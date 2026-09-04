@@ -1,0 +1,17 @@
+2026-09-04 17:54:10 启动 port=8790 models=9
+2026-09-04 17:54:10 启动 port=8790 models=9
+2026-09-04 17:54:16 127.0.0.1 - "GET /health HTTP/1.1" 200 -
+2026-09-04 17:54:16 127.0.0.1 - "GET /v1/models HTTP/1.1" 200 -
+2026-09-04 17:54:22 127.0.0.1 - "POST /v1/chat/completions HTTP/1.1" 400 -
+2026-09-04 17:54:27 create_agent_task 400: {"code":4001,"message":"bad request: binding: expr_path=conversation_id, cause=missing required parameter"}
+2026-09-04 17:54:27 127.0.0.1 - "POST /v1/chat/completions HTTP/1.1" 502 -
+2026-09-04 17:54:28 create_agent_task 400: {"code":4001,"message":"bad request: binding: expr_path=conversation_id, cause=missing required parameter"}
+2026-09-04 17:54:28 127.0.0.1 - "POST /v1/chat/completions HTTP/1.1" 502 -
+2026-09-04 17:57:46 create_agent_task 400: {"code":4001,"message":"bad request: binding: expr_path=conversation_id, cause=missing required parameter"}
+2026-09-04 17:57:46 127.0.0.1 - "POST /v1/chat/completions HTTP/1.1" 502 -
+2026-09-04 17:58:01 启动 port=8790 models=9
+2026-09-04 17:58:08 create_agent_task 400: {"code":4001,"message":"bad request: binding: expr_path=session_id, cause=missing required parameter"}
+2026-09-04 17:58:08 127.0.0.1 - "POST /v1/chat/completions HTTP/1.1" 502 -
+2026-09-04 17:58:52 启动 port=8790 models=9
+2026-09-04 17:58:57 create_agent_task 400: {"code":4001,"message":"bad request: binding: expr_path=device_id, cause=missing required parameter"}
+2026-09-04 17:58:57 127.0.0.1 - "POST /v1/chat/completions HTTP/1.1" 502 -
