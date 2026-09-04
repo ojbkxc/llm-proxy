@@ -186,10 +186,16 @@ def _read_session() -> dict:
     token = info.get("token") or ""
     if not token:
         raise RuntimeError("TRAE 登录 token 为空")
+    # device_id 取 iCubeAuthInfo://icube-dc:<id> 键后缀（alaudalog 实测 user_unique_id）
+    device_id = ""
+    for k in storage:
+        if k.startswith("iCubeAuthInfo://icube-dc:"):
+            device_id = k[len("iCubeAuthInfo://icube-dc:"):]
+            break
     sess = {
         "token": token,
         "user_id": info.get("userId") or "",
-        "device_id": storage.get("telemetry.devDeviceId") or "",
+        "device_id": device_id,
         "machine_id": storage.get("telemetry.machineId") or "",
         "host": info.get("host") or GATEWAY,
         "exp": _decode_jwt_exp(token),
@@ -281,13 +287,18 @@ def build_create_body(sess: dict, session_id: str, query_text: str, cfg: dict) -
         "session_id": session_id,
         "conversation_id": session_id,
         "user_id": sess["user_id"],
+        "device_id": sess["device_id"],
         "content": [],
         "model_name": cfg["name"],
+        "config_name": cfg["name"],
         "agent_type": "solo_agent_lite",
         "agent_id": "solo_agent_lite",
         "query": json.dumps([{"type": "text", "data": {"content": query_text}}], ensure_ascii=False),
+        "user_input": query_text,
         "workspace_folders": [WORKSPACE],
         "scene_location": 2,
+        "ide_version": "0.1.60",
+        "app_version": "0.1.60",
         "custom_model": {
             "provider": "", "is_preset": True,
             "config_name": cfg["name"], "config_source": 1, "model_name": cfg["name"],
