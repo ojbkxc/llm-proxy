@@ -1,0 +1,374 @@
+# 通用 Claude / Codex 本地配置部署脚本
+
+> 一个可在任意机器上分发运行的部署脚本，自动探测 Claude（含 Claude Code CLI / Claude Code Haha 桌面端 / yume）与 Codex 的安装目录，并完成统一接入配置（自定义网关、模型分档、子代理分工、环境变量、密钥写入、非官方模型注册）。
+
+零第三方依赖，仅需 Python 标准库（建议 3.10+）。npm 仅用于可选的全局路径探测。
+
+**配套脚本**：`Claude/setup_yume.py` —— yume 桌面版专用一键部署（Node 22 + 官方 CLI + yume 安装器 + 网关配置 + 模型注册 + 权限全放行，已装组件自动跳过）。
+
+---
+
+## 〇、新电脑部署步骤（按顺序执行）
+
+> Windows 全流程约 5 分钟。前置条件：能上网；Windows 需管理员 PowerShell。
+
+### Windows
+
+**第 1 步：装 Node.js**（已装可跳过，`node -v` 能出版本号即已装）
+
+下载安装：https://nodejs.org/ （选 LTS 版本，一路下一步）
+
+**第 2 步：装 Python**（已装可跳过，`python --version` 能出版本号即已装）
+
+下载安装：https://www.python.org/downloads/ （3.10+；安装时勾选 **Add python.exe to PATH**）
+
+**第 3 步：装最新版 Codex**（管理员 PowerShell）
+
+```powershell
+npm install -g @openai/codex@latest
+codex --version   # 确认输出 codex-cli 0.15x.x
+```
+
+**第 4 步：拿到本项目**
+
+```powershell
+git clone <你的仓库地址> C:\GitHub\deploy_ai_cli
+# 或者从旧电脑直接拷贝整个 deploy_ai_cli 文件夹过去
+```
+
+**第 5 步：右键 `deploy.cmd` →「以管理员身份运行」**
+
+它会自动完成：管理员/Python/Codex 检查 → 写入 Claude 与 Codex 全部配置 → 修复 Windows 沙箱 Temp 权限（`--auto-fix`）→ 信任项目目录 → 打印后续步骤。
+
+不想用 cmd 也可以手动跑（效果相同）：
+
+```powershell
+cd C:\GitHub\deploy_ai_cli
+python deploy_ai_cli.py --non-interactive --auto-fix `
+  --trust-project "C:\GitHub\AIGX" `
+  --trust-project "C:\GitHub\deploy_ai_cli"
+```
+
+**第 6 步：重开终端**（必须！让 `CF_GATEWAY_KEY`、`ANTHROPIC_*` 等用户级环境变量生效）
+
+**第 7 步：验证**
+
+```powershell
+# Codex 对话测试
+cd C:\GitHub\AIGX
+codex exec "请回复：对话正常"
+
+# 沙箱命令执行测试（应列出文件）
+codex sandbox powershell -NoProfile -Command "ls | Select-Object -First 3"
+```
+
+两条都有正常输出即部署成功。
+
+**日常使用姿势**（Windows 已知限制见第十章）：
+
+```powershell
+codex                                            # TUI 交互模式（推荐，可逐条审批命令）
+codex exec --sandbox danger-full-access "任务"    # 自动化模式（无沙箱，信任任务用）
+codex --profile fast                             # 切快模型
+```
+
+### macOS / Linux
+
+```bash
+# 1. 装 Node.js（brew 或官网）
+brew install node
+
+# 2. 装 Codex
+npm install -g @openai/codex@latest
+
+# 3. 跑部署脚本（无需管理员）
+python3 deploy_ai_cli.py --non-interactive
+
+# 4. 重开终端后验证
+codex exec "请回复：对话正常"
+```
+
+> macOS/Linux 沙箱（Landlock/seccomp）原生可用，无需 `--auto-fix`，`workspace-write` 正常生效。
+
+---
+
+## 一、它能做什么
+
+| 目标 | 配置内容 |
+|------|----------|
+| **Codex** | 生成 `~/.codex/config.toml`（custom provider + env_key）、8 个模型分档 `*.config.toml`、`auth.json`、用户级环境变量 `CF_GATEWAY_KEY` |
+| **Claude** | 合并式写入 `~/.claude/settings.json`（保留你已有的字段）：三槽模型映射（opus/sonnet=glm-5.3，haiku=glm-5.3-flash）、`modelPicker` 注册 8 个非官方模型名（glm/deepseek/kimi 系，解决 `unrecognized_model`）、权限全放行 + `bypassPermissions`、语言中文；生成 3 个分工子代理 `~/.claude/agents/*.md`；写入 `ANTHROPIC_*` + `CLAUDE_DANGEROUS_MODE` 环境变量并清除致命的 `ANTHROPIC_MODEL` |
+
+> Claude Code Haha 桌面端与官方 CLI 共用 `~/.claude`，以上配置它全部继承，重启即生效。
+
+---
+
+## 二、快速开始
+
+```bash
+# 最小运行（自动检测 + 交互询问缺失项）
+python deploy_ai_cli.py
+
+# 只探测、不写入（先看看检测结果）
+python deploy_ai_cli.py --dry-run
+
+# 全自动无人值守（需已能在现有配置里复用密钥）
+python deploy_ai_cli.py --non-interactive --api-key sk-xxx
+
+# 撤销最近一次写入
+python deploy_ai_cli.py --rollback
+```
+
+---
+
+## 三、命令行参数
+
+| 参数 | 说明 | 默认 |
+|------|------|------|
+| `--base-url` | 自定义网关地址（Codex 用它带 `/v1`；Claude 写入时自动剥掉 `/v1`，因为 SDK 自己拼） | `https://cfapi.1232333.xyz/v1` |
+| `--api-key` | 网关 API Key（优先级最高；不提供则依次尝试 `--key-file` / 脚本内置 `DEFAULT_API_KEY` / 复用现有配置 / 交互询问） | 自动 |
+| `--key-file` | 从文件读取 API Key | — |
+| `--codex-home` | Codex 配置目录 | `~/.codex` |
+| `--claude-home` | Claude 配置目录 | `~/.claude` |
+| `--codex-bin` | 覆盖 Codex 可执行文件路径 | 自动检测 |
+| `--claude-bin` | 覆盖 Claude 可执行文件路径 | 自动检测 |
+| `--models-file` | JSON 文件，覆盖 Codex 模型分档 | 内置 8 档 |
+| `--skip-codex` | 跳过 Codex 配置 | 否 |
+| `--skip-claude` | 跳过 Claude 配置 | 否 |
+| `--dry-run` | 仅探测，不写任何配置 | 否 |
+| `--non-interactive` | 非交互模式，检测失败直接报错 | 否 |
+| `--force` | 覆盖已存在的 `config.toml` | 否 |
+| `--rollback` | 回滚最近一次配置写入 | — |
+| `--verbose` | 输出 DEBUG 日志 | 否 |
+| `--log-file` | 日志输出文件路径 | 控制台 |
+
+---
+
+## 四、自动检测机制
+
+脚本按「**多来源 + 优先级 + 回退**」三层策略探测安装目录：
+
+### 1. 检测来源（按顺序）
+
+| 优先级 | 来源 | 适用 |
+|--------|------|------|
+| 1 | 命令行覆盖 `--codex-bin` / `--claude-bin` | 手动指定 |
+| 2 | `PATH` 环境变量（`shutil.which`） | 全平台 |
+| 3 | Windows 注册表 `App Paths` | Windows |
+| 4 | 常见默认安装路径 | 全平台 |
+| 5 | npm 全局目录（`npm root -g`） | 全平台（npm 可选） |
+| 6 | 受限目录模糊搜索（`os.walk` + 深度截断） | 回退 |
+
+### 2. 各平台默认路径清单
+
+**Codex**
+
+- Windows：`%APPDATA%\npm\codex.cmd`、`%LOCALAPPDATA%\Programs\OpenAI\Codex\bin\codex.exe`、`%ProgramFiles%\OpenAI\Codex\bin\codex.exe`、注册表、npm root
+- macOS：`~/.npm-global/bin/codex`、`~/.local/bin/codex`、`/opt/homebrew/bin/codex`、`/usr/local/bin/codex`、npm root
+- Linux：`~/.npm-global/bin/codex`、`~/.local/bin/codex`、`/usr/local/bin/codex`、`/usr/bin/codex`、npm root
+
+**Claude**
+
+- Windows：`~/.claude/local/claude.exe`、`~/.local/bin/claude.exe`、npm root；桌面端 `%ProgramFiles%\Claude Code Haha\*.exe`（精确 + `*Haha*` 模糊）
+- macOS：`~/.claude/local/claude`、`/usr/local/bin/claude`、`/opt/homebrew/bin/claude`；桌面端 `/Applications/*Haha*.app`
+- Linux：`~/.claude/local/claude`、`~/.local/bin/claude`、`/usr/local/bin/claude`、`/opt/Claude Code Haha/`
+
+### 3. 回退策略
+
+- 自动检测失败 → 进入**交互式选择**：列出所有候选 + 模糊搜索结果，可手动输入绝对路径，或回车跳过；
+
+- `--non-interactive` 模式下检测失败 → 直接报错退出（便于 CI/无人值守环境冒烟）。
+
+---
+
+## 五、配置流程
+
+```
+解析参数 → 依赖检查 → 路径探测（含回退）→ [dry-run 则结束]
+     → 解析密钥（参数 > key-file > DEFAULT_API_KEY > 复用现有 auth.json/settings.json > 交互）
+     → 写入 Codex 配置 → 写入 Claude 配置 → 输出摘要与后续提示
+```
+
+### 密钥从哪来（按优先级）
+
+| 优先级 | 方式 | 适用场景 |
+|--------|------|----------|
+| 1 | `--api-key sk-xxx` 命令行 | 临时使用，不落盘 |
+| 2 | `--key-file /path/to/key` 密钥文件 | 密钥与脚本分离保管 |
+| 3 | **脚本内置 `DEFAULT_API_KEY`**（见 `deploy_ai_cli.py` 顶部常量区） | 分发部署，把密钥填进占位符即可免参数免交互 |
+| 4 | 自动复用目标机器现有 `auth.json` / `settings.json` 中的密钥 | 二次运行或已有配置 |
+| 5 | 运行时交互输入 | 首次手动部署 |
+
+内置方式用法：打开脚本找到这一行，填入真实密钥即可——
+
+```python
+DEFAULT_API_KEY = ""
+```
+
+> ⚠️ 安全提示：填好密钥的脚本副本请仅在受控范围分发，**不要提交到公开仓库**。密钥解析遵循上面的优先级，`--api-key` / `--key-file` 会覆盖内置值。
+
+**幂等与安全**：
+
+- `settings.json` 采用**合并式写入**：只增改 `env`/`modelPicker`/`permissions` 等字段，`proxy`/`network` 等你已有的字段原样保留；
+- 写任何已存在文件前，先备份为 `<file>.bak.<时间戳>`，并记录进 `.deploy_backup_manifest.json`；
+- `--rollback` 依清单恢复最近一批备份；
+- 重复运行不会破坏已有配置（已存在的 profile/agent 自动跳过）。
+
+### 非官方模型为什么能通过 CLI 校验（modelPicker 机制）
+
+官方 Claude Code CLI 会在本地校验 `--model` / `/model` 传入的模型名，非官方名（`glm-5.3` 等）直接报 `unrecognized_model`。解法是在 `~/.claude/settings.json` 写：
+
+```json
+"modelPicker": {
+  "options": [
+    { "model": "glm-5.3", "behavesAs": "claude-opus-4-8" },
+    { "model": "glm-5.3-flash", "behavesAs": "claude-haiku-4-5" }
+  ]
+}
+```
+
+- `behavesAs` 指定这个陌生模型按哪个官方模型处理（能力探测、effort 默认值等客户端行为）；
+- 实际请求仍把原始模型名（`glm-5.3`）发给网关，由网关映射到真实上游；
+- 本脚本默认注册 8 个：glm-5.3 / glm-5.3-flash / glm-5.2 / deepseek-v4-pro-0813 / deepseek-v4-flash-0731 / kimi-k2.7-code / kimi-k2.6 / glm-4.7-flash，全部实测通过。
+
+**仍然不能用的**：环境变量 `ANTHROPIC_MODEL`——设了它照样报 `unrecognized_model`（CLI 对这个变量不走 modelPicker 白名单），脚本会主动从注册表清掉它。模型映射只走 `ANTHROPIC_DEFAULT_OPUS/SONNET/HAIKU_MODEL` 三槽。
+
+---
+
+## 六、错误处理与日志
+
+- 日志分 `DEBUG / INFO / WARNING / ERROR` 四级，默认 INFO；
+- 密钥缺失、路径探测失败、备份清单写入失败等均不中断主流程，按可回退策略降级处理；
+- 所有报错会给出明确原因与下一步建议（例如提示加 `--codex-bin` 覆盖）；
+- 完整日志可 `--log-file out.log` 落盘排查。
+
+---
+
+## 七、各平台运行示例
+
+### Windows（PowerShell）
+
+```powershell
+# 干跑看检测结果
+python .\deploy_ai_cli.py --dry-run
+
+# 全自动部署（密钥自动复用，无需任何输入）
+python .\deploy_ai_cli.py --non-interactive
+
+# 覆盖 Codex 路径 + 指定网关
+python .\deploy_ai_cli.py --codex-bin "D:\tools\codex\codex.exe" --base-url "https://my-gw.example.com"
+```
+
+### macOS
+
+```bash
+python3 deploy_ai_cli.py --dry-run
+python3 deploy_ai_cli.py --api-key sk-xxx
+```
+
+### Linux
+
+```bash
+python3 deploy_ai_cli.py --dry-run
+python3 deploy_ai_cli.py --key-file /etc/ai-gateway.key --non-interactive
+```
+
+---
+
+## 八、部署完成后怎么用
+
+**Codex 模型分档切换**（8 档，经 Anthropic 协议实测可用）：
+
+```bash
+codex --profile fast     # glm-5.3-flash   日常快改
+codex --profile fast47   # glm-4.7-flash
+codex --profile dfast    # deepseek-v4-flash
+codex --profile mid      # glm-5.2          均衡主力
+codex --profile code     # kimi-k2.7-code   写码
+codex --profile kimi     # kimi-k2.6        长文本
+codex --profile dspro    # deepseek-v4-pro  深度推理
+codex --profile deep     # glm-5.3          全力
+```
+
+**Claude 子代理分工**（一次任务多模型接力）：
+
+| 子代理 | 绑定模型 | 用途 |
+|--------|---------|------|
+| `code-reviewer` | deepseek-v4-pro-0813 | 代码审查 |
+| `fast-writer` | glm-5.3-flash | 文档/文案/小修补 |
+| `architect` | glm-5.2 | 方案设计 |
+
+**Claude 对话中手动切模型**（`/model <名字>`，已在 modelPicker 注册）：
+
+```
+glm-5.3                主力（opus 档行为）
+glm-5.3-flash          快速（haiku 档行为）
+glm-5.2                均衡
+deepseek-v4-pro-0813   深度推理（偶发空响应，重试即可）
+deepseek-v4-flash-0731 最快（不支持图片）
+kimi-k2.7-code / kimi-k2.6 / glm-4.7-flash
+```
+
+---
+
+## 九、自定义模型分档（`--models-file`）
+
+传入 JSON 文件覆盖默认分档，格式 `{"档位名": ["模型名", "effort"]}`：
+
+```json
+{
+  "fast": ["glm-5.3-flash", "low"],
+  "deep": ["glm-5.3", "high"]
+}
+```
+
+```bash
+python deploy_ai_cli.py --models-file ./my_models.json
+```
+
+---
+
+## 十、Windows 已知问题与内置规避（2026-09 实测）
+
+本脚本在 Windows 上已内置以下规避与体检，无需手动处理：
+
+### 1. 网关 404（`base_url` 缺 `/v1`）
+
+codex 的 `wire_api = "responses"` 直接拼 `base_url + "/responses"`。网关地址不带 `/v1` 时请求打到不存在的端点，模型连接直接 404。
+
+**内置规避**：`_build_codex_config` 会自动给 `base_url` 补 `/v1` 后缀，无需手动处理。
+
+### 2. Git Bash 在受限沙箱内崩溃（`CreateFileMapping error 5`）
+
+codex 的 Windows 受限 token 沙箱会剥离 `SeCreateGlobalPrivilege`，而 Git Bash（msys/cygwin 运行时）启动时必须用该权限创建以用户 SID 命名的共享内存段 → `CreateFileMapping` error 5 → 所有 Git 工具（`ls`/`bash`/`whoami`）在沙箱内崩溃。
+
+**内置规避**：生成的 `config.toml` 指定 PowerShell 作为执行 shell：
+
+```toml
+[shell]
+windows_default = "powershell"
+```
+
+### 3. 沙箱用户 Temp 权限丢失
+
+删除 `~/.codex` 后重装，沙箱用户（`CodexSandboxOnline/Offline`）对 `C:\Windows\Temp` 的写权限可能丢失，同样触发 `CreateFileMapping error 5`。
+
+**部署后体检**：脚本会运行 `codex sandbox` 测试原生 PowerShell，失败时打印可直接复制的修复命令（需管理员执行）：
+
+```powershell
+icacls C:\Windows\Temp /grant "CodexSandboxOnline:(OI)(CI)F"
+icacls C:\Windows\Temp /grant "CodexSandboxOffline:(OI)(CI)F"
+```
+
+### 4. `codex exec` 忽略 sandbox 配置（codex 0.153.x Windows 已知问题）
+
+Windows 上 `sandbox_mode = "workspace-write"` 配置与 `-s workspace-write` 参数均不生效，`exec` 恒为 `read-only` + `approval never`，所有命令被 `blocked by policy` 拒绝。
+
+**当前可用方案**：唯一有效的是 `--sandbox danger-full-access`（跳过受限 token，以当前用户身份执行）：
+
+```powershell
+cd C:\path\to\repo
+codex exec --sandbox danger-full-access "你的任务指令"
+```
+
+> ⚠️ `danger-full-access` 无沙箱隔离，命令直接以你的用户身份执行，仅用于信任的任务。等 codex 上游修复 Windows 沙箱后可切回 workspace-write。

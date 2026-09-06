@@ -29,10 +29,10 @@ TRAE SOLO CN 官方模型本地代理 - 纯 Python 标准库 + cryptography
     → 明文 = SHA512(payload) + payload(JSON: token/userId/host/refreshToken...)
   token 过期时打开 TRAE 客户端让它自动刷新即可（当前 token 至 2026-09-13）。
 
-已知限制（详见 trae_solo_analysis/TRAE_SOLO_CN_分析.md）：
-  1. create_agent_task 真实报文 ~88KB（含完整上下文+工具定义），本文件的请求体
-     是从日志还原的最小化占位模板——若上游 400/拒绝，需用 mitm（trae_mitm/）
-     抓一次真实报文后替换 _build_create_body / _build_workflow_body。
+已知限制（详见 trae_proxy_进展.md 与 trae_probe.py 注释）：
+  1. create_agent_task 请求体已迭代至第二代（user_input 对象化 + __dev 模型名），
+     上游绑定/模型配置检查均通过；剩余卡点是服务端 "failed to get summary
+     config"——摘要配置未注册，需用 mitm 抓一次真实报文对比请求序列后修正。
   2. tool_call 即终止：云端工具（RunCommand/Read/Edit...）无法在本机执行，
      工具调用翻译为 OpenAI tool_calls 返回给客户端后立即 interrupt 回合。
   3. 服务端排队（request_wait_in_queue）时首 token 延迟可达分钟级（Free 账号）。
@@ -61,13 +61,40 @@ APPDATA = os.environ.get("APPDATA", os.path.join(HOME, "AppData", "Roaming"))
 
 # TRAE SOLO CN 客户端用户数据
 STORAGE_JSON = os.path.join(APPDATA, "TRAE SOLO CN", "User", "globalStorage", "storage.json")
-WORKSPACE = "d:\\GitHub"  # 客户端日志中的 workspace（占位）
+# 客户端默认工作区（solo-lite-default-workspace/workspace.json 换算）：
+WORKSPACE = "C:\\GitHub"
 
-# 上游网关与编排端点（alaudalog 实测）
+# 上游网关（alaudalog 实测）
 GATEWAY = "https://trae-api-cn.mchost.guru"
-EP_CREATE = GATEWAY + "/api/agent/v3/create_agent_task"
-EP_WORKFLOW = GATEWAY + "/api/agent/v3/workflow/start"
-EP_INTERRUPT = GATEWAY + "/api/agent/v3/interrupt"
+
+# —— SOLO 免费聊天通道（来自 traework2api 实测，2026-09-04 本机验证通过）——
+# 不走 create_agent_task 编排（会被 summary config 卡点拦截），
+# 直接用 llm_utils_chat：请求体近 OpenAI 格式，SSE 事件为
+# metadata / output{response, reasoning_content, tool_calls} / token_usage / done / error。
+EP_LLM_UTILS = GATEWAY + "/api/agent/v3/llm_utils_chat"
+EP_GET_DETAIL_PARAM = GATEWAY + "/api/ide/v1/get_detail_param"
+SOLO_FUNCTION = "solo_work_lite"
+SOLO_IDE_VERSION = "0.1.43"
+SOLO_IDE_VERSION_CODE = "20260716"
+SOLO_DEVICE_BRAND = "83DG"
+
+# solo_work_lite 模型表缓存（get_detail_param 拉取，失败回落静态 MODELS）
+# TTL：正缓存 1h，负缓存 5min（对齐 traework2api handler.go）
+_solo_models_cache = {"names": [], "ts": 0, "fail_ts": 0}
+SOLO_MODELS_TTL = 3600
+SOLO_MODELS_FAIL_COOLDOWN = 300
+
+# token 自动续期（traework2api client.go refreshLocked 移植）
+OAUTH_HOST = "https://api.trae.com.cn"
+EP_EXCHANGE = OAUTH_HOST + "/cloudide/api/v3/trae/oauth/ExchangeToken"
+SOLO_CLIENT_ID = "en1oxy7wnw8j9n"
+REFRESH_AHEAD_SEC = 3600  # token 临期 1h 内触发续期
+
+# API Key 鉴权（空 = 不鉴权，环境变量 TRAE_PROXY_API_KEY 设置）
+API_KEY = os.environ.get("TRAE_PROXY_API_KEY", "")
+
+# 请求体大小上限（防 OOM，对齐 traework2api handler.go maxBodyBytes=8MB）
+MAX_BODY_BYTES = 8 << 20
 
 # ── 凭证信封常量（trae-mate trae_auth.rs 逐字节移植）────────────────────────
 ENVELOPE_HEADER = bytes([116, 99, 5, 16, 0, 0])
@@ -105,10 +132,38 @@ MODEL_ALIAS.update({
     "seed-2.1-pro": "Doubao-Seed-2.1-Pro",
     "seed-2.1-turbo": "Doubao-Seed-2.1-Turbo",
 })
-DEFAULT_MODEL = "DeepSeek-V4-Flash-Official"
+DEFAULT_MODEL = "glm-5.2"  # solo_work_lite 通道实测可用（traework2api 同款默认）
+
+# ── 配置文件（config.json 覆盖常量；环境变量优先）────────────────────────────
+def _apply_config():
+    """读 config.json 覆盖常量。优先级：环境变量 > config.json > 代码默认值。"""
+    global PORT, API_KEY, MAX_BODY_BYTES, SOLO_MODELS_TTL, SOLO_MODELS_FAIL_COOLDOWN, REFRESH_AHEAD_SEC, DEFAULT_MODEL
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            cfg = json.loads(f.read())
+    except Exception:
+        return
+    if "port" in cfg and not os.environ.get("TRAE_PROXY_PORT"):
+        PORT = int(cfg["port"])
+    if "api_key" in cfg and not os.environ.get("TRAE_PROXY_API_KEY"):
+        API_KEY = str(cfg["api_key"])
+    if "max_body_mb" in cfg and not os.environ.get("TRAE_PROXY_MAX_BODY_MB"):
+        MAX_BODY_BYTES = int(cfg["max_body_mb"]) << 20
+    if "models_ttl" in cfg and not os.environ.get("TRAE_PROXY_MODELS_TTL"):
+        SOLO_MODELS_TTL = int(cfg["models_ttl"])
+    if "models_fail_cooldown" in cfg and not os.environ.get("TRAE_PROXY_MODELS_FAIL_COOLDOWN"):
+        SOLO_MODELS_FAIL_COOLDOWN = int(cfg["models_fail_cooldown"])
+    if "refresh_ahead_sec" in cfg and not os.environ.get("TRAE_PROXY_REFRESH_AHEAD_SEC"):
+        REFRESH_AHEAD_SEC = int(cfg["refresh_ahead_sec"])
+    if "default_model" in cfg and not os.environ.get("TRAE_PROXY_DEFAULT_MODEL"):
+        DEFAULT_MODEL = str(cfg["default_model"])
+
+_apply_config()
 
 # 日志（同目录；TRAE_PROXY_LOG 空字符串关闭）
 LOG_FILE = os.environ.get("TRAE_PROXY_LOG", os.path.join(os.path.dirname(os.path.abspath(__file__)), "trae_proxy.log"))
+LOG_MAX_BYTES = int(os.environ.get("TRAE_PROXY_LOG_MAX_MB", "5")) << 20
 _log_lock = threading.Lock()
 
 # 直连（不走系统代理；mchost.guru CN 网关可直连，同 trae-mate 结论）
@@ -120,6 +175,14 @@ def _log(msg):
         return
     try:
         with _log_lock:
+            try:
+                if os.path.getsize(LOG_FILE) > LOG_MAX_BYTES:
+                    old = LOG_FILE + ".old"
+                    if os.path.exists(old):
+                        os.remove(old)
+                    os.rename(LOG_FILE, old)
+            except Exception:
+                pass
             with open(LOG_FILE, "a", encoding="utf-8") as f:
                 f.write("%s %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()), msg))
     except Exception:
@@ -169,8 +232,92 @@ def _decode_jwt_exp(token: str):
         return None
 
 
+def _encrypt_auth_info(payload: dict) -> str:
+    """_decrypt_auth_info 的逆运算：payload → base64 信封（续期后写回 storage.json 用）。"""
+    plain = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    digest = hashlib.sha512(plain).digest()
+    full = digest + plain
+    pad = 16 - len(full) % 16
+    full += bytes([pad]) * pad
+    random_key = secrets.token_bytes(32)
+    secret = bytes(l ^ r for l, r in zip(LEFT_SECRET, RIGHT_SECRET))
+    derived = hashlib.sha512(hashlib.sha512(random_key).digest() + secret).digest()
+    key, iv = derived[:16], derived[16:32]
+    enc = Cipher(algorithms.AES(key), modes.CBC(iv)).encryptor()
+    ciphertext = enc.update(full) + enc.finalize()
+    return base64.b64encode(ENVELOPE_HEADER + random_key + ciphertext).decode("ascii")
+
+
+_refresh_lock = threading.Lock()
+_refreshing = False   # 是否有线程正在续期（防并发重复刷新 + 并发写同一 tmp 文件）
+
+
+def _refresh_token(sess: dict) -> dict:
+    """用 refreshToken 调 ExchangeToken 续期，更新 sess 并写回 storage.json。
+
+    移植自 traework2api client.go refreshLocked。失败时不改 sess（旧 token 可重试）。
+    并发去重：临期时多个请求同时进入，只让一个真正调 ExchangeToken，其余直接返回旧 sess。
+    """
+    global _refreshing
+    with _refresh_lock:
+        if _refreshing:
+            return sess   # 别的线程正在刷，先用旧的
+        _refreshing = True
+    try:
+        rt = sess.get("refresh_token") or ""
+        if not rt:
+            raise RuntimeError("无 refreshToken，请打开 TRAE SOLO CN 客户端重新登录")
+        body = json.dumps({"ClientID": SOLO_CLIENT_ID, "RefreshToken": rt,
+                           "ClientSecret": "-", "UserID": ""}).encode("utf-8")
+        req = urllib.request.Request(EP_EXCHANGE, data=body, method="POST")
+        req.add_header("Content-Type", "application/json")
+        req.add_header("Accept", "application/json")
+        req.add_header("User-Agent", "Trae/" + SOLO_IDE_VERSION)
+        resp = _opener.open(req, timeout=30)
+        obj = json.loads(resp.read().decode("utf-8", "replace"))
+        result = obj.get("Result") or {}
+        new_token = result.get("Token") or ""
+        if not new_token:
+            raise RuntimeError("ExchangeToken 未返回 Token，refreshToken 可能已失效，请重新登录")
+        new_rt = result.get("RefreshToken") or rt
+        expires_at = result.get("TokenExpireAt") or 0
+        if expires_at > 1e12:
+            expires_at = expires_at // 1000  # 毫秒 → 秒
+        # 写回 storage.json（重新加密信封）；用唯一 tmp 名避免并发写同一文件
+        try:
+            with open(STORAGE_JSON, "r", encoding="utf-8") as f:
+                storage = json.load(f)
+            encoded = storage.get("iCubeAuthInfo://icube.cloudide")
+            if encoded:
+                info = _decrypt_auth_info(encoded)
+                info["token"] = new_token
+                info["refreshToken"] = new_rt
+                storage["iCubeAuthInfo://icube.cloudide"] = _encrypt_auth_info(info)
+                tmp = "%s.tmp.%d" % (STORAGE_JSON, os.getpid())
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(storage, f, ensure_ascii=False, indent=2)
+                os.replace(tmp, STORAGE_JSON)
+                _log("token 续期已写回 storage.json，新 exp=%s" % expires_at)
+        except Exception as e:
+            _log("token 续期写回 storage.json 失败（内存已更新）: %r" % e)
+        new_sess = dict(sess)
+        new_sess["token"] = new_token
+        new_sess["refresh_token"] = new_rt
+        new_sess["exp"] = expires_at or _decode_jwt_exp(new_token)
+        with _session_lock:
+            _session_cache["at"] = time.time()
+            _session_cache["data"] = new_sess
+        return new_sess
+    finally:
+        with _refresh_lock:
+            _refreshing = False
+
+
 def _read_session() -> dict:
-    """读 TRAE 登录态：{token, user_id, device_id, machine_id, exp}。缓存 60s。"""
+    """读 TRAE 登录态：{token, user_id, device_id, machine_id, exp, refresh_token}。缓存 60s。
+
+    token 临期（REFRESH_AHEAD_SEC 内）时自动调 _refresh_token 续期。
+    """
     now = time.time()
     with _session_lock:
         if _session_cache["data"] and now - _session_cache["at"] < 60:
@@ -199,10 +346,20 @@ def _read_session() -> dict:
         "machine_id": storage.get("telemetry.machineId") or "",
         "host": info.get("host") or GATEWAY,
         "exp": _decode_jwt_exp(token),
+        "refresh_token": info.get("refreshToken") or "",
     }
     with _session_lock:
         _session_cache["at"] = now
         _session_cache["data"] = sess
+    # token 临期自动续期（traework2api RefreshTokenIfNeeded 移植）
+    exp = sess.get("exp")
+    if exp and exp - time.time() < REFRESH_AHEAD_SEC:
+        _log("token 临期（exp=%s，%ds 后过期），触发自动续期" % (
+            time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(exp)), int(exp - time.time())))
+        try:
+            sess = _refresh_token(sess)
+        except Exception as e:
+            _log("自动续期失败（继续用旧 token）: %r" % e)
     return sess
 
 
@@ -239,98 +396,29 @@ def build_headers(sess: dict, body_len: int) -> dict:
     return h
 
 
-def _post(url: str, sess: dict, body: dict, timeout: int = 60):
-    payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
-    req = urllib.request.Request(url, data=payload, method="POST")
-    for k, v in build_headers(sess, len(payload)).items():
-        req.add_header(k, v)
-    return _opener.open(req, timeout=timeout)
-
-
-# ── 上游：伪 agent 回合（编排协议）───────────────────────────────────────────
 class UpstreamError(Exception):
     def __init__(self, message, status=502):
         super().__init__(message)
         self.status = status
 
 
-def _pseudo_object_id() -> str:
-    """24-hex（MongoDB ObjectId 风格）会话 id。"""
-    return "%08x%s" % (int(time.time()), secrets.token_hex(8))
-
-
-def _common_params(sess: dict) -> str:
-    """客户端 common_params（alaudalog 日志还原的精简版）。"""
-    cp = {
-        "icube_uid": sess["user_id"], "user_id": sess["user_id"], "biz_user_id": sess["user_id"],
-        "user_is_login": True, "user_unique_id": sess["device_id"], "device_id": sess["device_id"],
-        "machine_id": sess["machine_id"], "arch": platform.machine() or "x64", "system": "win32",
-        "scope": "marscode", "tenant": "marscode", "region": "CN", "aiRegion": "CN",
-        "quality": "stable", "app_version": "0.1.60", "vscode_version": "1.107.1",
-        "os_name": "windows", "os_version": platform.platform()[:64],
-        "platform": "electron", "identity": "0", "identity_str": "Free",
-        "language": "zh-cn", "app_language": "zh-cn", "chat_mode": 1,
-        "product_code": "SOLO_Lite", "agent_runtime_implementation": "ai-agent",
-    }
-    return json.dumps(cp, ensure_ascii=False)
-
-
-def build_create_body(sess: dict, session_id: str, query_text: str, cfg: dict) -> dict:
-    """
-    create_agent_task 请求体。
-
-    ⚠️ 占位模板：真实报文 ~88KB（完整上下文+工具定义+模型信息），结构从
-    alaudalog 日志的 SendMessageRequest / start_chat 还原。若上游 400，
-    用 trae_mitm 抓真实报文替换本函数与 build_workflow_body。
-    """
-    return {
-        "session_id": session_id,
-        "conversation_id": session_id,
-        "user_id": sess["user_id"],
-        "device_id": sess["device_id"],
-        "content": [],
-        "model_name": cfg["name"],
-        "config_name": cfg["name"],
-        "agent_type": "solo_agent_lite",
-        "agent_id": "solo_agent_lite",
-        "query": json.dumps([{"type": "text", "data": {"content": query_text}}], ensure_ascii=False),
-        "user_input": query_text,
-        "workspace_folders": [WORKSPACE],
-        "scene_location": 2,
-        "ide_version": "0.1.60",
-        "app_version": "0.1.60",
-        "custom_model": {
-            "provider": "", "is_preset": True,
-            "config_name": cfg["name"], "config_source": 1, "model_name": cfg["name"],
-            "use_remote_service": True, "multimodal": False,
-            "prompt_max_tokens": 936000, "reasoning_effort_level": "high",
-        },
-        "common_params": _common_params(sess),
-    }
-
-
-def build_workflow_body(sess: dict, session_id: str, task_id: str, query_text: str, cfg: dict) -> dict:
-    """workflow/start 请求体（占位模板，同上警告）。"""
-    return {
-        "task_id": task_id,
-        "chat_session_id": session_id,
-        "user_id": sess["user_id"],
-        "agent_id": "solo_agent_lite",
-        "agent_type": "solo_agent_lite",
-        "model_name": cfg["name"],
-        "query": json.dumps([{"type": "text", "data": {"content": query_text}}], ensure_ascii=False),
-        "workspace_folders": [WORKSPACE],
-        "common_params": _common_params(sess),
-    }
-
-
-def _interrupt(sess: dict, session_id: str):
-    """终止 agent 回合（用户取消时客户端也调此端点）。"""
-    try:
-        _post(EP_INTERRUPT, sess, {"chat_session_id": session_id}, timeout=10).close()
-        _log("interrupt 已发送 session=%s" % session_id)
-    except Exception as e:
-        _log("interrupt 失败: %r" % e)
+def _map_upstream_error(code, msg: str) -> int:
+    """上游内部错误码/消息 → 客户端友好的 HTTP 状态码。"""
+    s = (str(msg) or "").lower()
+    c = str(code) if code is not None else ""
+    # 认证/会话失效 → 401
+    if c in ("1005", "1001", "1002", "401") or any(k in s for k in ("auth", "session", "token", "login", "unauthorized")):
+        return 401
+    # 限流 → 429
+    if c == "429" or any(k in s for k in ("rate", "limit", "quota", "too many")):
+        return 429
+    # 内容安全 → 400
+    if c in ("1006", "1003", "400") or any(k in s for k in ("content_security", "security", "sensitive", "违规")):
+        return 400
+    # 上游明确返回的 5xx
+    if c in ("500", "502", "503"):
+        return int(c)
+    return 502
 
 
 def _iter_sse(resp):
@@ -363,69 +451,137 @@ def _iter_sse(resp):
         yield event, "\n".join(data_parts)
 
 
-def _extract_task_id(create_text: str) -> str:
-    """从 create_agent_task 响应提取 task_id（响应可能是 JSON 或 SSE）。"""
-    candidates = [create_text]
-    if "data:" in create_text:
-        candidates = [ln[len("data:"):].strip() for ln in create_text.splitlines()
-                      if ln.startswith("data:")] + candidates
-    for cand in candidates:
-        try:
-            obj = json.loads(cand)
-        except Exception:
+# ── SOLO llm_utils_chat 通道（主力，2026-09-04 实测打通）─────────────────────
+def solo_headers(sess: dict, stream: bool = True) -> dict:
+    """SOLO 通道请求头（对齐 traework2api SOLOHeaders，实测必需）。"""
+    at = sess["token"]
+    h = {
+        "content-type": "application/json",
+        "accept": "text/event-stream" if stream else "application/json",
+        "user-agent": "Trae/" + SOLO_IDE_VERSION,
+        "authorization": "Cloud-IDE-JWT " + at,
+        "x-cloudide-token": at,
+        "x-ide-token": at,
+        "x-uid": sess["user_id"],
+        "x-app-id": "6eefa01c-1036-4c7e-9ca5-d891f63bfcd8",
+        "x-app-version": "default",
+        "x-ide-version": SOLO_IDE_VERSION,
+        "x-ide-version-code": SOLO_IDE_VERSION_CODE,
+        "x-app-version-code": SOLO_IDE_VERSION_CODE,
+        "x-ide-version-type": "stable",
+        "x-device-type": "windows",
+        "x-os-version": "Windows 11 Pro",
+        "x-device-brand": SOLO_DEVICE_BRAND,
+        "request-traffic-type": "prod",
+    }
+    if sess.get("machine_id"):
+        h["x-machine-id"] = sess["machine_id"]
+    if sess.get("device_id"):
+        h["x-device-id"] = sess["device_id"]
+    return h
+
+
+def _solo_messages(msgs) -> list:
+    """OpenAI messages → SOLO 格式：content 字符串 → [{type:text,text:...}]，
+    assistant tool_calls 的 function → function_call（上游字段名）。"""
+    out = []
+    for m in msgs or []:
+        if not isinstance(m, dict):
             continue
-        stack = [obj]
-        while stack:
-            cur = stack.pop()
-            if isinstance(cur, dict):
-                for k in ("task_id", "taskId", "agent_run_id", "agentRunId"):
-                    v = cur.get(k)
-                    if isinstance(v, str) and v:
-                        return v
-                stack.extend(cur.values())
-            elif isinstance(cur, list):
-                stack.extend(cur)
-    return ""
+        m = dict(m)
+        role = m.get("role")
+        content = m.get("content")
+        if content is None:
+            m.pop("content", None)
+        elif isinstance(content, str):
+            m["content"] = [{"type": "text", "text": content}]
+        if role == "assistant" and isinstance(m.get("tool_calls"), list):
+            kept = []
+            for tc in m["tool_calls"]:
+                if not isinstance(tc, dict):
+                    continue
+                tc = dict(tc)
+                fn = tc.get("function")
+                if isinstance(fn, dict):
+                    if not str(fn.get("name") or "").strip():
+                        continue  # 上游要求 function_call.name 必填
+                    tc["function_call"] = fn
+                    tc.pop("function", None)
+                kept.append(tc)
+            if kept:
+                m["tool_calls"] = kept
+            else:
+                m.pop("tool_calls", None)
+        out.append(m)
+    return out
 
 
-def agent_turn_chunks(sess: dict, cfg: dict, query_text: str):
-    """
-    执行一个伪 agent 回合，产出内部 OpenAI chat.completion.chunk 字典流。
-    流结束原因：turn_completion→stop；tool_call→tool_calls（并发 interrupt）。
-    """
-    session_id = _pseudo_object_id()
+def _solo_body(oa: dict, cfg: dict) -> dict:
+    """OpenAI 请求对象 → llm_utils_chat 请求体。"""
+    body = {
+        "messages": _solo_messages(oa.get("messages")),
+        "function": SOLO_FUNCTION,
+        "stream": True,  # 上游强制流式，非流式由本地聚合
+        "config_name": cfg["name"],
+        "model": cfg["name"],
+    }
+    # tools：上游要求 function.parameters 是 JSON 字符串（非对象）
+    tools = oa.get("tools")
+    if isinstance(tools, list) and tools:
+        out_tools = []
+        for t in tools:
+            if not isinstance(t, dict) or not isinstance(t.get("function"), dict):
+                continue
+            t = dict(t)
+            fn = dict(t["function"])
+            params = fn.get("parameters")
+            if isinstance(params, dict):
+                fn["parameters"] = json.dumps(params, ensure_ascii=False)
+            t["function"] = fn
+            out_tools.append(t)
+        if out_tools:
+            body["tools"] = out_tools
+    # tool_choice 归一化
+    tc = oa.get("tool_choice")
+    if isinstance(tc, str):
+        if tc.strip().lower() == "none":
+            body.pop("tools", None)
+        else:
+            body["tool_choice"] = tc
+    elif isinstance(tc, dict):
+        typ = str(tc.get("type") or "").lower()
+        if typ == "none":
+            body.pop("tools", None)
+        elif typ in ("auto", "required"):
+            body["tool_choice"] = typ
+        elif typ == "function":
+            name = ""
+            fn = tc.get("function")
+            if isinstance(fn, dict):
+                name = str(fn.get("name") or "").strip()
+            body["tool_choice"] = name or "auto"
+    return body
 
-    # 1) create_agent_task（建回合）
+
+def solo_turn_chunks(sess: dict, cfg: dict, oa: dict):
+    """llm_utils_chat 回合：产出内部 OpenAI chat.completion.chunk 字典流。"""
+    body = _solo_body(oa, cfg)
+    payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(EP_LLM_UTILS, data=payload,
+                                 headers=solo_headers(sess, stream=True), method="POST")
     try:
-        resp = _post(EP_CREATE, sess, build_create_body(sess, session_id, query_text, cfg), timeout=120)
-        create_text = resp.read().decode("utf-8", "replace")
+        resp = _opener.open(req, timeout=600)
     except urllib.error.HTTPError as e:
         detail = ""
         try:
             detail = e.read().decode("utf-8", "replace")[:300]
         except Exception:
             pass
-        _log("create_agent_task %s: %s" % (e.code, detail[:200]))
-        raise UpstreamError("create_agent_task %s: %s（模板占位，如持续 400 需 mitm 抓真实报文）" % (e.code, detail))
+        _log("llm_utils_chat %s: %s" % (e.code, detail[:200]))
+        raise UpstreamError("llm_utils_chat %s: %s" % (e.code, detail), status=e.code)
     except Exception as e:
-        raise UpstreamError("create_agent_task 连接失败: %s" % e)
-    task_id = _extract_task_id(create_text)
-    _log("create_agent_task ok session=%s task=%s" % (session_id, task_id or "?"))
+        raise UpstreamError("llm_utils_chat 连接失败: %s" % e)
 
-    # 2) workflow/start（token 流）
-    try:
-        resp = _post(EP_WORKFLOW, sess, build_workflow_body(sess, session_id, task_id, query_text, cfg), timeout=600)
-    except urllib.error.HTTPError as e:
-        detail = ""
-        try:
-            detail = e.read().decode("utf-8", "replace")[:300]
-        except Exception:
-            pass
-        raise UpstreamError("workflow/start %s: %s" % (e.code, detail))
-    except Exception as e:
-        raise UpstreamError("workflow/start 连接失败: %s" % e)
-
-    ct = (resp.headers.get("Content-Type") or "").lower()
     chat_id = "chatcmpl-" + _rand()
     created = int(time.time())
     finish_reason = None
@@ -437,18 +593,7 @@ def agent_turn_chunks(sess: dict, cfg: dict, query_text: str):
                 "choices": [{"index": 0, "delta": delta, "finish_reason": fr}]}
 
     yield chunk({"role": "assistant", "content": ""})
-
-    if "event-stream" not in ct:
-        # 非流式响应：整体 JSON（罕见，防御）
-        data = resp.read().decode("utf-8", "replace")
-        try:
-            obj = json.loads(data)
-            text = json.dumps(obj, ensure_ascii=False)
-            yield chunk({"content": text})
-        except Exception:
-            yield chunk({"content": data[:2000]})
-        yield chunk({}, "stop")
-        return
+    tc_index = 0
 
     for event, data_text in _iter_sse(resp):
         if data_text == "[DONE]":
@@ -456,60 +601,76 @@ def agent_turn_chunks(sess: dict, cfg: dict, query_text: str):
         try:
             data = json.loads(data_text)
         except Exception:
-            data = {"_raw": data_text}
+            continue
         if not isinstance(data, dict):
-            data = {"_raw": str(data)}
-        name = event or data.get("event") or data.get("type") or ""
+            continue
 
-        # —— token 流：thought（正文）/ reasoning（推理）——
-        if name in ("thought", "output", "message", "") and ("thought" in data or "reasoning" in data or "_raw" in data):
-            reasoning = data.get("reasoning")
-            thought = data.get("thought")
+        if event == "output":
+            reasoning = data.get("reasoning_content")
+            response = data.get("response")
             if isinstance(reasoning, str) and reasoning:
                 yield chunk({"reasoning_content": reasoning})
-            if isinstance(thought, str) and thought:
-                yield chunk({"content": thought})
-            if "_raw" in data and not thought and not reasoning:
-                yield chunk({"content": data["_raw"]})
+            if isinstance(response, str) and response:
+                yield chunk({"content": response})
+            raw_tc = data.get("tool_calls")
+            if raw_tc:
+                calls = raw_tc if isinstance(raw_tc, list) else [raw_tc]
+                deltas = []
+                for call in calls:
+                    if not isinstance(call, dict):
+                        continue
+                    # SOLO 上游用 function_call 字段名（OpenAI 是 function）
+                    fc = call.get("function_call") or call.get("function")
+                    if not isinstance(fc, dict):
+                        continue
+                    name = str(fc.get("name") or "").strip()
+                    # 对齐 traework2api：忽略 SOLO 专属 partial_arguments/namespace，只认 arguments
+                    args = fc.get("arguments") if isinstance(fc.get("arguments"), str) else ""
+                    has_id = isinstance(call.get("id"), str) and call["id"]
+                    if not name and not args and not has_id:
+                        continue
+                    # 上游 index 优先（增量分片按 index 合并），无 index 才本地递增兜底
+                    idx = call.get("index")
+                    idx = int(idx) if isinstance(idx, (int, float)) else tc_index
+                    tc_index = max(tc_index, idx + 1)
+                    delta = {"index": idx, "type": "function", "function": {}}
+                    if has_id:
+                        delta["id"] = call["id"]
+                    if name:
+                        delta["function"]["name"] = name
+                    if args:
+                        delta["function"]["arguments"] = args
+                    deltas.append(delta)
+                if deltas:
+                    yield chunk({"tool_calls": deltas})
+                    finish_reason = "tool_calls"
             continue
 
-        if name == "token_usage" or name == "compact_token_usage":
+        if event == "token_usage":
             usage = {
-                "prompt_tokens": data.get("input_tokens") or data.get("prompt_tokens") or 0,
-                "completion_tokens": data.get("output_tokens") or data.get("completion_tokens") or 0,
-                "total_tokens": (data.get("input_tokens") or data.get("prompt_tokens") or 0)
-                                + (data.get("output_tokens") or data.get("completion_tokens") or 0),
+                "prompt_tokens": data.get("prompt_tokens") or 0,
+                "completion_tokens": data.get("completion_tokens") or 0,
+                "total_tokens": data.get("total_tokens")
+                                or (data.get("prompt_tokens") or 0) + (data.get("completion_tokens") or 0),
             }
+            for extra in ("reasoning_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"):
+                if data.get(extra) is not None:
+                    usage[extra] = data[extra]
             continue
 
-        if name == "request_wait_in_queue":
-            pos = data.get("position")
-            _log("排队中 session=%s position=%s" % (session_id, pos))
-            continue
-
-        if name == "tool_call":
-            tid = data.get("toolcall_id") or data.get("id") or ("call_" + secrets.token_hex(12))
-            tname = data.get("tool_name") or data.get("name") or "unknown"
-            args = data.get("arguments") or data.get("input") or {}
-            args_text = args if isinstance(args, str) else json.dumps(args, ensure_ascii=False)
-            yield chunk({"tool_calls": [{"index": 0, "id": tid, "type": "function",
-                                         "function": {"name": tname, "arguments": args_text}}]})
-            finish_reason = "tool_calls"
-            _interrupt(sess, session_id)
+        if event == "done":
+            fr = data.get("finish_reason")
+            if isinstance(fr, str) and fr and not (finish_reason == "tool_calls" and fr == "stop"):
+                # 已判定 tool_calls 时不被上游的兜底 stop 覆盖（OpenAI 语义）
+                finish_reason = fr
+            if finish_reason is None:
+                finish_reason = "stop"
             break
 
-        if name == "turn_completion":
-            finish_reason = "stop"
-            break
-
-        if name in ("done", "workflow_finish"):
-            finish_reason = finish_reason or "stop"
-            break
-
-        if name in ("content_security", "error"):
-            code = data.get("code") or data.get("error_code")
-            msg = data.get("message") or data.get("error_message") or data_text[:200]
-            raise UpstreamError("上游事件错误 %s(code=%s): %s" % (name, code, msg))
+        if event == "error":
+            code = data.get("code")
+            msg = data.get("message") or data_text[:200]
+            raise UpstreamError("上游事件错误 error(code=%s): %s" % (code, msg), status=_map_upstream_error(code, msg))
 
     if finish_reason is None:
         finish_reason = "stop"
@@ -519,38 +680,22 @@ def agent_turn_chunks(sess: dict, cfg: dict, query_text: str):
     yield final
 
 
-# ── messages → query 文本（无服务端多轮状态，整段拼接）────────────────────────
-def messages_to_query(msgs) -> str:
-    parts = []
-    for m in msgs or []:
-        if not isinstance(m, dict):
-            continue
-        role = m.get("role") or "user"
-        content = m.get("content")
-        if isinstance(content, list):
-            texts = []
-            for p in content:
-                if isinstance(p, dict) and isinstance(p.get("text"), str):
-                    texts.append(p["text"])
-                elif isinstance(p, str):
-                    texts.append(p)
-            text = "\n".join(texts)
-        elif isinstance(content, str):
-            text = content
-        else:
-            text = json.dumps(content, ensure_ascii=False) if content is not None else ""
-        tool_calls = m.get("tool_calls")
-        if tool_calls:
-            text += "\n" + json.dumps(tool_calls, ensure_ascii=False)
-        if role == "system":
-            parts.append("[System]\n" + text)
-        elif role == "assistant":
-            parts.append("[Assistant]\n" + text)
-        elif role == "tool":
-            parts.append("[Tool result]\n" + text)
-        else:
-            parts.append(text)
-    return "\n\n".join(p for p in parts if p.strip()) or " "
+def fetch_solo_models(sess: dict) -> list:
+    """get_detail_param 拉取 solo_work_lite 模型表（config_name 列表）。"""
+    body = {"function": SOLO_FUNCTION, "config_names": None, "need_prompt": False,
+            "current_config_info": None, "poly_prompt": True, "mode_type": None,
+            "agent_type": None}
+    payload = json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(EP_GET_DETAIL_PARAM, data=payload,
+                                 headers=solo_headers(sess, stream=False), method="POST")
+    resp = _opener.open(req, timeout=30)
+    obj = json.loads(resp.read().decode("utf-8", "replace"))
+    names = []
+    for ci in obj.get("config_info_list") or []:
+        n = ci.get("config_name")
+        if n:
+            names.append(n)
+    return names
 
 
 # ── chunk 流聚合（非流式响应）───────────────────────────────────────────────
@@ -634,6 +779,8 @@ def convert_responses_to_openai(body: dict) -> dict:
                     for part in c:
                         if isinstance(part, dict) and part.get("type") in ("input_text", "output_text", "text") and part.get("text"):
                             text += part["text"]
+                        elif isinstance(part, dict) and part.get("type") in ("input_image", "image", "image_url"):
+                            text += "[图片输入暂不支持]"
                 if text:
                     msgs.append({"role": role, "content": text})
             elif t == "function_call":
@@ -706,6 +853,8 @@ def convert_anthropic_to_openai(body: dict) -> dict:
                      if isinstance(p, dict) and p.get("type") == "text"]
             if any(t.strip() for t in texts):
                 msgs.append({"role": "user", "content": "\n".join(texts)})
+            if any(isinstance(p, dict) and p.get("type") == "image" for p in c):
+                msgs.append({"role": "user", "content": "[图片输入暂不支持]"})
     oa["messages"] = msgs or [{"role": "user", "content": ""}]
     return oa
 
@@ -751,10 +900,15 @@ def convert_openai_to_responses(openai_obj: dict, req_model: str) -> dict:
                        "arguments": (tc.get("function") or {}).get("arguments", "{}"),
                        "status": "completed"})
     incomplete = choice.get("finish_reason") == "length"
+    _ot = "".join(
+        seg.get("text", "")
+        for item in output if item.get("type") == "message"
+        for seg in (item.get("content") or []) if seg.get("type") == "output_text"
+    )
     return {
         "id": "resp_" + _rand(), "object": "response", "created_at": int(time.time()),
         "status": "incomplete" if incomplete else "completed",
-        "model": req_model, "output": output,
+        "model": req_model, "output": output, "output_text": _ot,
         "usage": {"input_tokens": usage.get("prompt_tokens", 0),
                   "output_tokens": usage.get("completion_tokens", 0),
                   "total_tokens": usage.get("total_tokens", 0)},
@@ -1101,38 +1255,73 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Length", "0")
         self.end_headers()
 
+    def _check_api_key(self):
+        """API Key 校验（TRAE_PROXY_API_KEY 设置时启用）。已响应错误返回 True。"""
+        if not API_KEY:
+            return False
+        authz = self.headers.get("Authorization") or ""
+        if not authz.startswith("Bearer ") or not secrets.compare_digest(authz[7:], API_KEY):
+            self._json(401, {"error": {"message": "missing or invalid API key", "type": "invalid_api_key"}})
+            return True
+        return False
+
     def do_GET(self):
         path = self.path.split("?")[0]
+        if self._check_api_key():
+            return
         try:
             if path == "/health":
                 try:
                     s = _read_session()
                     exp = s.get("exp")
                     exp_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(exp)) if exp else "unknown"
+                    now = int(time.time())
+                    cache = _solo_models_cache
+                    cache_age = now - cache.get("ts", 0) if cache.get("ts") else None
                     return self._json(200, {"ok": True, "user": s["user_id"],
                                             "tokenExp": exp_str,
-                                            "models": sorted(MODELS)})
+                                            "port": PORT, "upstream": EP_LLM_UTILS,
+                                            "models": sorted(MODELS),
+                                            "cache": {"count": len(cache.get("names", [])),
+                                                      "age": cache_age, "ttl": SOLO_MODELS_TTL}})
                 except Exception as e:
                     return self._json(200, {"ok": False, "error": str(e)})
             if path in ("/v1/models", "/models"):
                 now = int(time.time())
-                return self._json(200, {
-                    "object": "list",
-                    "data": [{
-                        "id": mid,
-                        "object": "model",
-                        "created": now,
+                cached_names = _solo_models_cache.get("names") or []
+                if cached_names and now - _solo_models_cache.get("ts", 0) < SOLO_MODELS_TTL:
+                    solo_names = cached_names
+                elif _solo_models_cache.get("fail_ts") and now - _solo_models_cache["fail_ts"] < SOLO_MODELS_FAIL_COOLDOWN:
+                    solo_names = cached_names or sorted(MODELS)
+                else:
+                    try:
+                        sess = _read_session()
+                        solo_names = fetch_solo_models(sess)
+                        _solo_models_cache["names"] = solo_names
+                        _solo_models_cache["ts"] = now
+                        _solo_models_cache["fail_ts"] = 0
+                    except Exception:
+                        _solo_models_cache["fail_ts"] = now
+                        solo_names = cached_names or sorted(MODELS)
+                data = []
+                for n in solo_names:
+                    m = MODELS.get(n, {})
+                    data.append({
+                        "id": n, "object": "model", "created": now,
                         "owned_by": "trae-solo-cn",
-                        "metadata": {"display_name": m["display"], "model_name": m["model_name"],
-                                     "context_window": m["ctx"]},
-                    } for mid, m in sorted(MODELS.items())],
-                })
+                        "metadata": {"display_name": m.get("display", n),
+                                     "model_name": m.get("model_name", n),
+                                     "context_window": m.get("ctx", 0)},
+                    })
+                return self._json(200, {"object": "list", "data": data})
             return self._json(404, {"error": {"message": "支持: GET /v1/models, GET /health, POST /v1/chat/completions, /v1/responses, /v1/messages"}})
         except Exception as e:
             return self._json(500, {"error": {"message": str(e)}})
 
     def do_POST(self):
         path = self.path.split("?")[0]
+        if self._check_api_key():
+            return
         if path == "/v1/messages/count_tokens":
             return self._handle_count_tokens()
         if path == "/v1/messages":
@@ -1146,6 +1335,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def _handle_count_tokens(self):
         try:
             length = int(self.headers.get("Content-Length") or 0)
+            if length > MAX_BODY_BYTES:
+                return self._json(413, {"error": {"message": f"请求体过大（{length} > {MAX_BODY_BYTES} 字节）"}})
             req = json.loads(self.rfile.read(length).decode("utf-8"))
         except Exception:
             return self._json(400, {"error": {"message": "无效 JSON 请求体"}})
@@ -1153,9 +1344,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         return self._json(200, {"input_tokens": max(1, total // 3)})
 
     def _handle_chat(self, protocol: str):
+        _t0 = time.time()
         # 1) 读请求体
         try:
             length = int(self.headers.get("Content-Length") or 0)
+            if length > MAX_BODY_BYTES:
+                return self._json(413, {"error": {"message": f"请求体过大（{length} > {MAX_BODY_BYTES} 字节）"}})
             req_body = json.loads(self.rfile.read(length).decode("utf-8"))
         except Exception:
             return self._json(400, {"error": {"message": "无效 JSON 请求体"}})
@@ -1169,12 +1363,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
         else:
             oa = dict(req_body)
 
-        # 3) 模型解析（别名 → config_name）
+        # 3) 模型解析（别名 → config_name；未知模型放行，由上游校验）
         model = oa.get("model") or DEFAULT_MODEL
         real = MODEL_ALIAS.get(model, model)
-        if real not in MODELS:
-            return self._json(404, {"error": {"message": "模型 %s 不存在。可用: %s" % (model, ", ".join(sorted(MODELS)))}})
-        cfg = {"name": real, **MODELS[real]}
+        if real in MODELS:
+            cfg = {"name": real, **MODELS[real]}
+        else:
+            cfg = {"name": real, "model_name": real, "display": real, "ctx": 0}
         is_stream = bool(oa.get("stream"))
 
         # 4) 凭证
@@ -1183,16 +1378,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except Exception as e:
             return self._json(500, {"error": {"message": str(e)}})
 
-        # 5) 上游 agent 回合
-        query = messages_to_query(oa.get("messages"))
-        try:
-            chunks = list(agent_turn_chunks(sess, cfg, query))
-        except UpstreamError as e:
-            return self._json(e.status, {"error": {"message": str(e)}})
-        except Exception as e:
-            return self._json(502, {"error": {"message": "上游异常: %s" % e}})
-
-        _log("回合完成 model=%s stream=%s chunks=%d" % (real, is_stream, len(chunks)))
+        # 5) 上游 SOLO 聊天回合（llm_utils_chat 通道）
+        # P0 真流式：流式时保留生成器边收边写，非流式才落内存
+        if is_stream:
+            chunks = solo_turn_chunks(sess, cfg, oa)
+        else:
+            try:
+                chunks = list(solo_turn_chunks(sess, cfg, oa))
+            except UpstreamError as e:
+                return self._json(e.status, {"error": {"message": str(e)}})
+            except Exception as e:
+                return self._json(502, {"error": {"message": "上游异常: %s" % e}})
+            _log("回合完成 model=%s stream=False chunks=%d 耗时=%.2fs" % (real, len(chunks), time.time() - _t0))
 
         # 6a) 流式：协议状态机输出 SSE
         if is_stream:
@@ -1215,9 +1412,27 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.wfile.write(b"%x\r\n" % len(b_out) + b_out + b"\r\n")
                 self.wfile.flush()
 
+            def _write_error(err):
+                try:
+                    if protocol == "anthropic":
+                        _write_sse("error", json.dumps({"type": "error", "error": {
+                            "type": "api_error", "message": str(err)}}, ensure_ascii=False))
+                    elif protocol == "responses":
+                        _write_sse("response.failed", json.dumps({"type": "response.failed",
+                            "response": {"id": "resp_" + _rand(), "object": "response",
+                            "created_at": int(time.time()), "status": "failed",
+                            "model": req_model_name, "output": [],
+                            "error": {"code": "upstream_error", "message": str(err)}}}, ensure_ascii=False))
+                    else:
+                        _write_sse("", json.dumps({"error": {"message": str(err),
+                            "type": "api_error", "code": "upstream_error"}}, ensure_ascii=False))
+                except Exception:
+                    pass
+
+            n = 0
             try:
-                final_sent = False
                 for c in chunks:
+                    n += 1
                     if st is not None:
                         for ev, pl in st.feed(c):
                             _write_sse(ev, pl)
@@ -1226,13 +1441,30 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if st is not None:
                     for ev, pl in st.finish():
                         _write_sse(ev, pl)
-                        if ev in ("response.completed", "message_stop"):
-                            final_sent = True
                 else:
                     _write_sse("", "[DONE]")
                 self.wfile.write(b"0\r\n\r\n")
+                _log("回合完成 model=%s stream=True chunks=%d 耗时=%.2fs" % (real, n, time.time() - _t0))
+            except UpstreamError as e:
+                _log("流内上游错误 model=%s: %s" % (real, e))
+                _write_error(e)
+                try:
+                    if st is None:
+                        _write_sse("", "[DONE]")
+                    self.wfile.write(b"0\r\n\r\n")
+                except Exception:
+                    pass
             except (BrokenPipeError, ConnectionResetError):
                 _log("客户端提前断开 stream model=%s" % real)
+            except Exception as e:
+                _log("流式异常 model=%s: %r" % (real, e))
+                _write_error(e)
+                try:
+                    if st is None:
+                        _write_sse("", "[DONE]")
+                    self.wfile.write(b"0\r\n\r\n")
+                except Exception:
+                    pass
             return
 
         # 6b) 非流式：聚合 → 协议转换
@@ -1256,7 +1488,7 @@ def main():
         print("TRAE 官方模型代理已启动: http://127.0.0.1:%d" % PORT)
         print("警告: 凭证暂不可用（%s）；启动 TRAE SOLO CN 登录后自动恢复" % e)
     print("模型: %s" % ", ".join(sorted(MODELS)))
-    print("上游: agent 编排通道 %s" % GATEWAY)
+    print("上游: llm_utils_chat 通道（solo_work_lite）%s" % GATEWAY)
     print("认证: 自动复用 TRAE SOLO CN 登录态（token 过期时打开客户端刷新）")
     _log("启动 port=%d models=%d" % (PORT, len(MODELS)))
     try:

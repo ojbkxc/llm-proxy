@@ -1,0 +1,17 @@
+继续迭代 C:\GitHub\AIGX 项目（AI 中转网关，对标 new-api）。
+
+先读 AGENTS.md 第 0 节项目速览了解硬性约束与架构，再开工。
+
+工作方式：
+1. 开工前 git status 检查工作区，避让我另一个会话正在编辑的文件，
+   只提交你自己改的文件
+2. Rust 编译验证只走 GitHub CI（本地无工具链）；前端可本地
+   cd frontend && npm run build 验证
+3. 每轮改动：改码 → 本地 tsc/build 验证 → commit+push → GitHub API
+   查 CI runs 全绿才算完成
+4. 涉及部署：下载 CI artifacts 的 linux-amd64 产物，
+   SSH 装到 104.223.65.202:/opt/aigx/aigx 并重启服务（注意 config 重置坑）
+5. 功能验证用 tests/e2e/run-e2e.mjs 跑浏览器 E2E（12 项断言），
+   或 curl 直连生产 API
+
+我的需求是：[在这里写本轮要迭代的具体内容]

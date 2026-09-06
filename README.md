@@ -1,151 +1,196 @@
-# Workspace (Midea) LLM 本地代理
+# llm-proxy — 本地 LLM 代理合集
 
-把美的 Workspace 编辑器内部的 LLM 通道转成本地 **OpenAI 兼容 / Responses / Anthropic 兼容 API**，并内置外部大模型安全合规层。
+把官方 AI 编程客户端的模型通道转成本地 **OpenAI / Responses / Anthropic 三协议兼容 API**，零第三方依赖（仅 `cryptography`）。
 
-## 使用
+## 代理一览
+
+| 代理 | 客户端 | 默认端口 | 多账号 | 自动续期 | 跨平台 |
+|---|---|---|---|---|---|
+| `codearts_proxy.py` | 华为 CodeArts Agent | 8788 | ✅ 池轮询 | ✅ DPoP+STS | ✅ Win 抓取 / 任意平台运行 |
+| `trae_proxy.py` | 字节 TRAE SOLO CN | 8790 | — | ✅ refresh | ✅ |
+
+---
+
+## codearts_proxy.py — 华为 CodeArts Agent
+
+把 CodeArts Agent 的官方模型通道（inferhub / snap-access）转成本地 API，认证复用客户端登录态。
+
+### 快速开始
 
 ```bash
-# 前提：已安装并登录 Workspace 编辑器（首次登录仍走它，之后 accessToken 自动续期，见「认证自动续期」）
-python proxy.py
+# Windows 上（有 CodeArts Agent 客户端已登录）
+python codearts_proxy.py --capture          # 抓取当前登录态入池
+python codearts_proxy.py                    # 启动代理 → http://127.0.0.1:8788
 ```
 
-启动后本地可用接口（127.0.0.1:8787）：
+### 模型
 
-| 接口 | 协议 | 说明 |
+| model id | 上下文 | 说明 |
 |---|---|---|
-| `GET /v1/models` | OpenAI | 可用模型列表 |
-| `POST /v1/chat/completions` | OpenAI | 对话（支持 stream 透传） |
-| `POST /v1/responses` | OpenAI Responses | 新版协议（codex-cli 等，支持流式） |
-| `POST /v1/messages` | Anthropic | Messages 对话（支持流式） |
-| `POST /v1/messages/count_tokens` | Anthropic | token 估算（本地，不转发上游） |
-| `GET /health` | - | 当前登录用户和 token 有效期 |
+| `GLM-5.2` | 307200 | 最新旗舰模型，专为长程任务打造 |
+| `glm-5.2-sft-harmony` | 196608 | 基于 GLM-5.2 增训鸿蒙代码与开发知识 |
+| `openpangu-2.0-pro` | 512000 | 最新旗舰模型，复杂工程稳定交付 |
+| `openpangu-2.0-flash` | 512000 | 均衡推理效果与性能 |
 
-> 三种格式的请求体 / 响应体在代理内部统一转换为 OpenAI chat 格式调上游，再按客户端协议转换返回。流式也做同样的转换（OpenAI chat SSE → Responses SSE / Anthropic SSE）。
->
-> Responses 转 OpenAI chat 时，`parallel_tool_calls` 仅在显式声明 `tools` 时透传；否则丢弃。
-> 这是为了兼容 codex-cli：它即便不带 tools 也会发送 `parallel_tool_calls: false`，而上游
-> litellm 网关只允许在声明 `tools` 时携带该字段（否则 400）。
+别名：`glm-5.2` / `glm-5.2-harmony` / `pangu-pro` / `pangu-flash`。
 
-## 对接示例
+> 注：所有模型上游 `max_tokens` 请求参数上限为 65536（input+output 总 token 预算另计，
+> 超限返回 limit_err 81027/81001，代理会钳制并转成 413 提示）。
 
-任意支持上述协议的工具里这样配：
+### 端点
 
-- Base URL: `http://127.0.0.1:8787/v1`（Anthropic 客户端填 `http://127.0.0.1:8787`）
-- API Key: 任意值（本地代理不校验）
-- 模型名: 用 `GET /v1/models` 里返回的 id，如 `qwen3.8-max`、`gpt-5.6-luna`、`deepseek_v4` 等
-
-```bash
-# OpenAI 兼容
-curl http://127.0.0.1:8787/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{"model":"qwen3.8-max","messages":[{"role":"user","content":"hi"}]}'
-
-# Responses
-curl http://127.0.0.1:8787/v1/responses \
-  -H "Content-Type: application/json" \
-  -d '{"model":"qwen3.8-max","input":"hi"}'
-
-# Anthropic
-curl http://127.0.0.1:8787/v1/messages \
-  -H "Content-Type: application/json" \
-  -d '{"model":"qwen3.8-max","max_tokens":200,"messages":[{"role":"user","content":"hi"}]}'
-```
-
-## 安全合规层
-
-针对外部大模型使用规范内置以下拦截/脱敏（可配置）：
-
-| 规则 | 行为 | 配置位置 |
+| 端点 | 协议 | 说明 |
 |---|---|---|
-| 个人账号（`ex_` 开头的工号等特征） | 403 拦截，禁止调用外部大模型 | `PERSONAL_ACCOUNT_PATTERNS`（特征可扩展，拦截不可关闭） |
-| 政治 / 宗教 / 违法关键词 | 403 拦截，统一提示"禁止向外部大模型传敏感信息" | `SENSITIVE_WORDS` |
-| 手机号 / 身份证号 / 车牌号 / 银行卡号 | **可逆脱敏**：替换为 `PH_XXXX` 占位符后转发，响应回来时自动还原 | `_PII_PATTERN` |
-| 邮箱（含个人邮箱如 `ex_xxx@partner.midea.com`） | **可逆脱敏**：替换为 `PH_XXXX` 占位符后转发，响应回来时自动还原 | `_EMAIL_PATTERN` |
-| 密码 / API Key / Token / 私钥 / 连接串 / JWT | **可逆脱敏**：替换为 `PH_XXXX` 占位符后转发，响应回来时自动还原 | `REDACT_PATTERNS` |
-| 含 `.github` 的路径 | 跳过全部检查，直接转发（CI 自动流程场景） | `IGNORE_PATH_PARTS` |
-| 客户端名（Codex/Claude/CodeArts/Trae 等） | **可逆伪装**：替换为 `Workspace_<hash>` 占位符后转发，响应时自动还原 | `_CLIENT_SPOOF` |
+| `GET /health` | — | 健康检查（各账号过期状态） |
+| `GET /v1/models` | OpenAI | 模型列表 |
+| `POST /v1/chat/completions` | OpenAI | Chat Completions（流式/非流式） |
+| `POST /v1/responses` | Responses | Responses API（codex-cli 兼容） |
+| `POST /v1/messages` | Anthropic | Messages API（流式/非流式） |
+| `POST /v1/messages/count_tokens` | Anthropic | Token 计数 |
 
-### 脱敏原理
-
-1. 请求里的 `password=Abc123`、`api_key=sk-xxx`、手机号、身份证号、车牌号、银行卡号、邮箱等可逆值 → 替换为占位符 `PH_XXXX`
-2. 原文按 JSON 行写入 `audit_redact.jsonl`（审计 + 供响应还原）
-3. 大模型回复里若引用了 `PH_XXXX` → 代理在响应里自动还原回原文
-4. 同一请求里出现**多个**同类敏感值（如 2 个手机号、多个邮箱）会各自生成唯一占位符、全部替换；同一原文重复出现则共用同一占位符（哈希去重）
-5. 流式输出中占位符即使被模型按 token 拆开（如 `PH_1CC0` + `E18DDC`），代理也会跨 chunk 拼回完整占位符再还原为原文
-6. 政治/宗教/违法等**不可逆**关键词 → 直接 403 拦截，绝不外发
-
-> 审计文件：`audit_redact.jsonl`（与 proxy.py 同目录）。**拦截事件与脱敏原文都在这里**，满足"所有与外部大模型的交互均有审计记录、支持事后追查"的要求。
-
-## 请求身份
-
-代理默认从当前 Workspace 登录态（JWT 里的 preferred_username）取用户工号做合规判断。
-若你的工具能带自定义身份，可加请求头 `X-User-Id: <工号>` 覆盖；命中个人账号特征
-（默认 `ex_` 开头的工号，如 `ex_shenyk4`）的会被拦截。特征在
-`PERSONAL_ACCOUNT_PATTERNS` 中配置（可扩展，但"是否拦截"是固定逻辑）。
-
-## 认证自动续期
-
-proxy.py 会在 accessToken **临期（剩余 < 1 小时）或已过期**时，自动用
-refreshToken 调 `GET /api/login-server/v1/auth/refresh-token` 续期，并把新
-accessToken / refreshToken 写回 opencode.db（对 Workspace 编辑器透明）。
-
-- accessToken 每次续期约 +24h，refreshToken 约 +48h（Keycloak 会话内续期）。
-- 只要刷新能成功，就无需再手动打开编辑器；**只有 SSO 会话总寿命到期**（刷新返回
-  `success=false`）时才需要重新登录，此时请求会返回
-  「登录态已失效，请打开 Workspace 编辑器重新登录后再试」。
-- 续期结果写入 `proxy.log`（`[session] accessToken 已自动续期 ...`）。
-
-> opencode.db 里存有 `refreshToken` 字段。若你手动用 Workspace 编辑器重新登录，
-> 它可能覆盖掉这行（不带 refreshToken），导致自动续期失效退回提示；此时跑一次
-> `python ws_auth.py refresh` 把 refreshToken 补回即可。
-
-### ws_auth.py（独立认证脚本，不参与代理运行）
+### 多账号池
 
 ```bash
-python ws_auth.py status     # 只读展示 accessToken/refreshToken 有效期 + 两处存储一致性
-python ws_auth.py refresh    # 主动续期并双写（VSCode 存储 + opencode.db）
+python codearts_proxy.py --capture           # 抓取当前客户端登录态入池
+python codearts_proxy.py --list              # 查看池
+python codearts_proxy.py --remove LABEL      # 移除指定账号
+python codearts_proxy.py --export 路径.json  # 导出池（跨电脑迁移）
+python codearts_proxy.py --import 路径.json  # 导入池（合并，同标签覆盖）
 ```
 
-> 该脚本用 `cryptography`（AES-GCM）解 VSCode 存储的完整 session；主代理
-> `proxy.py` 保持零第三方依赖，不依赖它。
+池非空时自动 round-robin 轮询，过期账号跳过，401 自愈换号。每个账号独立 session id（N 账号 = N×3 并发会话额度）。
 
-## 日志与审计
+### 跨电脑迁移
 
-同目录生成 3 个文件：
+```bash
+# Windows 上抓取并导出
+python codearts_proxy.py --capture
+python codearts_proxy.py --export accounts.json
 
-| 文件 | 内容 |
-|---|---|
-| `proxy.log` | 运行日志（请求访问 + 启动/退出 + 自动续期）。环境变量 `WS_PROXY_LOG` 改路径，空字符串关闭 |
-| `audit_redact.jsonl` | 拦截事件 + 脱敏原文（密码/密钥/客户端名等占位符原文），用于审计追查 + 响应还原 |
-| `audit_pass.jsonl` | 放行请求记录（谁、何时、协议、模型、token 数，不写敏感原文），方便事后分析用量 |
-| `ws_auth.py` | 独立认证脚本（status / refresh），解 VSCode 存储 + 主动续期双写 |
+# Linux / 其他电脑上导入并运行
+pip install cryptography
+python codearts_proxy.py --import accounts.json
+python codearts_proxy.py
+```
 
-## 客户端指纹伪装
+**网盘共享**：设 `CODEARTS_PROXY_ACCOUNTS_FILE` 指向网盘同一份池文件，多机共享，mtime 热加载自动生效。
 
-上游（litellm 网关）可能检测调用方客户端。代理会把请求里出现的 `Codex`、`Claude`、
-`Anthropic`、`CodeArts Agent`、`TraeCode`、`Cline`、`Cursor`、`ZCode` 等第三方工具名，
-替换成 `Workspace_<hash>` 占位符后转发（仍是 Workspace 前缀，防检测一致）；响应回来时再精确还原成原名。
-同样，转发上游的 `User-Agent` 统一设为 `Workspace`。
+### 登录态自动续期
 
-> `OpenAI`、`MCP` 属于公司名 / 协议名，不是第三方客户端标识，不参与伪装，避免上游在
-> 被改写的 prompt 上推理（例如 "用 MCP 做 X" 不会被替换成 "用 Workspace_xxx 做 X"）。
+securitytoken 是临时凭证（≈2h），临期 1 小时自动调 STS OAuth 端点续期（DPoP ES256 签名），refresh_token 有效期 ≈24 天，期间无需人工干预。续期后新凭证写回池文件，代理自洽管理。
 
-## 工作原理
+> **已知限制**：续期不回写客户端 `state.vscdb`，refresh_token 轮换后客户端当前 session 失效（池账号不受影响）。`CLIENT_ID` 默认 `codearts-agent`，可用 `CODEARTS_PROXY_CLIENT_ID` 覆盖。
 
-1. Workspace 编辑器登录后会把 `{accessToken,label,id}` 用随机 key XOR 加密存进
-   `~/.local/share/workspace-code-prd/opencode.db` 的 `workspace_session` 表
-2. 本代理从该 db 解出 accessToken（JWT，Keycloak 签发，约 24h 有效）
-3. 用它调 `https://workspace-prd.midea.com/api/cn-control/ide/list-organizations`
-   和 `list-assistants` 拿到模型清单（真实推理网关是
-   `https://apiprod.midea.com/llm/f-devops-python-litellm/v1`）
-4. 请求时带上 `Authorization: Bearer <jwt>`、`TEAM: workspace-dev`、`SCENE: workspace-local`
-   （与 ws.exe 内置 fetch wrapper 完全一致），流式/非流式直接透传
+### 配置
 
-> token 过期（JWT exp）会报 500，打开 Workspace 编辑器让它自动刷新后再试。
-> 现在 proxy.py 会先尝试用 refreshToken 自动续期（见「认证自动续期」）；只有续期失败
-> （SSO 会话到期）才需要人工重新登录。
+| 环境变量 | 默认值 | 说明 |
+|---|---|---|
+| `CODEARTS_PROXY_PORT` | 8788 | 监听端口 |
+| `CODEARTS_PROXY_API_KEY` | (空) | API Key 鉴权（空=不鉴权，支持 `Authorization: Bearer` 和 `X-Api-Key`） |
+| `CODEARTS_PROXY_CLIENT_ID` | codearts-agent | STS OAuth client_id |
+| `CODEARTS_PROXY_ACCOUNTS_FILE` | 脚本同目录 | 池文件路径（网盘共享用） |
 
-## 模型别名
+请求体上限 8MB（防 OOM，对齐 trae_proxy）。
 
-`proxy.py` 顶部 `MODEL_ALIAS` 表可自定义"本地想用的名字 → Workspace 真实模型 id"，
-例如 `deepseek-v4-pro` → `deepseek_v4`。加别名只改这张表即可。
+### 测试
+
+```bash
+python test_codearts_proxy.py        # 9 项离线测试（不触网）
+```
+
+### 平台支持
+
+| 平台 | 代理运行 | `--capture` | 说明 |
+|---|---|---|---|
+| Windows | ✅ | ✅ | 全功能（DPAPI 解密客户端登录态） |
+| Linux / macOS | ✅ | ❌ | 池非空时全功能；`--import` 导入池后即可运行 |
+
+---
+
+## trae_proxy.py — 字节 TRAE SOLO CN
+
+把 TRAE SOLO CN 客户端的官方模型通道转成本地三协议兼容 API。
+
+### 快速开始
+
+```bash
+# 确保 TRAE SOLO CN 客户端已登录（token 有效期内）
+python trae_proxy.py
+```
+
+代理启动在 `http://127.0.0.1:8790`，自动复用客户端登录态。
+
+### 端点
+
+| 端点 | 协议 | 说明 |
+|---|---|---|
+| `GET /health` | — | 健康检查（token 有效期、模型数、缓存状态） |
+| `GET /v1/models` | OpenAI | 模型列表（动态拉取 + 1h 缓存） |
+| `POST /v1/chat/completions` | OpenAI | Chat Completions（流式/非流式） |
+| `POST /v1/responses` | Responses | Responses API（codex-cli 兼容） |
+| `POST /v1/messages` | Anthropic | Messages API（流式/非流式） |
+| `POST /v1/messages/count_tokens` | Anthropic | Token 计数 |
+
+### 配置
+
+优先级：环境变量 > `config.json` > 代码默认值。
+
+```bash
+export TRAE_PROXY_PORT=8790
+export TRAE_PROXY_API_KEY="your-secret-key"   # 空 = 不鉴权
+cp config.example.json config.json            # 或用配置文件
+```
+
+| 配置项 | 环境变量 | 默认值 | 说明 |
+|---|---|---|---|
+| port | `TRAE_PROXY_PORT` | 8790 | 监听端口 |
+| api_key | `TRAE_PROXY_API_KEY` | (空) | API Key 鉴权 |
+| max_body_mb | `TRAE_PROXY_MAX_BODY_MB` | 8 | 请求体大小上限 |
+| models_ttl | `TRAE_PROXY_MODELS_TTL` | 3600 | 模型列表缓存 TTL（秒） |
+| refresh_ahead_sec | `TRAE_PROXY_REFRESH_AHEAD_SEC` | 3600 | token 临期续期阈值（秒） |
+| default_model | `TRAE_PROXY_DEFAULT_MODEL` | glm-5.2 | 默认模型 |
+
+### 测试
+
+```bash
+python test_trae_proxy.py                       # 离线单元测试
+python test_trae_proxy.py --integration         # 单元 + 集成测试
+```
+
+---
+
+## 共同特性
+
+- **三协议兼容**：OpenAI Chat / Responses / Anthropic Messages 统一转换
+- **真流式**：边收边写，TTFB ≈ 0s
+- **自动续期**：token 临期自动刷新，无需手动登录
+- **API Key 鉴权**：可选，`Authorization: Bearer` 或 `X-Api-Key`
+- **body 限制**：8MB 上限防 OOM
+- **零依赖**：纯 Python 标准库 + `cryptography`
+
+## 依赖
+
+- Python 3.8+
+- `cryptography`（AES-256-GCM 解密 / ES256 DPoP 签名）
+
+```bash
+pip install cryptography
+```
+
+## 项目结构
+
+```
+llm-proxy/
+├── codearts_proxy.py          # 华为 CodeArts Agent 代理（多账号 + 自动续期）
+├── codearts-proxy.md          # codearts_proxy 设计文档（逆向细节）
+├── test_codearts_proxy.py     # codearts_proxy 测试套件（9 项）
+
+├── trae_proxy.py              # 字节 TRAE SOLO CN 代理
+├── test_trae_proxy.py         # trae_proxy 测试套件
+├── trae_login.py              # TRAE 登录辅助
+├── proxy.py                   # ws-proxy 合规层（账号拦截/脱敏/审计）
+├── test_proxy.py              # ws-proxy 测试
+├── ws_auth.py                 # ws-proxy 认证脚本
+├── config.example.json        # trae_proxy 配置模板
+└── AGENTS.md                  # 项目操作守则
+```
