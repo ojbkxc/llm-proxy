@@ -46,46 +46,55 @@ from typing import Dict, List, Optional, Tuple
 APP_NAME = "deploy_ai_cli"
 MANIFEST_NAME = ".deploy_backup_manifest.json"
 
-DEFAULT_BASE_URL = "https://cfapi.1232333.xyz/v1"
+# 网关地址：cfapi 云网关 / 本地 ws-proxy（proxy.py，端口 8787）都认识下面的
+# gpt-* 假名。换网关直接改这一行（本地 proxy 就改成 http://127.0.0.1:8787/v1）。
+DEFAULT_BASE_URL = "http://127.0.0.1:8787/v1"
 
 # 网关 API Key 占位符：留空表示未启用。把真实密钥填到这里即可免参数/免交互部署。
 # 安全提示：密钥会随源码明文传播，请勿将填好密钥的副本提交到公开仓库或随意转发。
 DEFAULT_API_KEY = "sk-wa-f9cb7d4ba48f403797fc3f55b928ceac"
 
-# Codex 模型分档：{ 档位名: (模型名, reasoning effort) }
+# Codex 模型分档（gpt-* 假名，两网关通用）：
+# { 档位名: (模型名, reasoning effort) }
 DEFAULT_CODEX_PROFILES: Dict[str, Tuple[str, str]] = {
-    "fast":   ("glm-5.3-flash", "low"),
-    "fast47": ("glm-4.7-flash", "low"),
-    "dfast":  ("deepseek-v4-flash-0731", "medium"),
-    "mid":    ("glm-5.2", "medium"),
-    "code":   ("kimi-k2.7-code", "high"),
-    "kimi":   ("kimi-k2.6", "high"),
-    "dspro":  ("glm-5.3", "high"),
-    "deep":   ("glm-5.3", "high"),
+    "fast":   ("gpt-5.6-luna-fast", "low"),
+    "sfast":  ("gpt-5.6-sol-fast", "low"),
+    "mid":    ("gpt-5.6-sol", "medium"),
+    "qwen":   ("qwen3.8-max", "medium"),
+    "qwenp":  ("qwen3.7-plus", "low"),
+    "hw":     ("hw-glm-5", "medium"),
+    "code":   ("gpt-5.6-luna", "high"),
+    "deep":   ("gpt-6-astra", "high"),
 }
-DEFAULT_CODEX_PRIMARY = "deepseek-v4-pro-0813"
+DEFAULT_CODEX_PRIMARY = "gpt-5.6-luna"
 
 # Claude 子代理分工：{ 子代理名: (模型名, 职责描述) }
 CLAUDE_AGENT_SPECS: Dict[str, Tuple[str, str]] = {
-    "code-reviewer": ("deepseek-v4-pro-0813",
+    "code-reviewer": ("gpt-5.6-sol",
                       "深度代码审查员。审查代码改动、排查 bug、检查安全风险与性能问题时主动使用。"),
-    "fast-writer":   ("glm-5.3-flash",
+    "fast-writer":   ("gpt-5.6-luna-fast",
                       "快速文档与修补助手。写注释、README、commit 说明、简单文案或小范围机械修改时主动使用。"),
-    "architect":     ("glm-5.2",
+    "architect":     ("gpt-6-astra",
                       "方案架构师。需要横向对比技术方案、评估架构取舍、制定实现计划时主动使用。"),
 }
 
-# Claude 主/辅模型环境变量映射（opus/sonnet 同为 glm-5.3 主力，haiku 用 flash）
+# Claude 主/辅模型环境变量映射（opus/sonnet 用假名主力，haiku 用 flash）
 CLAUDE_MODEL_ENV: Dict[str, str] = {
-    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "glm-5.3-flash",
-    "ANTHROPIC_DEFAULT_SONNET_MODEL": "glm-5.3",
-    "ANTHROPIC_DEFAULT_OPUS_MODEL":   "glm-5.3",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "gpt-5.6-luna-fast",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "gpt-5.6-luna",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL":   "gpt-6-astra",
 }
 
-# 官方 CLI 会本地校验模型名，非官方名（glm/deepseek）须注册进 modelPicker 才能通过。
-# behavesAs 指定按哪个官方模型处理（capability/effort 默认值），请求仍发原始模型名给网关。
+# 官方 CLI 会本地校验模型名，非官方名（gpt-* 假名/glm/deepseek）须注册进
+# modelPicker 才能通过。behavesAs 指定按哪个官方模型处理（capability/effort
+# 默认值），请求仍发原始模型名给网关。
 MODEL_PICKER: Dict = {
     "options": [
+        {"model": "gpt-6-astra",          "behavesAs": "claude-opus-4-8"},
+        {"model": "gpt-5.6-luna",         "behavesAs": "claude-opus-4-8"},
+        {"model": "gpt-5.6-luna-fast",    "behavesAs": "claude-haiku-4-5"},
+        {"model": "gpt-5.6-sol",          "behavesAs": "claude-sonnet-4-6"},
+        {"model": "gpt-5.6-sol-fast",     "behavesAs": "claude-haiku-4-5"},
         {"model": "glm-5.3",              "behavesAs": "claude-opus-4-8"},
         {"model": "glm-5.3-flash",        "behavesAs": "claude-haiku-4-5"},
         {"model": "glm-5.2",              "behavesAs": "claude-sonnet-4-6"},
@@ -1016,7 +1025,7 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument("--base-url", default=DEFAULT_BASE_URL,
-                   help="自定义网关地址（自动补 /v1 后缀，缺失时 codex responses 端点会 404）")
+                   help="自定义网关地址（自动补 /v1 后缀，缺失时 codex responses 端点会 404）；换网关也可以直接改脚本里的 DEFAULT_BASE_URL")
     p.add_argument("--api-key", default=None,
                    help="网关 API Key（优先级最高；不提供则依次尝试 --key-file / 脚本内置 DEFAULT_API_KEY / 复用现有配置 / 交互询问）")
     p.add_argument("--key-file", default=None, help="从文件读取 API Key")
@@ -1146,8 +1155,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     log.info("")
     log.info("后续提示：")
     log.info("  1. 环境变量已写入用户级，请「重开终端」使其生效")
-    log.info("  2. Codex 切模型：codex --profile fast/mid/code/deep")
-    log.info("  3. Claude 子代理：code-reviewer(deepseek-v4-pro) / fast-writer(glm-5.3-flash) / architect(glm-5.2)")
+    log.info("  2. Codex 切模型：codex --profile fast/sfast/mid/qwen/qwenp/hw/code/deep")
+    log.info("  3. Claude 子代理：code-reviewer(gpt-5.6-sol) / fast-writer(gpt-5.6-luna-fast) / architect(gpt-6-astra)")
     log.info("  4. 撤销本次改动：python %s --rollback", Path(__file__).name)
     if IS_WINDOWS:
         log.info("  5. Windows 已知问题：codex exec 的 workspace-write 在部分版本不生效，")
