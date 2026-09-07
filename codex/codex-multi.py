@@ -96,7 +96,7 @@ def _env(key, default=""):
     return os.environ.get(key) or _DOTENV.get(key) or default
 
 
-# 远程服务器（复用 remote-multi.py 的已验证凭据；.env 可覆盖）
+# 远程服务器（.env 可覆盖）
 REMOTE_HOST = _env("REMOTE_HOST", "104.223.65.202")
 REMOTE_PORT = int(_env("REMOTE_PORT", "10122"))
 REMOTE_USER = _env("REMOTE_USER", "root")
