@@ -42,6 +42,7 @@ GPT 假名（网关 cf-ai-gw 提供, 可在 -m / 场景配置里直接用, 与�
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -84,6 +85,20 @@ def sh(cmd):
 def sh_tmux(args):
     """封装 tmux 调用，忽略失败返回值。"""
     return sh([TMUX] + args)
+
+
+def ensure_tmux():
+    """检查 tmux 是否可用。Windows 本机无 tmux 时给出清晰指引，避免裸抛 WinError 2。"""
+    if shutil.which(TMUX) is None:
+        print(
+            "[错误] 未找到 tmux。codex-tm.py 是 Linux 服务器端脚本，"
+            "依赖 tmux 做持久会话（断 SSH 不掉线）。\n"
+            "  - 本机 Windows 请改用 win-code.py（本地/远程 Codex 启动器）\n"
+            "  - 或到 Linux 服务器 /opt/codex 下运行本脚本",
+            file=sys.stderr,
+        )
+        return False
+    return True
 
 
 def load_scenarios():
@@ -221,6 +236,8 @@ def start_all():
 
 def menu():
     """无参数启动时：数字交互菜单。"""
+    if not ensure_tmux():
+        return
     choices = [
         ("start",   "启动 Codex 持续终端（选模型场景）"),
         ("startall", "全部模型场景一起启动 (glm/deep/kimi/dfast/gfast 并行)"),
@@ -301,6 +318,9 @@ def main():
     if not args.action:
         menu()
         return
+
+    if not ensure_tmux():
+        sys.exit(1)
 
     if args.action == "start":
         start(args.scene)

@@ -22,23 +22,29 @@ Workspace (Midea) LLM 本地代理 - 纯 Python 标准库实现，无需 pip ins
 import base64
 import hashlib
 import http.server
+import io
 import json
 import os
 import re
+import socket
 import sqlite3
 import sys
 import threading
 import time
+import urllib.error
 import urllib.request
+import webbrowser
 
 # 模型映射：你本地希望用的名字 → Workspace 里的真实 model id
 # 想加别名/改名字只改这张表即可，不用动下面的逻辑
 MODEL_ALIAS = {
-    "deepseek-v4-pro": "deepseek_v4",
+    "gpt-6-astra":     "gpt-5.6-luna",
     "gpt-5.6-luna":    "gpt-5.6-luna",
+    "gpt-5.6-luna-fast": "qwen3.8-max",
+    "gpt-5.6-sol":     "aliyun-glm-5.2",
+    "gpt-5.6-sol-fast": "qwen3.7-plus",
     "qwen3.8-max":     "qwen3.8-max",
     "qwen3.7-plus":    "qwen3.7-plus",
-    "glm-5.2":         "aliyun-glm-5.2",
     "hw-glm-5":        "hw-glm-5",
 }
 
@@ -141,11 +147,16 @@ def _log(msg: str):
         return
     _enqueue("log", "%s %s" % (time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()), msg))
 
+# 按天分文件（如 audit_redact_260907.jsonl）：跨天后写新文件，旧文件自然封存不再增长
+_TODAY_TAG = time.strftime("%y%m%d")
+# 启动时回载近几天的占位符映射（用于还原跨天会话里的占位符）
+AUDIT_CACHE_DAYS = 7
+
 # 审计日志：脱敏原文存储在这里，用于审计追查 + 响应后还原占位符
-AUDIT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "audit_redact.jsonl")
+AUDIT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "audit_redact_%s.jsonl" % _TODAY_TAG)
 
 # 放行请求审计：未拦截的请求记录单独存一个文件，方便事后分析（谁、何时、什么协议/模型、token 数）
-PASS_AUDIT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "audit_pass.jsonl")
+PASS_AUDIT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "audit_pass_%s.jsonl" % _TODAY_TAG)
 
 
 def _audit_pass(entry: dict):
@@ -164,6 +175,12 @@ _session_cache = {"at": 0, "data": None}
 REFRESH_AHEAD_SEC = 3600
 # refresh-token 端点（与 ws.exe MideaAuthenticationService.performRefresh 一致）
 REFRESH_URL = BASE + "/api/login-server/v1/auth/refresh-token"
+# 浏览器交互式登录端点（与 ws.exe MideaAuthenticationService.getLoginState/getLoginToken 一致）
+LOGIN_STATE_URL = BASE + "/api/login-server/v1/auth/state"
+LOGIN_TOKEN_URL = BASE + "/api/login-server/v1/auth/token?state="
+# 浏览器登录总超时与轮询间隔（ws.exe 用 180s / 1s，此处保持一致）
+BROWSER_LOGIN_TIMEOUT = 180
+BROWSER_LOGIN_POLL_INTERVAL = 1.0
 
 
 def _decrypt_session_row(key: str, enc_hex: str) -> dict:
@@ -233,6 +250,44 @@ def _write_session_row(payload: dict):
         con.close()
 
 
+# Workspace 编辑器路径（token 失效时自动拉起，编辑器会自动登录刷新 db）
+WS_EDITOR = os.path.join(
+    os.environ.get("LOCALAPPDATA", ""), "Programs", "Workspace", "Workspace.exe"
+)
+
+
+def _try_relogin_via_editor(wait_sec: int = 45) -> bool:
+    """拉起 Workspace 编辑器并等待它自动重新登录（db 里的 session 被刷新）。
+
+    返回 True 表示 db 中出现了有效期更长的 accessToken（视为自愈成功）。
+    持有 _session_lock 调用（_refresh_session_locked 内），期间该锁不释放：
+    并发请求会阻塞在此，等编辑器刷新完一起恢复。
+    """
+    old_exp = 0
+    try:
+        old_exp = int(_decode_jwt(_load_session_from_db().get("accessToken") or "").get("exp", 0))
+    except Exception:
+        pass
+    try:
+        os.startfile(WS_EDITOR)  # 已在运行也无妨，startfile 只是再唤起一次
+        _log("[session] 已拉起 Workspace 编辑器，等待自动登录...")
+    except Exception as e:
+        _log("[session] 拉起编辑器失败: %s" % e)
+        return False
+    deadline = time.time() + wait_sec
+    while time.time() < deadline:
+        time.sleep(3)
+        try:
+            exp = int(_decode_jwt(_load_session_from_db().get("accessToken") or "").get("exp", 0))
+            if exp > old_exp:  # token 被编辑器刷新了
+                _log("[session] 编辑器自愈成功，登录态已刷新")
+                return True
+        except Exception:
+            continue
+    _log("[session] 等待编辑器自愈超时（%ss）" % wait_sec)
+    return False
+
+
 def _refresh_token_via_refresh(refresh_token: str) -> dict:
     """用 refreshToken 调刷新端点，返回 {accessToken, refreshToken, exp}。"""
     # 走 _http_json 而非 _opener：mock 测试模式下能记录请求并注入预设响应
@@ -258,9 +313,24 @@ def _refresh_session_locked(db_data: dict) -> dict:
     try:
         new = _refresh_token_via_refresh(rt)
     except Exception as e:
-        # SSO 会话到期、网络异常等都归为刷新失败：提示重新登录
-        _log("[session] 自动刷新失败: %s" % e)
-        raise RuntimeError("登录态已失效，请打开 Workspace 编辑器重新登录后再试") from e
+        # SSO 会话到期、网络异常等都归为刷新失败。
+        # 自愈优先级：浏览器登录（无需打开编辑器）→ 失败再拉起 Workspace 编辑器兜底
+        # （编辑器会自动重新登录刷新 db；代码保留，浏览器登录不可用时仍可走这条老路）
+        _log("[session] 自动刷新失败: %s，尝试浏览器登录" % e)
+        try:
+            return _browser_login_locked()
+        except Exception as be:
+            _log("[session] 浏览器登录不可用: %s，降级拉起编辑器自愈" % be)
+        _log("[session] 尝试拉起编辑器自愈")
+        if _try_relogin_via_editor():
+            try:
+                db_data2 = _load_session_from_db()
+                rt2 = db_data2.get("refreshToken") or rt
+                new = _refresh_token_via_refresh(rt2)
+            except Exception as e2:
+                raise RuntimeError("登录态已失效，编辑器自愈后仍刷新失败: %s" % e2) from e2
+        else:
+            raise RuntimeError("登录态已失效，请完成浏览器登录或打开 Workspace 编辑器重新登录后再试") from e
     # 写回 db（含新 refreshToken，保证下次还能续期；对 ws.exe 透明）
     label = db_data.get("label", "")
     uid = db_data.get("id", "")
@@ -293,29 +363,105 @@ def _read_session() -> dict:
         if data and now - _session_cache["at"] < 10 and data["exp"] - now > REFRESH_AHEAD_SEC:
             return data
         # 缓存过期/临期：重读 db 拿最新（可能含别人刚写的 refreshToken）
-        db_data = _load_session_from_db()
-        token = db_data.get("accessToken") or ""
+        db_data = None
         try:
-            jwt = _decode_jwt(token)
-        except Exception:
-            jwt = {}
-        exp = int(jwt.get("exp", 0))
-        username = jwt.get("preferred_username", "") or db_data.get("id", "")
-        if exp - now <= REFRESH_AHEAD_SEC:
+            db_data = _load_session_from_db()
+        except Exception as e:
+            # db 无有效 session（全新机器/行损坏）：直接走浏览器交互式登录
+            _log("[session] 读 db 失败: %s，尝试浏览器登录" % e)
+        if db_data is not None:
+            token = db_data.get("accessToken") or ""
+            try:
+                jwt = _decode_jwt(token)
+            except Exception:
+                jwt = {}
+            exp = int(jwt.get("exp", 0))
+            username = jwt.get("preferred_username", "") or db_data.get("id", "")
+            if exp - now > REFRESH_AHEAD_SEC:
+                session = {
+                    "accessToken": token,
+                    "label": db_data.get("label", ""),
+                    "id": db_data.get("id", ""),
+                    "username": username,
+                    "exp": exp,
+                    "refreshToken": db_data.get("refreshToken", ""),
+                }
+                _session_cache.update({"at": now, "data": session})
+                return session
             # 临期或已过期：优先用 refreshToken 自动续期
             db_data["username"] = username
-            session = _refresh_session_locked(db_data)
-        else:
-            session = {
-                "accessToken": token,
-                "label": db_data.get("label", ""),
-                "id": db_data.get("id", ""),
-                "username": username,
-                "exp": exp,
-                "refreshToken": db_data.get("refreshToken", ""),
-            }
+            try:
+                session = _refresh_session_locked(db_data)
+                _session_cache.update({"at": now, "data": session})
+                return session
+            except Exception as e:
+                # refreshToken 也失效：降级走浏览器交互式登录（复刻 ws.exe 登录流程）
+                _log("[session] refreshToken 续期失败: %s，尝试浏览器登录" % e)
+        session = _browser_login_locked()
         _session_cache.update({"at": now, "data": session})
         return session
+
+
+# ── 浏览器交互式登录（复刻 ws.exe MideaAuthProvider.createSession 流程）──────
+def _browser_login_locked() -> dict:
+    """（持有 _session_lock 时调用）打开默认浏览器完成 SSO 登录，轮询拿到 token。
+
+    流程与 Workspace 编辑器一致：
+      1. GET /auth/state → {state, login_url}
+      2. 用系统默认浏览器打开 login_url（用户在浏览器里完成企业 SSO 认证）
+      3. 每秒 GET /auth/token?state=... 轮询，认证完成后返回新 token
+      4. 双写 opencode.db（proxy 自己用）
+    超时（BROWSER_LOGIN_TIMEOUT 秒）或认证服务不可用 → 抛 RuntimeError。
+    """
+    with _http_json(LOGIN_STATE_URL, {}, method="GET", timeout=30) as resp:
+        st = json.loads(resp.read().decode("utf-8"))
+    if not st.get("success"):
+        raise RuntimeError("认证服务不可用（/auth/state success=false），请稍后重试或手动登录 Workspace")
+    body = st.get("body") or {}
+    state, login_url = body.get("state") or "", body.get("login_url") or ""
+    if not state or not login_url:
+        raise RuntimeError("认证服务返回异常（缺少 state/login_url），请手动登录 Workspace")
+    try:
+        webbrowser.open(login_url)
+        _log("[session] 已打开浏览器等待登录: %s" % login_url)
+    except Exception as e:
+        _log("[session] 打开浏览器失败: %s（可手动打开上面地址完成登录）" % e)
+    deadline = time.time() + BROWSER_LOGIN_TIMEOUT
+    while time.time() < deadline:
+        time.sleep(BROWSER_LOGIN_POLL_INTERVAL)
+        try:
+            with _http_json(LOGIN_TOKEN_URL + state, {}, method="GET", timeout=30) as resp:
+                tok = json.loads(resp.read().decode("utf-8"))
+        except Exception as e:
+            _log("[session] 轮询 token 失败（继续）: %s" % e)
+            continue
+        if tok.get("success"):
+            b = tok.get("body") or {}
+            access_token = (b.get("access_token") or "").replace("Bearer", "").replace("bearer", "").strip()
+            refresh_token = b.get("refresh_token") or ""
+            user = b.get("user") or {}
+            if not access_token:
+                continue
+            uid = user.get("uid", "")
+            cn = user.get("cn", "") or uid
+            try:
+                exp = int(_decode_jwt(access_token).get("exp", 0))
+            except Exception:
+                exp = int((b.get("access_token_info") or {}).get("expire_time", 0))
+            _write_session_row({"accessToken": access_token, "id": uid, "label": cn,
+                                "refreshToken": refresh_token})
+            _log("[session] 浏览器登录成功，用户 %s，有效期至 %s (UTC)" %
+                 (cn, time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(exp))))
+            return {
+                "accessToken": access_token,
+                "label": cn,
+                "id": uid,
+                "username": _decode_jwt(access_token).get("preferred_username", "") or uid,
+                "exp": exp,
+                "refreshToken": refresh_token,
+            }
+    raise RuntimeError("浏览器登录超时（%ss）：请在浏览器完成认证后重试，或打开 Workspace 编辑器手动登录"
+                       % BROWSER_LOGIN_TIMEOUT)
 
 
 # 测试开关：若设置了 WS_PROXY_MOCK，则所有上游 HTTP 调用都走本地 mock（不触网）。
@@ -686,8 +832,9 @@ _redact_cache_lock = threading.Lock()
 
 
 def _remember(placeholder: str, original: str, category: str, user: str):
+    # ts 用行号近似（文件名已含日期，行序即顺序），减小文件体积
     entry = {"placeholder": placeholder, "original": original, "category": category,
-             "user": user, "ts": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())}
+             "user": user}
     with _redact_cache_lock:
         _redact_cache[placeholder] = entry
     _audit_record(entry)
@@ -699,24 +846,31 @@ def _lookup(placeholder: str):
 
 
 def load_audit_cache():
-    """启动时加载已有审计文件，使重启后仍能还原历史占位符。"""
-    if not os.path.exists(AUDIT_FILE):
-        return
-    try:
-        with open(AUDIT_FILE, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    entry = json.loads(line)
-                except Exception:
-                    continue
-                if entry.get("placeholder"):
-                    with _redact_cache_lock:
-                        _redact_cache.setdefault(entry["placeholder"], entry)
-    except Exception:
-        pass
+    """启动时加载近 N 天的审计文件（含今天的），使重启后仍能还原历史占位符。
+
+    文件按天命名（audit_redact_YYMMDD.jsonl），这里倒序加载最近 AUDIT_CACHE_DAYS 天：
+    再早的占位符不再还原（日常对话不会引用几天前的占位符），旧文件可自行删除。
+    """
+    import glob as _glob
+    base_dir = os.path.dirname(AUDIT_FILE)
+    prefix = os.path.basename(AUDIT_FILE).rsplit("_", 1)[0] + "_"  # audit_redact_
+    days = sorted(_glob.glob(os.path.join(base_dir, prefix + "*.jsonl")), reverse=True)[:AUDIT_CACHE_DAYS]
+    for path in days:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        entry = json.loads(line)
+                    except Exception:
+                        continue
+                    if entry.get("placeholder"):
+                        with _redact_cache_lock:
+                            _redact_cache.setdefault(entry["placeholder"], entry)
+        except Exception:
+            continue
 
 
 def _replace_redact(text: str, user: str) -> tuple[str, list]:
@@ -1330,7 +1484,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def _block(self, message: str, user: str, protocol: str, model: str = ""):
         audit_block({"user": user, "protocol": protocol, "model": model,
-                     "reason": message, "ts": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())})
+                     "reason": message})
         return self._json(403, {
             "error": {
                 "type": "compliance_blocked",
@@ -1463,13 +1617,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self._block(reason, user, protocol, req_body.get("model", ""))
             req_body = redacted_body
 
+        # 4) 模型解析（必须先于 _spoof_walk：否则别名如 "deepseek-v4-pro" 里的
+        #    "deepseek" 会被伪装成 Workspace_<hash>，导致别名永远匹配不上）
+        model_id = req_body.get("model") or ""
+        model_id = MODEL_ALIAS.get(model_id, model_id)  # 别名 → 真实 id
+        client_model = req_body.get("model", "")  # 客户端请求的原名（回程改写响应 model 字段用）
+
         # 3.5) 客户端指纹伪装：把 Codex/Claude/CodeArts/Trae 等名字替换为 Workspace 占位符
         #      （响应回来时在 _common_llm 出口统一还原，见步骤 6/7）
         req_body = _spoof_walk(req_body, user)
 
-        # 4) 模型解析
-        model_id = req_body.get("model") or ""
-        model_id = MODEL_ALIAS.get(model_id, model_id)  # 别名 → 真实 id
         try:
             models = get_models(session)
         except Exception as e:
@@ -1517,8 +1674,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if retry_payload is not None:
                 _audit_pass({"action": "upstream_retry", "user": user, "protocol": protocol,
                              "model": req_body.get("model", ""), "status": e.code,
-                             "max_tokens": capped,
-                             "ts": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())})
+                             "max_tokens": capped})
                 try:
                     upstream = _forward(retry_payload)
                 except urllib.error.HTTPError as e2:
@@ -1527,30 +1683,25 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     except Exception:
                         detail = ""
                     _audit_pass({"action": "upstream_error", "user": user, "protocol": protocol,
-                                 "model": req_body.get("model", ""), "status": e2.code,
-                                 "ts": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())})
+                                 "model": req_body.get("model", ""), "status": e2.code})
                     return self._json(e2.code, {"error": {"message": "上游 %s: %s" % (e2.code, detail)}})
                 except Exception as e2:
                     _audit_pass({"action": "upstream_error", "user": user, "protocol": protocol,
-                                 "model": req_body.get("model", ""), "status": 500,
-                                 "ts": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())})
+                                 "model": req_body.get("model", ""), "status": 500})
                     return self._json(500, {"error": {"message": str(e2)}})
             else:
                 _audit_pass({"action": "upstream_error", "user": user, "protocol": protocol,
-                             "model": req_body.get("model", ""), "status": e.code,
-                             "ts": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())})
+                             "model": req_body.get("model", ""), "status": e.code})
                 return self._json(e.code, {"error": {"message": "上游 %s: %s" % (e.code, detail)}})
         except Exception as e:
             _audit_pass({"action": "upstream_error", "user": user, "protocol": protocol,
-                         "model": req_body.get("model", ""), "status": 500,
-                         "ts": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())})
+                         "model": req_body.get("model", ""), "status": 500})
             return self._json(500, {"error": {"message": str(e)}})
 
         if is_stream:
             # 放行审计：记录未拦截请求（流式不等待完成，先记一条）
             _audit_pass({"action": "pass", "user": user, "protocol": protocol,
-                         "model": req_body.get("model", ""), "stream": True,
-                         "ts": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())})
+                         "model": req_body.get("model", ""), "stream": True})
             # 流式：上游始终是 OpenAI chat SSE。按客户端协议转换：
             #   openai    → 透传（边还原占位符）
             #   responses → Responses SSE 事件流（codex-cli 依赖 response.completed 等）
@@ -1566,10 +1717,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
 
             # 协议流状态：把 OpenAI chat 的 delta 增量转成目标协议 SSE 事件
+            # （model 用客户端请求名，responses/anthropic 事件里的 model 字段保持一致）
             if protocol == "responses":
-                st = _ResponsesStreamState(req_body.get("model", ""))
+                st = _ResponsesStreamState(client_model)
             elif protocol == "anthropic":
-                st = _AnthropicStreamState(req_body.get("model", ""))
+                st = _AnthropicStreamState(client_model)
             else:
                 st = None
 
@@ -1618,6 +1770,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     # （与 responses/anthropic 一致），否则拆成两块的占位符无法还原。
                     obj = restore_body(obj)
                     obj = _unspoof_walk(obj)
+                    # openai chat 透传流：model 字段改写为客户端请求名（与非流式一致）
+                    if client_model and obj.get("model") != client_model:
+                        obj = dict(obj)
+                        obj["model"] = client_model
                     for ch in (obj.get("choices") or []):
                         d = ch.get("delta") or {}
                         for key in ("content", "reasoning_content"):
@@ -1685,6 +1841,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         try:
             resp_obj = restore_body(resp_obj)
             resp_obj = _unspoof_walk(resp_obj)   # 还原客户端名（Codex/Claude 等 → 原名）
+            # 响应 model 字段改写为客户端请求名（如 gpt-6-astra），否则 Codex 等客户端
+            # 校验"请求模型 == 响应模型"会失败（上游返回的是真实 id 如 gpt-5.6-luna-2026-07-09）
+            if client_model and isinstance(resp_obj, dict) and resp_obj.get("model") != client_model:
+                resp_obj = dict(resp_obj)
+                resp_obj["model"] = client_model
             out = out_fn(resp_obj, req_body)
             # 放行审计：记录未拦截请求（含上游返回的 token 统计）
             usage = resp_obj.get("usage") or {}
@@ -1692,8 +1853,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                          "model": req_body.get("model", ""), "stream": False,
                          "prompt_tokens": usage.get("prompt_tokens"),
                          "completion_tokens": usage.get("completion_tokens"),
-                         "total_tokens": usage.get("total_tokens"),
-                         "ts": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())})
+                         "total_tokens": usage.get("total_tokens")})
             return self._json(200, out)
         except Exception as e:
             return self._json(502, {"error": {"message": "转换响应失败: %s" % e}})
@@ -2087,6 +2247,17 @@ def main():
     except Exception as e:
         print("[ws-proxy] 警告: " + str(e))
     _log("=== ws-proxy 启动 ===")
+
+    # 后台预热模型列表：消除首个真实请求的拉取延迟（失败静默，首次请求会再拉）
+    def _warmup():
+        try:
+            s = _read_session()
+            get_models(s)
+            _log("[warmup] 模型列表预热完成")
+        except Exception as e:
+            _log("[warmup] 模型列表预热失败（不影响使用）: %s" % e)
+    threading.Thread(target=_warmup, daemon=True, name="ws-proxy-warmup").start()
+
     server = QuietThreadingHTTPServer(("127.0.0.1", PORT), Handler)
     print("[ws-proxy] http://127.0.0.1:%d/v1  (OpenAI / Responses / Anthropic 兼容, Ctrl+C 退出)" % PORT)
     print("[ws-proxy] 拦截/脱敏审计: %s" % AUDIT_FILE)
@@ -2097,8 +2268,10 @@ def main():
         server.serve_forever()
     except KeyboardInterrupt:
         _log("=== ws-proxy 退出 ===")
-        shutdown_writer()
         print("\n[ws-proxy] 已退出")
+    finally:
+        # 无论正常退出还是异常退出，都把内存队列里的日志/审计刷盘
+        shutdown_writer()
 
 
 if __name__ == "__main__":
