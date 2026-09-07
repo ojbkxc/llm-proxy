@@ -15,7 +15,7 @@ codex-remote-cli.py — 远程 Codex app-server 命令行客户端（Windows 本
 
     进入交互界面后直接输入对话，可断点续跑（resume/fork）。
     注意: `--remote` 只支持交互式 TUI，不支持 `codex exec`。
-    （或直接用同目录 win-code.py remote，自动带 token）
+    （或直接用同目录 codex-multi.py remote，自动带 token 并切模型）
 
 ===========================================================
 用法 B（本脚本，命令行脚本化，适合自动化/CI）:
