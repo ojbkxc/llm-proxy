@@ -70,9 +70,12 @@ class _DummyDB:
     """替身 sqlite 连接：proxy 的 _load_session_from_db / _write_session_row 走它读写。"""
     def __init__(self, rows):
         self.rows = list(rows)  # [(id, key, encrypted_hex, timestamp), ...]
-        self.written = []
+        self.written = []       # 记录 INSERT params，供测试断言写回内容
 
     def execute(self, sql, params=()):
+        if "INSERT" in sql.upper():
+            self.written.append(params)
+
         class _Cur:
             def __init__(self, owner, sql, params):
                 self.owner = owner
@@ -1019,10 +1022,8 @@ def test_auto_refresh_trigger():
 
 
 def test_auto_refresh_fail_prompt():
-    print("\n== 刷新失败提示重新登录 ==")
+    print("\n== 刷新失败 → 浏览器登录兜底成功（全程不拉起 Workspace 编辑器） ==")
     s = make_server()
-    s.enqueue(orgs_response())
-    s.enqueue(assistants_response())
     now = int(time.time())
     near_exp = now + 60
     rows = [("default", "k" * 64,
@@ -1030,21 +1031,42 @@ def test_auto_refresh_fail_prompt():
                                  "label": "麦志业", "refreshToken": "rt-old-token"}), now)]
     orig_connect = proxy.sqlite3.connect
     proxy.sqlite3.connect = lambda *a, **kw: _DummyDB(rows)
+    nb = _NoBrowser()
+    orig_webbrowser = proxy.webbrowser
+    proxy.webbrowser = nb
+    startfile_calls = []
+    orig_startfile = proxy.os.startfile
+    proxy.os.startfile = lambda *a, **kw: startfile_calls.append(a)
+    orig_poll = proxy.BROWSER_LOGIN_POLL_INTERVAL
+    proxy.BROWSER_LOGIN_POLL_INTERVAL = 0.01
     try:
         with proxy._session_lock:
             proxy._session_cache.update({"at": 0, "data": None})
-        # mock 上游：refresh-token 端点返回 success=false（SSO 会话到期）
+        # mock 消费顺序：1) refresh-token 失败  2) auth/state 成功  3) auth/token 轮询成功
+        # 4) orgs  5) assistants  6) chat
         s.enqueue(json.dumps({"success": False, "body": {}}))
-        try:
-            http_req("POST", "/v1/chat/completions",
-                     {"model": "qwen3.8-max", "messages": [{"role": "user", "content": "hi"}]})
-            check("刷新失败应返回 500", False)
-        except urllib.error.HTTPError as e:
-            body = e.read().decode("utf-8")
-            check("刷新失败返回 500", e.code == 500, str(e.code))
-            check("错误信息提示重新登录", "重新登录" in body, body[:200])
+        s.enqueue(state_response(state="st-fallback"))
+        s.enqueue(token_response(state="st-fallback"))
+        s.enqueue(orgs_response())
+        s.enqueue(assistants_response())
+        s.enqueue(chat_nonstream_response(text="浏览器兜底成功"))
+        resp = http_req("POST", "/v1/chat/completions",
+                        {"model": "qwen3.8-max", "messages": [{"role": "user", "content": "hi"}]})
+        out = json.loads(resp.read().decode("utf-8"))
+        check("刷新失败后浏览器登录兜底成功",
+              out.get("choices", [{}])[0].get("message", {}).get("content") == "浏览器兜底成功",
+              json.dumps(out, ensure_ascii=False)[:200])
+        check("全程未拉起 Workspace 编辑器", not startfile_calls, startfile_calls)
+        check("浏览器打开过一次登录页", len(nb.opened) == 1, nb.opened)
+        cur = proxy._session_cache["data"]
+        check("缓存来自浏览器登录的新 token", bool(cur and cur.get("refreshToken") == "rt-browser-new"), cur)
     finally:
         proxy.sqlite3.connect = orig_connect
+        proxy.webbrowser = orig_webbrowser
+        proxy.os.startfile = orig_startfile
+        proxy.BROWSER_LOGIN_POLL_INTERVAL = orig_poll
+        with proxy._session_lock:
+            proxy._session_cache.update({"at": 0, "data": None})
 
 
 def test_refresh_strips_bearer_and_writes_refresh():
@@ -1055,6 +1077,188 @@ def test_refresh_strips_bearer_and_writes_refresh():
     res = proxy._refresh_token_via_refresh("rt-old-token")
     check("刷新返回新 accessToken（已剥 Bearer）", res["accessToken"] == new_at, res)
     check("刷新返回新 refreshToken", res["refreshToken"] == "rt-new-token", res)
+
+
+# ── 浏览器交互式登录（refreshToken 彻底失效时的兜底） ─────────────────────
+
+def state_response(state="st-abc123", login_url=None):
+    """构造 /auth/state 响应体。"""
+    return json.dumps({
+        "success": True,
+        "body": {"state": state, "login_url": login_url or
+                 ("https://workspace-prd.midea.com/api/login-server/v1/auth/login?state=" + state)},
+    })
+
+
+def token_response(state="st-abc123", success=True, access_token=None, refresh_token=None):
+    """构造 /auth/token?state= 响应体（模拟轮询成功）。"""
+    body = {"success": success}
+    if success:
+        access_token = access_token or _jwt(int(time.time()) + 3600)
+        body["body"] = {
+            "access_token": "Bearer " + access_token,
+            "refresh_token": refresh_token or "rt-browser-new",
+            "user": {"uid": "ex_mazy16", "cn": "麦志业"},
+            "access_token_info": {"expire_time": int(time.time()) + 3600},
+            "refresh_token_info": {"expire_time": int(time.time()) + 7200},
+        }
+    return json.dumps(body)
+
+
+class _NoBrowser:
+    """替身 webbrowser：记录 open() 调用，不真正打开浏览器。"""
+    def __init__(self):
+        self.opened = []
+
+    def open(self, url, *a, **kw):
+        self.opened.append(url)
+        return True
+
+
+class _DummyDBNoRows(_DummyDB):
+    """初始无 session 行的空 db（从未登录场景）。"""
+    def __init__(self):
+        super().__init__(rows=[])
+
+
+def test_browser_login_on_refresh_fail():
+    print("\n== refreshToken 失效 → 自动浏览器登录（state→轮询→双写） ==")
+    s = make_server()
+    now = int(time.time())
+    far_expired_rt = "rt-dead-token"
+    # db 中：accessToken 已过期 + refreshToken 已彻底失效
+    rows = [("default", "k1", _xor_enc("k1", {"accessToken": _jwt(now - 7200),
+                                              "label": "麦志业", "refreshToken": far_expired_rt}), now)]
+    proxy.sqlite3.connect = lambda *a, **kw: _DummyDB(rows)
+    nb = _NoBrowser()
+    orig_webbrowser = proxy.webbrowser
+    proxy.webbrowser = nb
+    orig_poll = proxy.BROWSER_LOGIN_POLL_INTERVAL
+    proxy.BROWSER_LOGIN_POLL_INTERVAL = 0.01  # 测试中快速轮询
+    try:
+        with proxy._session_lock:
+            proxy._session_cache.update({"at": 0, "data": None})
+        # 队列：1) refresh-token 失败  2) auth/state 成功  3) auth/token 轮询成功
+        s.enqueue(upstream_error_response(200, json.dumps({"success": False})))
+        s.enqueue(state_response(state="st-abc123"))
+        s.enqueue(token_response(state="st-abc123"))
+        try:
+            sess = proxy._read_session()
+            check("浏览器登录后拿到新 session", bool(sess.get("accessToken")))
+        except Exception as e:
+            check("浏览器登录后拿到新 session", False, repr(e))
+        check("打开了浏览器（login_url）", len(nb.opened) == 1
+              and "state=st-abc123" in nb.opened[0], nb.opened)
+        # 请求序列：refresh-token 失败 → state → token
+        urls = [u for u, h, b in s.records]
+        check("先调 refresh-token 再调 auth/state",
+              any("refresh-token" in u for u in urls)
+              and urls.index([u for u in urls if "refresh-token" in u][0])
+              < urls.index([u for u in urls if "/auth/state" in u][0]), urls)
+        check("轮询 auth/token 带 state", any("/auth/token?state=st-abc123" in u for u in urls), urls)
+        # 写回：opencode.db 应写入新 token（XOR 可解）
+        with proxy._session_lock:
+            cache = proxy._session_cache["data"]
+        check("缓存含新 refreshToken", cache and cache.get("refreshToken") == "rt-browser-new", cache)
+        check("缓存 exp 来自新 JWT", cache and cache.get("exp", 0) > now + 3000, cache)
+    finally:
+        proxy.webbrowser = orig_webbrowser
+        proxy.BROWSER_LOGIN_POLL_INTERVAL = orig_poll
+        with proxy._session_lock:
+            proxy._session_cache.update({"at": 0, "data": None})
+
+
+def test_browser_login_timeout():
+    print("\n== 浏览器登录超时（用户未完成认证） → 报错退出 ==")
+    s = make_server()
+    now = int(time.time())
+    rows = [("default", "k1", _xor_enc("k1", {"accessToken": _jwt(now - 7200),
+                                              "label": "麦志业", "refreshToken": "rt-dead"}), now)]
+    proxy.sqlite3.connect = lambda *a, **kw: _DummyDB(rows)
+    nb = _NoBrowser()
+    orig_webbrowser = proxy.webbrowser
+    proxy.webbrowser = nb
+    orig_timeout = proxy.BROWSER_LOGIN_TIMEOUT
+    orig_poll = proxy.BROWSER_LOGIN_POLL_INTERVAL
+    proxy.BROWSER_LOGIN_TIMEOUT = 0.2     # 缩短超时，测试不等真实 180s
+    proxy.BROWSER_LOGIN_POLL_INTERVAL = 0.01
+    try:
+        with proxy._session_lock:
+            proxy._session_cache.update({"at": 0, "data": None})
+        s.enqueue(upstream_error_response(200, json.dumps({"success": False})))
+        s.enqueue(state_response(state="st-timeout"))
+        # 轮询永远 pending：token_response success=False（state 未完成认证）
+        while True:
+            try:
+                s.enqueue(token_response(state="st-timeout", success=False))
+                break
+            except IndexError:
+                break
+        try:
+            proxy._read_session()
+            check("超时应抛异常而非返回坏 session", False)
+        except RuntimeError as e:
+            check("超时抛 RuntimeError 提示手动登录", "登录" in str(e), str(e))
+        check("打开了浏览器", len(nb.opened) == 1, nb.opened)
+    finally:
+        proxy.webbrowser = orig_webbrowser
+        proxy.BROWSER_LOGIN_TIMEOUT = orig_timeout
+        proxy.BROWSER_LOGIN_POLL_INTERVAL = orig_poll
+        with proxy._session_lock:
+            proxy._session_cache.update({"at": 0, "data": None})
+
+
+def test_browser_login_no_db():
+    print("\n== 全新机器（无 opencode.db session 行）→ 直接浏览器登录 ==")
+    s = make_server()
+    proxy.sqlite3.connect = lambda *a, **kw: _DummyDBNoRows()
+    nb = _NoBrowser()
+    orig_webbrowser = proxy.webbrowser
+    proxy.webbrowser = nb
+    orig_poll = proxy.BROWSER_LOGIN_POLL_INTERVAL
+    proxy.BROWSER_LOGIN_POLL_INTERVAL = 0.01
+    try:
+        with proxy._session_lock:
+            proxy._session_cache.update({"at": 0, "data": None})
+        # 无 db 行：_load_session_from_db 抛 RuntimeError，走浏览器登录
+        s.enqueue(state_response(state="st-fresh"))
+        s.enqueue(token_response(state="st-fresh"))
+        try:
+            sess = proxy._read_session()
+            check("全新机器浏览器登录成功", bool(sess.get("accessToken")))
+        except Exception as e:
+            check("全新机器浏览器登录成功", False, repr(e))
+        check("打开了浏览器", len(nb.opened) == 1 and "state=st-fresh" in nb.opened[0], nb.opened)
+    finally:
+        proxy.webbrowser = orig_webbrowser
+        proxy.BROWSER_LOGIN_POLL_INTERVAL = orig_poll
+        with proxy._session_lock:
+            proxy._session_cache.update({"at": 0, "data": None})
+
+
+def test_browser_login_state_fail():
+    print("\n== auth/state 失败 → 明确报错（认证服务不可用） ==")
+    s = make_server()
+    now = int(time.time())
+    rows = [("default", "k1", _xor_enc("k1", {"accessToken": _jwt(now - 7200),
+                                              "label": "麦志业", "refreshToken": "rt-dead"}), now)]
+    proxy.sqlite3.connect = lambda *a, **kw: _DummyDB(rows)
+    orig_webbrowser = proxy.webbrowser
+    proxy.webbrowser = _NoBrowser()
+    try:
+        with proxy._session_lock:
+            proxy._session_cache.update({"at": 0, "data": None})
+        s.enqueue(upstream_error_response(200, json.dumps({"success": False})))
+        s.enqueue(json.dumps({"success": False}))  # state 端点失败
+        try:
+            proxy._read_session()
+            check("state 失败应抛异常", False)
+        except RuntimeError as e:
+            check("state 失败报认证服务不可用", "认证服务" in str(e) or "登录" in str(e), str(e))
+    finally:
+        proxy.webbrowser = orig_webbrowser
+        with proxy._session_lock:
+            proxy._session_cache.update({"at": 0, "data": None})
 
 
 def main():
@@ -1069,7 +1273,9 @@ def main():
              test_session_cache_fastpath, test_models_singleflight,
              test_upstream_retry, test_client_abort_no_traceback,
              test_auto_refresh_trigger, test_auto_refresh_fail_prompt,
-             test_refresh_strips_bearer_and_writes_refresh]
+             test_refresh_strips_bearer_and_writes_refresh,
+             test_browser_login_on_refresh_fail, test_browser_login_timeout,
+             test_browser_login_no_db, test_browser_login_state_fail]
 
     # 起真实代理（mock 模式下不触网）
     server = proxy.Handler
@@ -1078,10 +1284,23 @@ def main():
     t.start()
     time.sleep(0.3)
 
+    # 注入默认 mock DB session（远期有效 JWT + refreshToken），使整套测试不依赖
+    # 机器上真实 opencode.db 的登录状态（未登录/空表时旧测试也能自包含跑通）。
+    # 各测试用例可临时替换 proxy.sqlite3.connect 覆盖此默认值。
+    now = int(time.time())
+    default_rows = [("default", "k" * 64,
+                     _xor_enc("k" * 64, {"accessToken": _jwt(now + 7200), "id": "ex_mazy16",
+                                         "label": "麦志业", "refreshToken": "rt-default"}), now)]
+    orig_connect = proxy.sqlite3.connect
+    proxy.sqlite3.connect = lambda *a, **kw: _DummyDB(default_rows)
+    with proxy._session_lock:
+        proxy._session_cache.update({"at": 0, "data": None})
+
     try:
         for fn in tests:
             fn()
     finally:
+        proxy.sqlite3.connect = orig_connect
         try:
             proxy.shutdown_writer()
         except Exception:
