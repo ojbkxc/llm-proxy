@@ -53,6 +53,36 @@ CONFIG_FILE = os.path.join(SCRIPT_DIR, "codex-remote-config.json")
 
 DEFAULT_CODEX_BIN = r"C:\Users\Administrator\AppData\Local\OpenAI\Codex\bin\27d6a192e9c98618\codex.exe"
 
+# ============ .env 配置加载（.env 优先，无则用内置） ============
+# 规则：进程环境变量 > codex/.env > 本脚本内置值。
+# 常用键：MM_BASE_URL / MM_API_KEY / MM_FALLBACK_URL / MM_FALLBACK_KEY
+def _load_dotenv(path):
+    cfg = {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            for raw in f:
+                line = raw.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                k, v = k.strip(), v.strip()
+                if len(v) >= 2 and v[0] == v[-1] and v[0] in ('"', "'"):
+                    v = v[1:-1]
+                if k:
+                    cfg[k] = v
+    except OSError:
+        pass
+    return cfg
+
+
+_DOTENV = _load_dotenv(os.path.join(SCRIPT_DIR, ".env"))
+
+
+def _env(key, default=""):
+    """环境变量 > .env > 内置默认。"""
+    return os.environ.get(key) or _DOTENV.get(key) or default
+
+
 # Windows 上 codex 全局安装后是 codex.cmd / codex.ps1（npm shim），
 # subprocess.run(["codex", ...]) 不走 shell 时 CreateProcess 找不到 .CMD，
 # 报 WinError 2「系统找不到指定的文件」。必须显式解析出完整路径。
@@ -72,6 +102,7 @@ def resolve_codex_bin():
     return "codex"  # 兜底走 PATH（Linux/macOS 可直接执行）
 
 # 模型档位（对应 ~/.codex/<名>.config.toml profile 文件）
+# 多模型共用：全部硬编码，单人使用，不读外部注册表。
 PROFILES = {
     "deep":   {"model": "glm-5.3",               "label": "glm-5.3 (深度推理主力)"},
     "dspro":  {"model": "glm-5.3",               "label": "glm-5.3 (同 deep 档)"},
@@ -82,11 +113,18 @@ PROFILES = {
     "kimi":   {"model": "kimi-k2.6",             "label": "kimi-k2.6 (写码)"},
     "fast47": {"model": "glm-4.7-flash",         "label": "glm-4.7-flash (最快)"},
     # GPT 假名档(网关转发到真实模型, 效果等同)
-    "astra":  {"model": "gpt-6-astra",           "label": "gpt-6-astra → glm-5.3 (指挥官位)"},
-    "sol":    {"model": "gpt-5.6-sol",           "label": "gpt-5.6-sol → deepseek-v4-pro (分析位)"},
-    "luna":   {"model": "gpt-5.6-luna",          "label": "gpt-5.6-luna → kimi-k2.7-code (杂活位)"},
+    "astra":  {"model": "gpt-6-astra",           "label": "gpt-6-astra (指挥官位)"},
+    "sol":    {"model": "gpt-5.6-sol",           "label": "gpt-5.6-sol (分析位)"},
+    "luna":   {"model": "gpt-5.6-luna",          "label": "gpt-5.6-luna (杂活位)"},
+    # 与 deploy 生成的文件式 profile 一致（硬编码同步）
+    "sfast":  {"model": "gpt-5.6-sol-fast",      "label": "gpt-5.6-sol-fast (最快)"},
+    "qwen":   {"model": "qwen3.8-max",           "label": "qwen3.8-max (长上下文)"},
+    "qwenp":  {"model": "qwen3.7-plus",          "label": "qwen3.7-plus (轻量)"},
+    "hw":     {"model": "hw-glm-5",              "label": "hw-glm-5 (仅本地网关)"},
 }
 DEFAULT_PROFILE = "deep"
+
+
 
 
 def load_cfg():

@@ -121,7 +121,7 @@ codex exec "请回复：对话正常"
 
 | 目标 | 配置内容 |
 |------|----------|
-| **Codex** | 生成 `~/.codex/config.toml`（custom provider + env_key）、8 个模型分档 `*.config.toml`（gpt-\* 假名 + qwen/hw 直名）、`auth.json`、用户级环境变量 `CF_GATEWAY_KEY` |
+| **Codex** | 生成 `~/.codex/config.toml`（custom provider + env_key）、8 个模型分档 `*.config.toml`（gpt-\* 假名 + qwen/hw 直名）、`auth.json`、用户级环境变量 `CF_GATEWAY_KEY`、`~/.codex/AGENTS.md`（多模型子代理委派指南，Codex 对话中可主动用 `spawn_agent` 把子任务派给其他模型） |
 | **Claude** | 合并式写入 `~/.claude/settings.json`（保留你已有的字段）：三槽模型映射（opus=gpt-6-astra，sonnet=gpt-5.6-luna，haiku=gpt-5.6-luna-fast）、`modelPicker` 注册 13 个非官方模型名（gpt-\* 假名系 + 保留 glm/deepseek/kimi 旧条目，解决 `unrecognized_model`）、权限全放行 + `bypassPermissions`、语言中文；生成 3 个分工子代理 `~/.claude/agents/*.md`；写入 `ANTHROPIC_*` + `CLAUDE_DANGEROUS_MODE` 环境变量并清除致命的 `ANTHROPIC_MODEL` |
 
 > Claude Code Haha 桌面端与官方 CLI 共用 `~/.claude`，以上配置它全部继承，重启即生效。
@@ -338,6 +338,24 @@ gpt-5.6-sol-fast       最快（haiku 档行为）
 
 > 旧条目 glm-5.3 / glm-5.3-flash / glm-5.2 / deepseek-v4-pro-0813 / deepseek-v4-flash-0731 / kimi-k2.7-code / kimi-k2.6 / glm-4.7-flash 仍保留在 modelPicker 兼容历史配置，但分档与子代理已全部切换到假名体系。
 
+**Codex 子代理委派**（自定义 API，无需原生 spawn_agent）：
+
+部署会自动写 `~/.codex/AGENTS.md` 并注册 MCP 工具 `spawn_agent`。在 Codex 对话里直接说
+「把代码审查交给 分析 子代理」或「让 写码 子代理实现这个函数」，主模型就会把子任务
+委派给对应模型（全部走你的自定义网关），拿到结果后自行汇总。
+
+| 子代理 | 模型 | 适合委派的任务 |
+|--------|------|----------------|
+| 指挥官 | gpt-6-astra | 方案设计、横向对比、任务拆解 |
+| 分析 | gpt-5.6-sol | 代码审查、架构分析、疑难 bug |
+| 写码 | gpt-5.6-luna | 实现函数、按规格落地代码 |
+| 快速 | gpt-5.6-sol-fast | 小修补、批量机械修改 |
+| 快答 | gpt-5.6-luna-fast | 文档、注释、commit 说明 |
+
+也支持别名：astra / sol / luna / sol-fast / luna-fast。脚本侧可用
+`python multi-model.py` 里的 `spawn_agent(agent, task)` / `spawn_many(delegations)`
+直接并行委派。
+
 ---
 
 ## 九、自定义模型分档（`--models-file`）
@@ -401,3 +419,90 @@ codex exec --sandbox danger-full-access "你的任务指令"
 ```
 
 > ⚠️ `danger-full-access` 无沙箱隔离，命令直接以你的用户身份执行，仅用于信任的任务。等 codex 上游修复 Windows 沙箱后可切回 workspace-write。
+
+---
+
+## MCP：codex 会话内多模型协作
+
+`mcp_server.py` 是一个 MCP stdio server，把 multi-model.py 的多模型团队能力暴露为 8 个 MCP 工具，注入 codex 会话后即可在对话中调用。
+
+### 注册
+
+部署时自动注册（默认行为）：
+```bash
+python deploy_ai_cli.py
+```
+会在 `~/.codex/config.toml` 追加：
+```toml
+[mcp_servers.multi_model]
+command = "C:\\Python313\\python.exe"
+args = ["C:\\GitHub\\llm-proxy\\codex\\mcp_server.py"]
+```
+
+跳过注册：`python deploy_ai_cli.py --skip-mcp`
+
+### 验证
+
+```bash
+python mcp_server.py --self-check
+```
+输出 8 个工具清单表示就绪。
+
+### 工具清单
+
+| 工具 | 类型 | 用途 |
+|------|------|------|
+| multi_ask | 同步 | 单模型问答（55s 预算） |
+| multi_list_models | 同步 | 列出可用模型 |
+| multi_ping | 同步 | 探活 |
+| multi_team_start | 异步 | 启动五阶段团队流水线 |
+| multi_orchestrate_start | 异步 | 启动指挥官拆解+并行 |
+| multi_parallel_start | 异步 | 启动多模型同问对比 |
+| multi_task_status | 查询 | 轮询任务进度（<2s） |
+| multi_task_result | 查询 | 取最终交付 |
+
+### 两段式用法示例（codex 会话内）
+
+codex 在对话中可以调用这些工具。典型工作流：
+
+1. **启动团队任务**：
+   ```
+   multi_team_start(task="给 utils.py 增加 XXX 并附测试", workdir="C:/GitHub/myproject")
+   → 返回 {"task_id": "team-20260907-193012-a3f4", "status": "queued"}
+   ```
+
+2. **轮询进度**（codex 自主决定何时查）：
+   ```
+   multi_task_status(task_id="team-20260907-193012-a3f4")
+   → 返回 {"phase": 3, "phase_name": "审查", "round": 1, "files_written": ["src/utils.py"]}
+   ```
+
+3. **取最终交付**：
+   ```
+   multi_task_result(task_id="team-20260907-193012-a3f4")
+   → 返回最终汇总 + 文件清单 + 审查结论
+   ```
+
+### 桌面端覆写恢复
+
+Codex 桌面版运行时会重写 `~/.codex/config.toml`，可能丢失 MCP 注册。恢复方法：
+```bash
+python deploy_ai_cli.py --force
+```
+或手动在 config.toml 追加 `[mcp_servers.multi_model]` 段。
+
+### 故障排查
+
+| 症状 | 排查 |
+|------|------|
+| codex 会话内看不到 multi_* 工具 | 检查 config.toml 是否有 `[mcp_servers.multi_model]` 段 |
+| multi_ping 返回错误 | `python mcp_server.py --self-check` 确认 8 工具就绪 |
+| multi_ask 报网关连接失败 | `python allin.py` 完成 SSO 认证；确认 proxy.py 在运行 |
+| multi_team_start 返回"任务数达上限" | 等待现有任务完成或重启 codex（server 退出即清理） |
+| 任务句柄失效 | server 重启后 JOBS 清空；用 `python multi-model.py team --resume <task_id>` 从状态文件续跑 |
+
+### 环境变量
+
+| 变量 | 默认 | 用途 |
+|------|------|------|
+| MM_SYNC_BUDGET_SEC | 55 | 同步工具（multi_ask）执行预算（秒） |

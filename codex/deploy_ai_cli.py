@@ -541,6 +541,17 @@ def _shell_rc_files() -> List[Path]:
 # Codex 配置写入
 # --------------------------------------------------------------------------- #
 
+def _mcp_entry_paths() -> tuple:
+    """返回 MCP server 的 (command, args) 注册路径。
+
+    command = 当前 Python 解释器
+    args = 同目录 mcp_server.py 的绝对路径
+    """
+    cmd = sys.executable
+    mcp_script = str(Path(__file__).parent / "mcp_server.py")
+    return (cmd, [mcp_script])
+
+
 def _build_codex_config(base_url: str, trusted_projects: Optional[List[str]] = None) -> str:
     # 注意：base_url 必须带 /v1 后缀。codex 的 wire_api="responses" 会直接拼
     # base_url + "/responses"，缺 /v1 时请求打到不存在的端点，模型连接 404。
@@ -584,20 +595,24 @@ def _build_codex_config(base_url: str, trusted_projects: Optional[List[str]] = N
 
 
 def _write_codex_config(codex_home: Path, base_url: str, force: bool,
-                        trusted_projects: Optional[List[str]] = None) -> bool:
+                        trusted_projects: Optional[List[str]] = None,
+                        skip_mcp: bool = False) -> bool:
     cfg = codex_home / "config.toml"
     if cfg.exists() and not force:
         text = cfg.read_text(encoding="utf-8", errors="ignore")
         if "env_key" in text or "model_provider" in text:
             # 合并式追加信任项目（不覆盖已有 provider 配置）
             merged = _merge_trusted_projects(text, trusted_projects)
+            merged = _merge_mcp_servers(merged, skip_mcp)  # MCP 服务器注册
             if merged != text:
                 _deploy_write(cfg, merged)
-                log.info("config.toml 已合并新增信任项目")
+                log.info("config.toml 已合并新增信任项目 / MCP 服务器")
                 return True
             log.info("config.toml 已存在配置痕迹，跳过（如需覆盖请用 --force）")
             return False
-    _deploy_write(cfg, _build_codex_config(base_url, trusted_projects))
+    new_text = _build_codex_config(base_url, trusted_projects)
+    new_text = _merge_mcp_servers(new_text, skip_mcp)  # MCP 服务器注册
+    _deploy_write(cfg, new_text)
     return True
 
 
@@ -625,6 +640,60 @@ def _merge_trusted_projects(text: str, trusted_projects: Optional[List[str]]) ->
     if not appended:
         return text
     return "\n".join(lines) + "\n"
+
+
+def _merge_mcp_servers(text: str, skip_mcp: bool = False) -> str:
+    """把 [mcp_servers.multi_model] 段合并进 config.toml 文本。
+
+    规则：
+    - skip_mcp=True → 原样返回（不注册）
+    - 段不存在 → 追加
+    - 段存在且 command/args 与当前路径等价 → 幂等返回（零改动）
+    - 段存在但 args 指向的 mcp_server.py 不存在（失效路径）→ 整段重写
+    - 绝不写入 key/token/env
+
+    返回合并后的文本。
+    """
+    if skip_mcp:
+        return text
+
+    cmd, args = _mcp_entry_paths()
+    # TOML 里路径用双反斜杠
+    cmd_toml = cmd.replace("\\", "\\\\")
+    # TOML 数组：args = ["C:\\path\\mcp_server.py"]
+    args_toml = "[" + ", ".join(f'"{a.replace(chr(92), chr(92)*2)}"' for a in args) + "]"
+
+    mcp_section = f'''
+[mcp_servers.multi_model]
+command = "{cmd_toml}"
+args = {args_toml}'''
+
+    # 检查是否已存在 [mcp_servers.multi_model] 段
+    # 用 DOTALL + 预查到下一个段头 \n[xxx] 或文本结尾，避免 args 数组里的 [ 截断匹配
+    pattern = r'\[mcp_servers\.multi_model\].*?(?=\n\[[^\]]*\]|\Z)'
+    match = re.search(pattern, text, re.DOTALL)
+    if match is None:
+        # 段不存在 → 追加
+        if text and not text.endswith("\n"):
+            text += "\n"
+        return text + mcp_section + "\n"
+
+    # 段已存在 → 检查是否需要更新
+    existing = match.group(0)
+    # 检查 mcp_server.py 文件是否存在
+    mcp_script = args[0]
+    if not os.path.isfile(mcp_script):
+        # mcp_server.py 不存在，不注册（部署可能还没创建）
+        return text
+
+    # 检查现有段是否指向有效路径（用 TOML 转义形式比较，因为 existing 里存的是双反斜杠）
+    mcp_script_toml = mcp_script.replace("\\", "\\\\")
+    if cmd_toml in existing and mcp_script_toml in existing:
+        # 幂等：路径匹配，零改动
+        return text
+
+    # 路径不匹配或失效 → 整段重写
+    return text[:match.start()] + mcp_section.strip() + "\n" + text[match.end():]
 
 
 def _write_codex_profiles(codex_home: Path, profiles: Dict[str, Tuple[str, str]]) -> int:
@@ -755,15 +824,77 @@ def _fix_sandbox_temp_acl() -> bool:
     return False
 
 
+def _write_codex_agents_md(codex_home: Path, scope: str = "global") -> bool:
+    """写子代理委派分工说明（AGENTS.md）。
+
+    scope=global → ~/.codex/AGENTS.md（所有项目生效）；
+    scope=project → 当前工作目录/AGENTS.md（仅该仓库生效）。
+
+    让 Codex 主模型在对话里主动调用 MCP 的 spawn_agent 工具，
+    把不同子任务委派给不同模型（全部走自定义 API 网关）。
+    幂等：文件已存在且内容一致时跳过；不一致时按部署流程备份重写。
+    """
+    content = """# 多模型子代理委派指南（自定义 API）
+
+本机配置了多模型共用网关，你可以通过 MCP 工具 `spawn_agent` 把子任务委派给
+其他模型完成。委派后由你负责汇总与最终交付。
+
+## 可用子代理
+
+| 子代理 | 模型 | 适合委派的任务 |
+|--------|------|----------------|
+| 指挥官 | gpt-6-astra | 方案设计、横向对比、任务拆解 |
+| 分析   | gpt-5.6-sol | 代码审查、架构分析、排查疑难 bug |
+| 写码   | gpt-5.6-luna | 实现函数、写文件、按规格落地代码 |
+| 快速   | gpt-5.6-sol-fast | 小修补、快速整理、批量机械修改 |
+| 快答   | gpt-5.6-luna-fast | 文档、注释、文案、commit 说明 |
+
+也支持别名：astra / sol / luna / sol-fast / luna-fast。
+
+## 委派原则
+
+1. 子任务要自包含：写清输入、期望输出格式，必要时用 context 附背景材料。
+2. 一次任务最多委派 2~4 个子代理，避免过度拆解；简单任务不要委派。
+3. 委派返回后由你校验与汇总，不要直接复制子代理输出当最终答案。
+4. 需要真正落地文件/跑命令的工程任务，优先用 `multi_team_start`（五阶段
+   团队流水线），spawn_agent 只用于轻量问答式委派。
+5. 网关异常时子代理会返回失败信息，此时你自己完成该子任务并告知用户。
+
+## 工具调用示例
+
+- 让分析代理审查改动：`spawn_agent(agent="分析", task="审查最新改动里的并发问题")`
+- 让写码代理实现函数：`spawn_agent(agent="写码", task="实现 parse_config 函数",
+  context="现有代码在 src/config.py")`
+- 让快答代理写文档：`spawn_agent(agent="luna-fast", task="为 README 补充安装说明")`
+"""
+    if scope == "project":
+        path = Path.cwd() / "AGENTS.md"
+        if not (Path.cwd() / ".git").exists():
+            log.warning("--agents-scope project 但当前目录不是 git 仓库根，仍写入 %s", path)
+    else:
+        path = codex_home / "AGENTS.md"
+    if path.exists():
+        try:
+            if path.read_text(encoding="utf-8") == content:
+                log.info("AGENTS.md 已是最新（内容一致，跳过）")
+                return False
+        except Exception:
+            pass
+    _deploy_write(path, content)
+    return True
+
+
 def configure_codex(cfg: SimpleNamespace) -> Dict:
     result: Dict = {"configured": False}
     codex_home: Path = cfg.codex_home
     codex_home.mkdir(parents=True, exist_ok=True)
 
     result["config_toml"] = _write_codex_config(
-        codex_home, cfg.base_url, cfg.force, getattr(cfg, "trusted_projects", None))
+        codex_home, cfg.base_url, cfg.force, getattr(cfg, "trusted_projects", None),
+        skip_mcp=getattr(cfg, "skip_mcp", False))
     result["profiles_written"] = _write_codex_profiles(codex_home, cfg.profiles)
     result["auth_written"] = _write_codex_auth(codex_home, cfg.api_key)
+    result["agents_md"] = _write_codex_agents_md(codex_home, scope=getattr(cfg, "agents_scope", "global"))
 
     if cfg.api_key:
         set_user_env_var("CF_GATEWAY_KEY", cfg.api_key)
@@ -1040,6 +1171,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Windows 下自动修复 codex 沙箱 Temp ACL（需管理员；默认只体检并打印修复指引）")
     p.add_argument("--skip-codex", action="store_true", help="跳过 Codex 配置")
     p.add_argument("--skip-claude", action="store_true", help="跳过 Claude 配置")
+    p.add_argument("--skip-mcp", action="store_true", help="跳过 MCP 服务器注册（默认自动注册 multi_model MCP server）")
+    p.add_argument("--agents-scope", choices=["global", "project"], default="global",
+                   help="AGENTS.md 子代理指南作用域：global=~/.codex（默认），project=当前工作目录仓库根")
     p.add_argument("--dry-run", action="store_true", help="仅探测，不写任何配置")
     p.add_argument("--non-interactive", action="store_true", help="非交互模式，检测失败直接报错")
     p.add_argument("--force", action="store_true", help="覆盖已存在的 config.toml")
@@ -1074,6 +1208,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     codex_home = Path(args.codex_home).expanduser() if args.codex_home else (home / ".codex")
     claude_home = Path(args.claude_home).expanduser() if args.claude_home else (home / ".claude")
 
+    # 模型分档硬编码在 DEFAULT_CODEX_PROFILES（单人使用，不读外部注册表）
     profiles = DEFAULT_CODEX_PROFILES
     if args.models_file:
         try:
@@ -1109,6 +1244,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         trusted_projects=args.trust_project,
         non_interactive=args.non_interactive,
         force=args.force,
+        skip_mcp=args.skip_mcp,
+        agents_scope=args.agents_scope,
         resolved_codex=None,
         resolved_claude=None,
         resolved_cc_haha=None,
@@ -1151,6 +1288,22 @@ def main(argv: Optional[List[str]] = None) -> int:
     log.info("部署完成。摘要：")
     for tool, r in summary.items():
         log.info("  %s: %s", tool, r)
+
+    # MCP 服务器自检
+    if not args.skip_mcp and not args.skip_codex:
+        mcp_script = str(Path(__file__).parent / "mcp_server.py")
+        if os.path.isfile(mcp_script):
+            try:
+                r = subprocess.run([sys.executable, mcp_script, "--self-check"],
+                                   timeout=30, capture_output=True, text=True, encoding="utf-8", errors="replace")
+                if r.returncode == 0:
+                    log.info("  MCP 自检: 通过（%s）", r.stderr.strip().split("\n")[0] if r.stderr else "OK")
+                else:
+                    log.warning("  MCP 自检: 失败（退出码 %d），MCP 服务器可能无法启动", r.returncode)
+            except Exception as e:
+                log.warning("  MCP 自检: 异常 %s（不阻断部署）", e)
+        else:
+            log.warning("  mcp_server.py 不存在，跳过 MCP 自检")
 
     log.info("")
     log.info("后续提示：")

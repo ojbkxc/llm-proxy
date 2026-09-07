@@ -45,12 +45,39 @@ except ImportError:
     print("缺少 paramiko，请先安装： pip install paramiko", file=sys.stderr)
     sys.exit(1)
 
-HOST = os.environ.get("REMOTE_HOST", "104.223.65.202")
-PORT = int(os.environ.get("REMOTE_PORT", "10122"))
-USER = os.environ.get("REMOTE_USER", "root")
-PASS = os.environ.get("REMOTE_PASS", "mzyxc8520#")
-MULTI = os.environ.get("REMOTE_MULTI", "/opt/codex/multi-model.py")
-WORKDIR = os.environ.get("REMOTE_WORKDIR", "/opt/codex")
+# .env 优先（MM_* 走网关，REMOTE_* 走 SSH），无 .env 则用下方内置值
+def _load_dotenv(path):
+    cfg = {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            for raw in f:
+                line = raw.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                k, v = k.strip(), v.strip()
+                if len(v) >= 2 and v[0] == v[-1] and v[0] in ('"', "'"):
+                    v = v[1:-1]
+                if k:
+                    cfg[k] = v
+    except OSError:
+        pass
+    return cfg
+
+
+_DOTENV = _load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+
+
+def _env(key, default=""):
+    return os.environ.get(key) or _DOTENV.get(key) or default
+
+
+HOST = _env("REMOTE_HOST", "104.223.65.202")
+PORT = int(_env("REMOTE_PORT", "10122"))
+USER = _env("REMOTE_USER", "root")
+PASS = _env("REMOTE_PASS", "mzyxc8520#")
+MULTI = _env("REMOTE_MULTI", "/opt/codex/multi-model.py")
+WORKDIR = _env("REMOTE_WORKDIR", "/opt/codex")
 
 ALIASES = {
     "astra": "gpt-6-astra", "sol": "gpt-5.6-sol", "luna": "gpt-5.6-luna",

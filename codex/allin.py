@@ -23,6 +23,12 @@ allin.py 负责把流程串起来：
     python allin.py list                 # 起代理+等认证 → 列模型
     （其余子命令直接透传给 multi-model.py）
 
+    MCP 服务器（codex 会话内多模型协作）:
+    python mcp_server.py --self-check    # 自检：确认 8 个 MCP 工具就绪
+    # 部署时自动注册到 ~/.codex/config.toml，codex 会话内即可调用
+    # multi_team_start / multi_task_status / multi_task_result 等工具
+    # 跳过注册：python deploy_ai_cli.py --skip-mcp
+
 环境变量: WS_PROXY_PORT 可改代理端口（默认 8787，与 proxy.py 一致）。
 """
 import json
