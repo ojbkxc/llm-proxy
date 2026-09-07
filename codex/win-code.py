@@ -44,6 +44,7 @@ GPT 假名(网关 cf-ai-gw 提供, 任何 -m / 模型名处都可直接用):
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
 
@@ -51,6 +52,24 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(SCRIPT_DIR, "codex-remote-config.json")
 
 DEFAULT_CODEX_BIN = r"C:\Users\Administrator\AppData\Local\OpenAI\Codex\bin\27d6a192e9c98618\codex.exe"
+
+# Windows 上 codex 全局安装后是 codex.cmd / codex.ps1（npm shim），
+# subprocess.run(["codex", ...]) 不走 shell 时 CreateProcess 找不到 .CMD，
+# 报 WinError 2「系统找不到指定的文件」。必须显式解析出完整路径。
+
+
+def resolve_codex_bin():
+    """解析出可在 subprocess 中直接执行的 codex 完整路径。"""
+    env = os.environ.get("CODEX_BIN")
+    if env and os.path.exists(env):
+        return env
+    if os.path.exists(DEFAULT_CODEX_BIN):
+        return DEFAULT_CODEX_BIN
+    # shutil.which 能找到 codex.cmd（npm shim），返回完整路径供 subprocess 用
+    found = shutil.which("codex")
+    if found:
+        return found
+    return "codex"  # 兜底走 PATH（Linux/macOS 可直接执行）
 
 # 模型档位（对应 ~/.codex/<名>.config.toml profile 文件）
 PROFILES = {
@@ -86,12 +105,7 @@ def load_cfg():
 
 
 def codex_bin():
-    env = os.environ.get("CODEX_BIN")
-    if env and os.path.exists(env):
-        return env
-    if os.path.exists(DEFAULT_CODEX_BIN):
-        return DEFAULT_CODEX_BIN
-    return "codex"  # 兜底走 PATH
+    return resolve_codex_bin()
 
 
 def ensure_token(cfg):

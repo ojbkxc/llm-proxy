@@ -35,11 +35,9 @@ import urllib.request
 # 想加别名/改名字只改这张表即可，不用动下面的逻辑
 MODEL_ALIAS = {
     "deepseek-v4-pro": "deepseek_v4",
-    "deepseek-r1":     "deepseek_v4",
     "gpt-5.6-luna":    "gpt-5.6-luna",
     "qwen3.8-max":     "qwen3.8-max",
     "qwen3.7-plus":    "qwen3.7-plus",
-    "qwen3.6-plus":    "qwen3.6-plus",
     "glm-5.2":         "aliyun-glm-5.2",
     "hw-glm-5":        "hw-glm-5",
 }
