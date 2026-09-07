@@ -31,12 +31,18 @@ import argparse
 import json
 import os
 import re
+import secrets
+import shlex
+import shutil
 import ssl
 import subprocess
+import threading
 import sys
 import time
 import urllib.request
+import urllib.error
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
 
 # Windows 控制台默认 GBK，遇到生僻字会抛 UnicodeEncodeError；统一重配为 UTF-8
 if sys.platform == "win32":
@@ -46,29 +52,84 @@ if sys.platform == "win32":
         except Exception:
             pass
 
-BASE_URL = "http://127.0.0.1:8787/v1"
 UA = "codex-cli"
 
-# 从同目录 deploy_ai_cli.py 读网关地址与 Key（单点配置：改 deploy_ai_cli.py 即可全局换网关）
-_DEPLOY_API_KEY = ""
-try:
-    import importlib.util as _ilu
-    _spec = _ilu.spec_from_file_location(
-        "deploy_ai_cli", os.path.join(os.path.dirname(os.path.abspath(__file__)), "deploy_ai_cli.py"))
-    _d = _ilu.module_from_spec(_spec)
-    _spec.loader.exec_module(_d)
-    BASE_URL = getattr(_d, "DEFAULT_BASE_URL", BASE_URL)
-    _DEPLOY_API_KEY = getattr(_d, "DEFAULT_API_KEY", "") or ""
-except Exception:
-    pass  # deploy_ai_cli.py 缺失/出错时退回上面的默认值与兜底 Key
+# ============ 配置加载：环境变量 > .env > 硬编码默认 ============
+# .env 是唯一配置文件（KEY=VALUE，标准格式），放在本脚本同目录。
+# 有 .env 用 .env；没有则用下面硬编码默认（主网关 ws-proxy + 备选 cfapi）。
+def _load_dotenv(path):
+    cfg = {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            for raw in f:
+                line = raw.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                k, v = k.strip(), v.strip()
+                if len(v) >= 2 and v[0] == v[-1] and v[0] in ("'", '"'):
+                    v = v[1:-1]
+                if k:
+                    cfg[k] = v
+    except OSError:
+        pass
+    return cfg
+
+
+def _norm_url(u):
+    u = (u or "").strip().rstrip("/")
+    if not u:
+        return u
+    return u if u.endswith("/v1") else u + "/v1"
+
+
+_DOTENV = _load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+
+BASE_URL = _norm_url(os.environ.get("BASE_URL") or _DOTENV.get("BASE_URL")
+                     or "http://127.0.0.1:8787/v1")
+DEFAULT_API_KEY = (os.environ.get("API_KEY") or os.environ.get("CF_GATEWAY_KEY")
+                   or _DOTENV.get("API_KEY")
+                   or "sk-wa-f9cb7d4ba48f403797fc3f55b928ceac")
+FALLBACK_URL = _norm_url(os.environ.get("BASE_FALLBACK") or _DOTENV.get("BASE_FALLBACK")
+                         or "https://cfapi.1232333.xyz/v1")
+FALLBACK_KEY = (os.environ.get("BASE_FALLBACK_KEY") or _DOTENV.get("BASE_FALLBACK_KEY")
+                or DEFAULT_API_KEY)
+
+GATEWAYS = [
+    {"name": "ws-proxy", "base_url": BASE_URL,
+     "api_key": DEFAULT_API_KEY,
+     "models": {"gpt-6-astra": "gpt-6-astra", "gpt-5.6-luna": "gpt-5.6-luna",
+                "gpt-5.6-luna-fast": "gpt-5.6-luna-fast", "gpt-5.6-sol": "gpt-5.6-sol",
+                "gpt-5.6-sol-fast": "gpt-5.6-sol-fast",
+                "qwen3.8-max": "qwen3.8-max", "qwen3.7-plus": "qwen3.7-plus",
+                "hw-glm-5": "hw-glm-5"}},
+    {"name": "fallback", "base_url": FALLBACK_URL,
+     "api_key": FALLBACK_KEY,
+     "models": {"gpt-6-astra": "gpt-6-astra", "gpt-5.6-luna": "gpt-5.6-luna",
+                "gpt-5.6-luna-fast": "gpt-5.6-luna-fast", "gpt-5.6-sol": "gpt-5.6-sol",
+                "gpt-5.6-sol-fast": "gpt-5.6-sol-fast"}},
+]
+
+# 网关排障状态（circuit breaker）：按网关名记录 (连续失败数, 冷却到时间点)
+_GW_STATE = {}
+_GW_LOCK = threading.Lock()
 
 # 角色 → gpt-* 假名映射（网关层转发到真实模型，与 deploy_ai_cli.py 的分档一致）
+ROLE_DESCS = {
+    "指挥官": "总指挥/拆解/汇总",
+    "分析":   "深度分析/设计/审查",
+    "写码":   "实现/编码/落地",
+    "快速":   "快速杂活/整理",
+    "快答":   "快速问答",
+}
+
+# 多模型共用：全部硬编码在此，单机单人使用，不读任何外部注册表。
 ROLES = {
-    "指挥官": {"model": "gpt-6-astra",       "desc": "总指挥/拆解/汇总",   "temp": 0.4},
-    "分析":   {"model": "gpt-5.6-sol",       "desc": "深度分析/设计/审查", "temp": 0.3},
-    "写码":   {"model": "gpt-5.6-luna",      "desc": "实现/编码/落地",     "temp": 0.2},
-    "快速":   {"model": "gpt-5.6-sol-fast",  "desc": "快速杂活/整理",     "temp": 0.5},
-    "快答":   {"model": "gpt-5.6-luna-fast", "desc": "快速问答",          "temp": 0.5},
+    "指挥官": {"model": "gpt-6-astra",       "desc": "总指挥/拆解/汇总",   "temp": 0.4, "fallback": "gpt-5.6-luna"},
+    "分析":   {"model": "gpt-5.6-sol",       "desc": "深度分析/设计/审查", "temp": 0.3, "fallback": "gpt-5.6-luna"},
+    "写码":   {"model": "gpt-5.6-luna",      "desc": "实现/编码/落地",     "temp": 0.2, "fallback": "gpt-5.6-sol"},
+    "快速":   {"model": "gpt-5.6-sol-fast",  "desc": "快速杂活/整理",     "temp": 0.5, "fallback": "gpt-5.6-luna-fast"},
+    "快答":   {"model": "gpt-5.6-luna-fast", "desc": "快速问答",          "temp": 0.5, "fallback": "gpt-5.6-sol-fast"},
 }
 
 ALIASES = {
@@ -80,8 +141,88 @@ ALIASES = {
     "dfast": "deepseek-v4-flash-0731", "gfast": "glm-5.3-flash",
 }
 
+
+
+
 WORKDIR = os.getcwd()
 ALLOW_RUN = True
+
+# ---------------------------------------------------------------------------
+# TeamState 持久化：阶段边界原子落盘，支持 --resume 续跑
+# ---------------------------------------------------------------------------
+STATE_DIR = ".multi-model"
+STATE_SCHEMA_V = 1
+
+
+class StateError(Exception):
+    """状态文件损坏/版本不符/缺字段时抛出。"""
+    pass
+
+
+def _gen_task_id(task_type):
+    """生成形如 team-20260907-143012-a1b2 的任务 ID。"""
+    return f"{task_type}-{datetime.now():%Y%m%d-%H%M%S}-{secrets.token_hex(2)}"
+
+
+def _state_path(workdir, task_id):
+    """状态文件路径：<workdir>/.multi-model/state-<task_id>.json"""
+    return os.path.join(workdir, STATE_DIR, f"state-{task_id}.json")
+
+
+def _save_state_atomic(workdir, state):
+    """原子写状态：先写 .tmp 再 os.replace，避免半写文件被 --resume 读到。"""
+    state["updated_at"] = datetime.now().isoformat(timespec="seconds")
+    d = os.path.join(workdir, STATE_DIR)
+    os.makedirs(d, exist_ok=True)
+    final_path = _state_path(workdir, state["task_id"])
+    tmp_path = final_path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
+    os.replace(tmp_path, final_path)
+
+
+def _load_state(workdir, task_id):
+    """读状态文件并校验；任一校验失败抛 StateError 带明确文案。"""
+    path = _state_path(workdir, task_id)
+    if not os.path.isfile(path):
+        raise StateError(f"状态文件不存在: {path}")
+    try:
+        with open(path, encoding="utf-8") as f:
+            state = json.load(f)
+    except json.JSONDecodeError as e:
+        raise StateError(f"状态文件 JSON 解析失败: {e}")
+    if state.get("schema_v") != STATE_SCHEMA_V:
+        raise StateError(
+            f"状态文件 schema_v={state.get('schema_v')} 与当前版本 "
+            f"{STATE_SCHEMA_V} 不符，可能由不兼容版本写入")
+    for k in ("task_id", "task", "phase", "status"):
+        if k not in state:
+            raise StateError(f"状态文件缺关键字段: {k}")
+    return state
+
+
+def _new_state(task, workdir, engine="builtin", allow_risky=False):
+    """构造一份全新的流水线状态 dict。"""
+    now = datetime.now().isoformat(timespec="seconds")
+    return {
+        "schema_v": STATE_SCHEMA_V,
+        "task_id": _gen_task_id("team"),
+        "task": task,
+        "status": "running",
+        "phase": 1,
+        "round": 0,
+        "engine": engine,
+        "allow_risky": bool(allow_risky),
+        "workdir": workdir,
+        "design": {},
+        "impl": {},
+        "reviews": [],
+        "fixes": [],
+        "final": {},
+        "stage_errors": [],
+        "created_at": now,
+        "updated_at": now,
+    }
 
 
 def _ssl_ctx():
@@ -90,11 +231,12 @@ def _ssl_ctx():
 
 
 def api_key():
+    """网关 API Key。优先级：环境变量(CF_GATEWAY_KEY 等) > .env(API_KEY) > 硬编码。"""
     for k in ("CF_GATEWAY_KEY", "CUSTOM_API_KEY", "ANTHROPIC_AUTH_TOKEN"):
         v = os.environ.get(k)
         if v:
             return v
-    return _DEPLOY_API_KEY
+    return DEFAULT_API_KEY
 
 
 # ---------------------------------------------------------------------------
@@ -251,23 +393,121 @@ def _tool_search(pattern, path="."):
     return "\n".join(hits) if hits else "无匹配"
 
 
-def _tool_run_command(cmd):
+# 危险命令黑名单：命中即拦截（除非 --allow-risky 显式放行）
+# 列表用于文档化/测试枚举；实际匹配逻辑在 _match_dangerous 内用 token 化实现，
+# 以正确处理 flag 拆分归一（rm -rf / rm -r -f / rm -fr 等价）并避免误报。
+DANGEROUS_PATTERNS = [
+    {"name": "rm -rf", "type": "token", "pattern": "rm + -r + -f (flag 归一)"},
+    {"name": "del /s", "type": "token", "pattern": "del /s"},
+    {"name": "rd /s", "type": "token", "pattern": "rd /s"},
+    {"name": "Remove-Item -Recurse -Force", "type": "token",
+     "pattern": "Remove-Item -Recurse -Force / -rf"},
+    {"name": "format", "type": "regex", "pattern": r"^format\s+[a-z]:"},
+    {"name": "mkfs", "type": "token", "pattern": "mkfs*"},
+    {"name": "dd if=", "type": "token", "pattern": "dd + if="},
+    {"name": "diskpart", "type": "token", "pattern": "diskpart"},
+    {"name": "shutdown", "type": "token", "pattern": "shutdown"},
+    {"name": "fork bomb", "type": "regex",
+     "pattern": r":\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:"},
+]
+
+
+def _match_dangerous(cmd):
+    """命中危险命令返回模式名，未命中返回 None。大小写不敏感。
+
+    token 化优先 shlex.split（POSIX），失败退空格分割（Windows cmd）。
+    误报权衡：format 单词不拦、format c: 才拦；Remove-Item 单词不拦、
+    带 -Recurse -Force 才拦；dir/ls/python/pytest 等畅通。
+    """
+    if not cmd or not cmd.strip():
+        return None
+    raw = cmd.strip()
+    lower = raw.lower()
+    try:
+        toks = [t.lower() for t in shlex.split(raw, posix=True)]
+    except ValueError:
+        toks = lower.split()
+    if not toks:
+        return None
+    first = toks[0]
+
+    # rm -rf / rm -fr / rm -r -f / rm -f -r（flag 归一：-rf 等价于 -r + -f）
+    if first == "rm" and len(toks) >= 2:
+        flags = set()
+        for t in toks[1:]:
+            if t.startswith("-") and "/" not in t:
+                for ch in t[1:]:
+                    if ch in ("r", "f"):
+                        flags.add(ch)
+            else:
+                break  # 遇到非 flag 参数停止收集
+        if "r" in flags and "f" in flags:
+            return "rm -rf"
+
+    # Remove-Item -Recurse -Force（含 -rf 缩写）
+    if first == "remove-item" and len(toks) >= 2:
+        rest = toks[1:]
+        has_recurse = any(t in ("-recurse", "-r") for t in rest)
+        has_force = any(t in ("-force", "-f") for t in rest)
+        has_rf = any(t == "-rf" for t in rest)
+        if (has_recurse and has_force) or has_rf:
+            return "Remove-Item -Recurse -Force"
+
+    # del /s / rd /s（Windows cmd）
+    if first in ("del", "rd") and len(toks) >= 2 and "/s" in toks[1:]:
+        return "del /s" if first == "del" else "rd /s"
+
+    # format c: / format /...（format 单词不拦，必须有盘符或 / 开头参数）
+    if first == "format" and len(toks) >= 2:
+        if re.match(r"^[a-z]:", toks[1]) or toks[1].startswith("/"):
+            return "format"
+
+    # mkfs（token 前缀，如 mkfs.ext4）
+    if first.startswith("mkfs"):
+        return "mkfs"
+
+    # dd if=
+    if first == "dd" and "if=" in lower:
+        return "dd if="
+
+    # diskpart（精确首词）
+    if first == "diskpart":
+        return "diskpart"
+
+    # shutdown（首词精确）
+    if first == "shutdown":
+        return "shutdown"
+
+    # fork 炸弹 :(){ :|:& };:
+    if re.search(r":\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:", lower):
+        return "fork bomb"
+
+    return None
+
+
+def _tool_run_command(cmd, allow_risky=False):
     if not ALLOW_RUN:
         return "[已禁用] run_command 被 --no-run 关闭"
+    hit = _match_dangerous(cmd)
+    if hit and not allow_risky:
+        return (f"[已拦截] 命中危险命令黑名单({hit})。"
+                "如确需执行，用 --allow-risky 显式放行")
+    prefix = f"[风险放行] 命中危险命令({hit})\n" if hit else ""
     try:
         r = subprocess.run(cmd, shell=True, capture_output=True, text=True,
                            cwd=WORKDIR, timeout=300)
         out = (r.stdout or "") + (r.stderr or "")
         if len(out) > 3000:
             out = out[:3000] + "\n...[截断]"
-        return f"exit={r.returncode}\n{out}" if out.strip() else f"exit={r.returncode} (无输出)"
+        return prefix + (f"exit={r.returncode}\n{out}" if out.strip()
+                         else f"exit={r.returncode} (无输出)")
     except subprocess.TimeoutExpired:
-        return "命令超时(300s)"
+        return prefix + "命令超时(300s)"
     except Exception as e:
-        return f"执行失败: {e}"
+        return prefix + f"执行失败: {e}"
 
 
-def execute_tool(name, args):
+def execute_tool(name, args, allow_risky=False):
     args = args or {}
     try:
         if name == "list_dir":
@@ -279,7 +519,7 @@ def execute_tool(name, args):
         if name == "search":
             return _tool_search(args.get("pattern", ""), args.get("path", "."))
         if name == "run_command":
-            return _tool_run_command(args.get("cmd", ""))
+            return _tool_run_command(args.get("cmd", ""), allow_risky=allow_risky)
         return f"未知工具: {name}"
     except Exception as e:
         return f"工具执行出错: {e}"
@@ -288,27 +528,124 @@ def execute_tool(name, args):
 # ---------------------------------------------------------------------------
 # 模型调用
 # ---------------------------------------------------------------------------
-def call(model, messages, temperature=0.4, max_tokens=4000, timeout=600, tools=None):
-    """调 /v1/chat/completions，返回完整 message dict。"""
-    body = {
-        "model": model,
-        "messages": messages,
-        "temperature": temperature,
-        "max_tokens": max_tokens,
-    }
-    if tools:
-        body["tools"] = tools
-    req = urllib.request.Request(
-        BASE_URL + "/chat/completions", data=json.dumps(body).encode(), method="POST",
-        headers={
-            "Authorization": "Bearer " + api_key(),
-            "Content-Type": "application/json",
-            "User-Agent": UA,
-        },
-    )
-    resp = urllib.request.urlopen(req, timeout=timeout, context=_ssl_ctx())
-    data = json.loads(resp.read().decode())
-    return data["choices"][0]["message"]
+# ---- 失败审计与熔断 ----
+FAILURE_WINDOW = 60          # 熔断统计窗口（秒）
+FAILURE_THRESHOLD = 3        # 窗口内连续失败达到此值 → 冷却该网关
+COOLDOWN_SEC = 30            # 冷却时长（秒）
+RETRY_DELAYS = (0.5, 1.0, 2.0)   # 降级重试前的退避（递增，防打爆上游）
+
+
+def _failure_log_path():
+    return os.path.join(WORKDIR, ".multi-model", "failures.jsonl")
+
+
+def _audit_failure(kind, model, gateway, error, elapsed):
+    """追加一条失败记录（尽力而为，失败静默）。"""
+    try:
+        p = _failure_log_path()
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        rec = {"ts": datetime.now().isoformat(timespec="seconds"), "kind": kind,
+               "model": model, "gateway": gateway, "error": str(error)[:200],
+               "elapsed": round(elapsed, 2)}
+        with open(p, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+def _gw_available(gw_name):
+    """熔断检查：冷却期内返回 False。"""
+    with _GW_LOCK:
+        fails, cooldown_until = _GW_STATE.get(gw_name, (0, 0.0))
+        if cooldown_until > time.time():
+            return False
+        return True
+
+
+def _gw_record(gw_name, failure):
+    """熔断计数：failure=True 记一次失败，连续 FAILURE_THRESHOLD 次 → 进入 COOLDOWN_SEC 冷却；
+    failure=False（成功）→ 清零。"""
+    with _GW_LOCK:
+        if not failure:
+            _GW_STATE[gw_name] = (0, 0.0)
+            return
+        fails, _ = _GW_STATE.get(gw_name, (0, 0.0))
+        fails += 1
+        if fails >= FAILURE_THRESHOLD:
+            _GW_STATE[gw_name] = (0, time.time() + COOLDOWN_SEC)
+        else:
+            _GW_STATE[gw_name] = (fails, 0.0)
+
+
+def call(model, messages, temperature=0.4, max_tokens=4000, timeout=600, tools=None, tool_choice=None):
+    """调 /v1/chat/completions，返回完整 message dict。
+
+    降级链（全硬编码）：
+      1) 角色级 fallback 换模型（如 写码 luna → sol）；
+      2) 换网关（GATEWAYS 顺序：主网关 → 备选）；
+      3) 429/5xx/超时才降级；4xx 客户端错误直接抛（换模型救不了）；
+      4) 每次降级重试前退避 sleep（0.5s/1s/2s 递增），失败记 failures.jsonl；
+      5) 单网关 60s 内连续失败 3 次 → 熔断 30s，期间直接跳过该网关。
+    """
+    fallback_chain = []
+    for role in ROLES.values():
+        if role.get("model") == model and role.get("fallback"):
+            fallback_chain = [role["fallback"]]
+            break
+    candidates = [model] + fallback_chain
+    last_err = None
+    attempt = 0
+    for cand in candidates:
+        for gw in GATEWAYS:
+            if not _gw_available(gw["name"]):
+                continue  # 熔断中，跳过
+            real_model = gw["models"].get(cand, cand)
+            body = {
+                "model": real_model,
+                "messages": messages,
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+            }
+            if tools:
+                body["tools"] = tools
+            if tool_choice:
+                body["tool_choice"] = tool_choice
+            key = gw.get("api_key") or api_key()
+            req = urllib.request.Request(
+                gw["base_url"] + "/chat/completions", data=json.dumps(body).encode(), method="POST",
+                headers={
+                    "Authorization": "Bearer " + key,
+                    "Content-Type": "application/json",
+                    "User-Agent": UA,
+                },
+            )
+            t0 = time.time()
+            try:
+                resp = urllib.request.urlopen(req, timeout=timeout, context=_ssl_ctx())
+                data = json.loads(resp.read().decode())
+                _gw_record(gw["name"], failure=False)  # 成功 → 清零熔断计数
+                return data["choices"][0]["message"]
+            except urllib.error.HTTPError as e:
+                last_err = e
+                _audit_failure("http", cand, gw["name"], e, time.time() - t0)
+                if e.code in (408, 429) or 500 <= e.code < 600:
+                    _gw_record(gw["name"], failure=True)
+                    if attempt < len(RETRY_DELAYS):
+                        time.sleep(RETRY_DELAYS[attempt])
+                    attempt += 1
+                    continue  # 可降级错误 → 下一个候选/网关
+                raise  # 4xx 客户端错误不降级
+            except (urllib.error.URLError, TimeoutError, ConnectionError, OSError):
+                last_err = sys.exc_info()[1] or last_err
+                _audit_failure("network", cand, gw["name"], last_err, time.time() - t0)
+                _gw_record(gw["name"], failure=True)
+                if attempt < len(RETRY_DELAYS):
+                    time.sleep(RETRY_DELAYS[attempt])
+                attempt += 1
+                continue
+    if last_err is None:
+        raise RuntimeError("模型调用失败（无可用候选）")
+    raise last_err
 
 
 def msg_text(message):
@@ -325,9 +662,48 @@ def ask(model, prompt, system=None):
     return msg_text(call(model, msgs))
 
 
-def call_json(model, system, user, temperature=0.3, timeout=600):
+# 强制 JSON 提交工具：网关支持 tools 时，模型用 submit_json 提交结构化结果，
+# 避免自由文本里混入解释/思考导致 json.loads 失败。
+_SUBMIT_JSON_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "submit_json",
+        "description": "提交 JSON 结果",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "result": {
+                    "type": "string",
+                    "description": "JSON 格式的结果字符串",
+                },
+            },
+            "required": ["result"],
+        },
+    },
+}
+
+
+def call_json(model, system, user, temperature=0.3, timeout=600, use_tools=True):
+    """调模型取 JSON。use_tools=True 时优先用 submit_json 工具强制结构化输出，
+    任一异常（网关不支持 tools / 无 tool_calls / json 解析失败）回退既有截取法。
+    use_tools=False 直接走回退路径。"""
     msgs = [{"role": "system", "content": system},
             {"role": "user", "content": user}]
+    if use_tools:
+        try:
+            m = call(model, msgs, temperature=temperature, timeout=timeout,
+                     tools=[_SUBMIT_JSON_TOOL],
+                     tool_choice={"type": "function", "function": {"name": "submit_json"}})
+            tcs = m.get("tool_calls") or []
+            if tcs:
+                args_str = tcs[0]["function"].get("arguments", "")
+                args_obj = json.loads(args_str)
+                return json.loads(args_obj["result"])
+            # 无 tool_calls → 落入回退
+        except Exception:
+            # 网关不支持 tools / 无 tool_calls / json 解析失败 → 回退
+            pass
+    # 回退：既有「剥 ```json + find('{')/rfind('}')」截取法
     content = msg_text(call(model, msgs, temperature=temperature, timeout=timeout))
     s = content.strip()
     if s.startswith("```"):
@@ -344,7 +720,7 @@ def call_json(model, system, user, temperature=0.3, timeout=600):
     return json.loads(s)
 
 
-def agent_loop(model, system, user, tools=None, temperature=0.3, max_iter=20):
+def agent_loop(model, system, user, tools=None, temperature=0.3, max_iter=20, allow_risky=False):
     """带工具的 agent 循环：模型自主调用工具直到给出最终回答。返回 (文本, 工具轨迹)。"""
     msgs = [{"role": "system", "content": system}]
     if user:
@@ -361,20 +737,173 @@ def agent_loop(model, system, user, tools=None, temperature=0.3, max_iter=20):
         for tc in tcs:
             fn = tc["function"]
             name, args = fn["name"], json.loads(fn.get("arguments") or "{}")
-            result = execute_tool(name, args)
+            result = execute_tool(name, args, allow_risky=allow_risky)
             trace.append((name, args, result[:200]))
             msgs.append({"role": "tool", "tool_call_id": tc.get("id", ""),
                          "content": result})
     return "(达到最大工具调用轮数，已停止)", trace
 
 
+def spawn_agent(agent, task, context=None, max_tokens=4000):
+    """子代理委派：把子任务交给指定子模型（自定义 API，与 call 同链路）。
+
+    agent 支持角色名（指挥官/分析/写码/快速/快答）或别名（astra/sol/luna/...），
+    也支持直接写模型名。返回 (模型名, 回答文本)；委派失败时回答以 [子代理失败] 开头。
+    """
+    model = None
+    if agent in ROLES:
+        model = ROLES[agent]["model"]
+    else:
+        model = ALIASES.get(agent)
+        if model is None and agent in {r["model"] for r in ROLES.values()}:
+            model = agent
+    if model is None:
+        known = " / ".join(list(ROLES.keys()) + list(ALIASES.keys()))
+        return (agent, f"[子代理失败] 未知子代理 {agent}，可用: {known}")
+
+    prompt = f"子任务：{task}"
+    if context:
+        prompt += f"\n\n背景材料：\n{context}"
+    system = f"你是被委派的子代理（模型 {model}）。只完成分配给你的子任务，直接给出结果，不要复述任务。"
+    try:
+        answer = ask(model, prompt, system=system)
+        return (model, answer)
+    except Exception as e:
+        return (model, f"[子代理失败] {e}")
+
+
+def spawn_many(delegations, max_workers=4):
+    """并行委派多个子代理。delegations = [(agent, task, context_or_None), ...]
+
+    返回 [(agent, model, 回答), ...]，顺序与输入一致；单个失败不影响其他。
+    """
+    def _run(item):
+        agent, task, ctx = (item + (None,))[:3]
+        model, answer = spawn_agent(agent, task, context=ctx)
+        return (agent, model, answer)
+
+    with ThreadPoolExecutor(max_workers=max(1, min(max_workers, len(delegations)))) as ex:
+        futs = [ex.submit(_run, d) for d in delegations]
+        return [f.result() for f in futs]
+
+
+# ---------------------------------------------------------------------------
+# 交接摘要：阶段间传递结构化上下文，替代 [:800]/[:1200]/[:600] 粗暴截断
+# ---------------------------------------------------------------------------
+HANDOFF_MAX_CHARS = 4000
+
+
+def _trunc(s, limit):
+    """截断到 limit 字符，超限加 ...[截断]"""
+    if s is None:
+        return ""
+    s = str(s)
+    return s if len(s) <= limit else s[:limit] + "...[截断]"
+
+
+def _handoff_design(state):
+    """从 design 提取：关键决策(plan 前 1500 字) + 产物文件清单 + 遗留问题(acceptance 前 500 字)。"""
+    d = state.get("design") or {}
+    parts = []
+    plan = d.get("plan") or ""
+    parts.append("【关键决策】\n" + _trunc(plan, 1500))
+    files = d.get("files") or []
+    if files:
+        lines = []
+        for f in files:
+            if isinstance(f, dict):
+                lines.append(f"  - {f.get('path', '?')}: {f.get('purpose', '')}")
+            else:
+                lines.append(f"  - {f}")
+        parts.append("【产物文件清单】\n" + "\n".join(lines))
+    else:
+        parts.append("【产物文件清单】\n(无)")
+    acc = d.get("acceptance") or ""
+    if acc:
+        parts.append("【遗留问题/验收标准】\n" + _trunc(acc, 500))
+    return _trunc("\n\n".join(parts), HANDOFF_MAX_CHARS)
+
+
+def _handoff_impl(state):
+    """从 impl 提取：已写文件清单 + 实现摘要前 2000 字。"""
+    im = state.get("impl") or {}
+    parts = []
+    files = im.get("files") or []
+    if files:
+        parts.append("【已写文件清单】\n" + "\n".join(f"  - {f}" for f in files))
+    else:
+        parts.append("【已写文件清单】\n(无)")
+    summary = im.get("summary") or ""
+    parts.append("【实现摘要】\n" + _trunc(summary, 2000))
+    return _trunc("\n\n".join(parts), HANDOFF_MAX_CHARS)
+
+
+def _handoff_review(state, round_num):
+    """从 reviews[-1] 提取：verdict + blocking 列表 + minor 列表。"""
+    reviews = state.get("reviews") or []
+    if not reviews:
+        return f"【第 {round_num} 轮审查】\n(无审查记录)"
+    r = reviews[-1]
+    parts = [f"【第 {r.get('round', round_num)} 轮审查】"]
+    parts.append(f"结论: {r.get('verdict', '?')}")
+    if r.get("anomalous"):
+        parts.append("(结构化异常: 审查解析失败，按 anomalous fix 处理)")
+    blocking = r.get("blocking") or []
+    if blocking:
+        parts.append("阻塞问题:")
+        for it in blocking:
+            if isinstance(it, dict):
+                parts.append(f"  - [{it.get('file', '?')}] {it.get('issue', '')}")
+            else:
+                parts.append(f"  - {it}")
+    minor = r.get("minor") or []
+    if minor:
+        parts.append("次要问题:")
+        for it in minor:
+            if isinstance(it, dict):
+                parts.append(f"  - [{it.get('file', '?')}] {it.get('issue', '')}")
+            else:
+                parts.append(f"  - {it}")
+    return _trunc("\n".join(parts), HANDOFF_MAX_CHARS)
+
+
+# ---------------------------------------------------------------------------
+# codex 引擎：把实现/审查阶段委托给本地 codex CLI
+# ---------------------------------------------------------------------------
+class CodexEngineError(Exception):
+    """codex 引擎执行异常。"""
+    pass
+
+
+def _run_codex_stage(prompt, model, workdir, timeout=1800):
+    """用本地 codex exec 跑一个阶段，返回 (ok, detail)。
+    ok=True 时 detail 为 stdout；ok=False 时 detail 为错误文案。"""
+    codex_bin = shutil.which("codex")
+    if codex_bin is None:
+        return (False, "未找到 codex 可执行文件，建议 --engine builtin")
+    try:
+        r = subprocess.run(
+            [codex_bin, "exec", "--sandbox", "danger-full-access",
+             "-c", f"model={model}", prompt],
+            cwd=workdir, timeout=timeout, capture_output=True, text=True,
+            encoding="utf-8", errors="replace",
+        )
+    except subprocess.TimeoutExpired:
+        return (False, "codex exec 超时")
+    except Exception as e:
+        return (False, str(e))
+    if r.returncode != 0:
+        return (False, f"codex exec 退出码 {r.returncode}: {(r.stderr or '')[:500]}")
+    return (True, r.stdout or "")
+
+
 # ---------------------------------------------------------------------------
 # 基础命令
 # ---------------------------------------------------------------------------
-def parallel(prompt, models=None):
+def parallel(prompt, models=None, max_workers=4):
     models = models or [r["model"] for r in ROLES.values()]
     results = {}
-    with ThreadPoolExecutor(max_workers=len(models)) as ex:
+    with ThreadPoolExecutor(max_workers=max(1, min(max_workers, len(models)))) as ex:
         futs = {ex.submit(ask, m, prompt): m for m in models}
         for f in as_completed(futs):
             m = futs[f]
@@ -450,6 +979,11 @@ def orchestrate(task):
             final = "\n\n".join(report)
     except Exception as e:
         final = f"[汇总失败] {e}\n\n子任务原始结果：\n\n" + "\n\n".join(report)
+    # 追加结构化异常段（如有子任务执行失败）
+    failed = [s for s in subs if outputs[(s["role"], s["task"])][3]]
+    if failed:
+        final += "\n\n[结构化异常] " + "、".join(
+            f"[{s['role']}] {s['task'][:40]}" for s in failed) + " 执行失败"
     print("\n" + "=" * 60)
     print(final)
     print("=" * 60)
@@ -458,129 +992,220 @@ def orchestrate(task):
 # ---------------------------------------------------------------------------
 # team 流水线：分析 → 写码 → 审查 → 迭代回改 → 汇总
 # ---------------------------------------------------------------------------
-def team(task, max_rounds=3):
-    """真团队流水线：带工具落地文件 + 审查迭代。"""
+REVIEW_RETRIES = 2
+
+
+def team(task, max_rounds=3, state=None, engine=None, allow_risky=None):
+    """真团队流水线：带工具落地文件 + 审查迭代 + 状态持久化 + 引擎分派。
+
+    新增参数：
+      state       — 传入则 resume（按 state['phase'] 续跑，已完成阶段零模型调用）
+      engine      — "builtin"(默认) 或 "codex"(委托本地 codex CLI 跑实现阶段)
+      allow_risky — True 时放行命中危险黑名单的 run_command
+    返回 state dict（既有 CLI 调用不依赖返回值）。
+    """
+    engine = engine or "builtin"
+    allow_risky = bool(allow_risky)
+    if state is None:
+        state = _new_state(task, WORKDIR, engine, allow_risky)
+    else:
+        task = state["task"]  # resume 模式以 state 内 task 为准
+    ar = state["allow_risky"]
     print(f"\n工作目录: {WORKDIR}")
-    print(f"任务: {task}\n")
+    print(f"任务: {task}")
+    print(f"引擎: {state['engine']}  task_id: {state['task_id']}  phase: {state['phase']}")
+
+    design = state.get("design") or {}
+    impl_txt = (state.get("impl") or {}).get("summary") or ""
 
     # 阶段1：分析出设计稿
-    print("[1/5] 分析 " + ROLES["分析"]["model"] + " 产出设计稿...")
-    design_prompt = (
-        "你是软件架构师。先查看当前项目结构（用 list_dir/read_file 工具），"
-        "然后针对下面的任务输出一份 JSON 设计稿，不要写代码，只做设计。\n"
-        f"任务：{task}\n\n"
-        "JSON 格式（严格）：\n"
-        '{"files":[{"path":"相对路径","purpose":"这个文件做什么"}],'
-        '"plan":"实现步骤要点","acceptance":"验收标准(如何证明完成)"}'
-    )
-    design_txt, _ = agent_loop(
-        ROLES["分析"]["model"],
-        "你是架构师，先探索项目再用 JSON 输出设计稿。只输出 JSON，不要输出解释。",
-        design_prompt,
-        tools=[t for t in TOOLS if t["function"]["name"] in ("list_dir", "read_file", "search")],
-    )
-    try:
-        a, b = design_txt.find("{"), design_txt.rfind("}")
-        design = json.loads(design_txt[a:b + 1] if a != -1 and b != -1 else design_txt)
-    except Exception as e:
-        print(f"[警告] 设计稿解析失败({e})，退化为纯文本设计。")
-        design = {"files": [], "plan": design_txt, "acceptance": ""}
-    print(f"  设计稿: {json.dumps(design, ensure_ascii=False)[:500]}")
-
-    # 阶段2：写码落地
-    print("\n[2/5] 写码 " + ROLES["写码"]["model"] + " 按设计稿落地文件...")
-    impl_prompt = (
-        "你是资深工程师。根据下面的设计稿，用 write_file 工具把代码真正写到磁盘上。"
-        "先用 list_dir/read_file 了解现状，再逐个写文件。完成后简要说明写了哪些文件、如何验证。\n\n"
-        f"设计稿：{json.dumps(design, ensure_ascii=False)}"
-    )
-    impl_txt, impl_trace = agent_loop(
-        ROLES["写码"]["model"],
-        "你是写码工程师，用工具把代码落地到工作目录，写完后做自我检查。",
-        impl_prompt,
-        tools=[t for t in TOOLS if t["function"]["name"] in ("list_dir", "read_file", "write_file", "search")],
-        temperature=0.2,
-    )
-    for name, args, res in impl_trace:
-        if name == "write_file":
-            print(f"    ✎ {args.get('path')}  → {res}")
-    print(f"  写码完成（工具调用 {len(impl_trace)} 次）")
-
-    # 阶段3+4：审查 + 迭代回改
-    issues = None
-    for rnd in range(1, max_rounds + 1):
-        print(f"\n[3/5] 审查 {ROLES['分析']['model']} 读真实代码给意见（第 {rnd} 轮）...")
-        review_prompt = (
-            "你是代码审查专家。用 read_file/list_dir 工具读取刚才实际写出来的代码，"
-            "逐条列出问题。只输出 JSON：\n"
-            '{"blocking":[{"file":"...","issue":"..."}],'
-            '"minor":[{"file":"...","issue":"..."}],'
-            '"verdict":"pass" 或 "fix"}'
-            "若无阻塞问题，verdict 为 pass。"
+    if state["phase"] <= 1:
+        print("\n[1/5] 分析 " + ROLES["分析"]["model"] + " 产出设计稿...")
+        design_prompt = (
+            "你是软件架构师。先查看当前项目结构（用 list_dir/read_file 工具），"
+            "然后针对下面的任务输出一份 JSON 设计稿，不要写代码，只做设计。\n"
+            f"任务：{task}\n\n"
+            "JSON 格式（严格）：\n"
+            '{"files":[{"path":"相对路径","purpose":"这个文件做什么"}],'
+            '"plan":"实现步骤要点","acceptance":"验收标准(如何证明完成)"}'
         )
-        review_txt, _ = agent_loop(
+        design_txt, _ = agent_loop(
             ROLES["分析"]["model"],
-            "你是代码审查专家，只输出 JSON。",
-            review_prompt,
+            "你是架构师，先探索项目再用 JSON 输出设计稿。只输出 JSON，不要输出解释。",
+            design_prompt,
             tools=[t for t in TOOLS if t["function"]["name"] in ("list_dir", "read_file", "search")],
+            allow_risky=ar,
         )
         try:
-            a, b = review_txt.find("{"), review_txt.rfind("}")
-            issues = json.loads(review_txt[a:b + 1] if a != -1 and b != -1 else review_txt)
+            a, b = design_txt.find("{"), design_txt.rfind("}")
+            design = json.loads(design_txt[a:b + 1] if a != -1 and b != -1 else design_txt)
         except Exception as e:
-            print(f"[警告] 审查意见解析失败({e})，按通过处理。")
-            issues = {"blocking": [], "minor": [], "verdict": "pass"}
-        verdict = issues.get("verdict", "pass")
-        blocking = issues.get("blocking", [])
-        minor = issues.get("minor", [])
-        print(f"  结论: {verdict}  (阻塞 {len(blocking)} 条 / 次要 {len(minor)} 条)")
-        for it in blocking + minor:
-            print(f"    · [{it.get('file','?')}] {it.get('issue','')[:80]}")
-        if verdict == "pass" or not blocking:
-            break
-        if rnd < max_rounds:
-            print(f"\n[4/5] 回改 {ROLES['写码']['model']} 按审查意见修复...")
-            fix_prompt = (
-                "根据下面的审查意见，用 read_file 读代码、write_file 修复问题。"
-                "只修阻塞问题，次要问题一并处理。完成后说明改了什么。\n\n"
-                f"审查意见：{json.dumps(issues, ensure_ascii=False)}"
+            print(f"[警告] 设计稿解析失败({e})，退化为纯文本设计。")
+            design = {"files": [], "plan": design_txt, "acceptance": ""}
+        print(f"  设计稿: {json.dumps(design, ensure_ascii=False)[:500]}")
+        state["design"] = design
+        state["phase"] = 2
+        _save_state_atomic(WORKDIR, state)
+    else:
+        print("\n[1/5] 设计稿已有(resume)，跳过。")
+
+    # 阶段2：写码落地（按 engine 分派）
+    if state["phase"] <= 2:
+        print("\n[2/5] 写码 " + ROLES["写码"]["model"] + " 按设计稿落地文件...")
+        if state["engine"] == "codex":
+            impl_prompt = (
+                "你是资深工程师。根据下面的设计稿把代码真正写到磁盘上。"
+                "先了解现状，再逐个写文件。完成后简要说明写了哪些文件、如何验证。\n\n"
+                f"设计稿：{json.dumps(design, ensure_ascii=False)}"
             )
-            _, fix_trace = agent_loop(
+            ok, detail = _run_codex_stage(impl_prompt, ROLES["写码"]["model"], WORKDIR)
+            if ok:
+                impl_txt = detail
+                impl_files = []  # codex 模式无法精确追踪文件清单
+            else:
+                print(f"  [codex 引擎失败] {detail}")
+                state["stage_errors"].append({"phase": 2, "engine": "codex", "detail": detail})
+                impl_txt = f"[codex 引擎失败] {detail}"
+                impl_files = []
+        else:
+            impl_prompt = (
+                "你是资深工程师。根据下面的设计稿，用 write_file 工具把代码真正写到磁盘上。"
+                "先用 list_dir/read_file 了解现状，再逐个写文件。完成后简要说明写了哪些文件、如何验证。\n\n"
+                f"设计稿：{json.dumps(design, ensure_ascii=False)}"
+            )
+            impl_txt, impl_trace = agent_loop(
                 ROLES["写码"]["model"],
-                "你是工程师，按审查意见修复代码。",
-                fix_prompt,
-                tools=[t for t in TOOLS if t["function"]["name"] in ("read_file", "write_file", "list_dir", "search")],
+                "你是写码工程师，用工具把代码落地到工作目录，写完后做自我检查。",
+                impl_prompt,
+                tools=[t for t in TOOLS if t["function"]["name"] in ("list_dir", "read_file", "write_file", "search")],
                 temperature=0.2,
+                allow_risky=ar,
             )
-            for name, args, res in fix_trace:
+            impl_files = [args.get("path") for name, args, _ in impl_trace if name == "write_file"]
+            for name, args, res in impl_trace:
                 if name == "write_file":
                     print(f"    ✎ {args.get('path')}  → {res}")
+        print(f"  写码完成")
+        state["impl"] = {"files": impl_files, "summary": impl_txt}
+        state["phase"] = 3
+        _save_state_atomic(WORKDIR, state)
+    else:
+        print("\n[2/5] 实现已有(resume)，跳过。")
 
-    # 阶段5：汇总
+    # 阶段3+4：审查 + 迭代回改
+    if state["phase"] <= 3:
+        start_round = len(state.get("reviews") or [])
+        for rnd in range(start_round + 1, max_rounds + 1):
+            state["round"] = rnd
+            print(f"\n[3/5] 审查 {ROLES['分析']['model']} 读真实代码给意见（第 {rnd} 轮）...")
+            review_prompt = (
+                "你是代码审查专家。用 read_file/list_dir 工具读取刚才实际写出来的代码，"
+                "逐条列出问题。只输出 JSON：\n"
+                '{"blocking":[{"file":"...","issue":"..."}],'
+                '"minor":[{"file":"...","issue":"..."}],'
+                '"verdict":"pass" 或 "fix"}'
+                "若无阻塞问题，verdict 为 pass。"
+            )
+            # 审查解析重试 REVIEW_RETRIES 次；仍失败 → anomalous fix（禁止误判 pass）
+            issues = None
+            for attempt in range(1, REVIEW_RETRIES + 1):
+                review_txt, _ = agent_loop(
+                    ROLES["分析"]["model"],
+                    "你是代码审查专家，只输出 JSON。",
+                    review_prompt,
+                    tools=[t for t in TOOLS if t["function"]["name"] in ("list_dir", "read_file", "search")],
+                    allow_risky=ar,
+                )
+                try:
+                    a, b = review_txt.find("{"), review_txt.rfind("}")
+                    issues = json.loads(review_txt[a:b + 1] if a != -1 and b != -1 else review_txt)
+                    break  # 解析成功
+                except Exception as e:
+                    if attempt < REVIEW_RETRIES:
+                        print(f"  [审查解析失败 第{attempt}次({e})，重试...]")
+                    else:
+                        print(f"  [警告] 审查意见解析失败({e})，按 anomalous fix 处理（禁止误判 pass）。")
+            if issues is None:
+                # 解析全部失败 → anomalous fix，绝不判 pass
+                issues = {"blocking": [], "minor": [], "verdict": "fix", "anomalous": True}
+            verdict = issues.get("verdict", "fix")
+            blocking = issues.get("blocking", [])
+            minor = issues.get("minor", [])
+            print(f"  结论: {verdict}  (阻塞 {len(blocking)} 条 / 次要 {len(minor)} 条)")
+            for it in blocking + minor:
+                if isinstance(it, dict):
+                    print(f"    · [{it.get('file', '?')}] {str(it.get('issue', ''))[:80]}")
+            state["reviews"].append({
+                "round": rnd, "verdict": verdict,
+                "blocking": blocking, "minor": minor,
+                "anomalous": bool(issues.get("anomalous")),
+            })
+            _save_state_atomic(WORKDIR, state)
+            if verdict == "pass" or not blocking:
+                break
+            if rnd < max_rounds:
+                print(f"\n[4/5] 回改 {ROLES['写码']['model']} 按审查意见修复...")
+                fix_prompt = (
+                    "根据下面的审查意见，用 read_file 读代码、write_file 修复问题。"
+                    "只修阻塞问题，次要问题一并处理。完成后说明改了什么。\n\n"
+                    f"审查意见：{json.dumps(issues, ensure_ascii=False)}"
+                )
+                _, fix_trace = agent_loop(
+                    ROLES["写码"]["model"],
+                    "你是工程师，按审查意见修复代码。",
+                    fix_prompt,
+                    tools=[t for t in TOOLS if t["function"]["name"] in ("read_file", "write_file", "list_dir", "search")],
+                    temperature=0.2,
+                    allow_risky=ar,
+                )
+                for name, args, res in fix_trace:
+                    if name == "write_file":
+                        print(f"    ✎ {args.get('path')}  → {res}")
+                state["fixes"].append({
+                    "round": rnd,
+                    "files": [args.get("path") for name, args, _ in fix_trace if name == "write_file"],
+                })
+                _save_state_atomic(WORKDIR, state)
+        state["phase"] = 5
+        _save_state_atomic(WORKDIR, state)
+    else:
+        print("\n[3-4/5] 审查迭代已有(resume)，跳过。")
+
+    # 阶段5：汇总（用交接摘要替代 [:800]/[:1200]/[:600] 粗暴截断）
     print("\n[5/5] 汇总 " + ROLES["指挥官"]["model"] + " 输出最终交付...")
-    files_done = ", ".join(f.get("path", "") for f in design.get("files", []))
+    files_done = ", ".join(
+        f.get("path", "") for f in design.get("files", []) if isinstance(f, dict))
     final_prompt = (
         "你是总指挥。团队已完成以下任务，请汇总最终交付：完成内容、文件清单、"
         "验证方法、剩余风险。简洁，直接输出，不要输出思考过程。\n\n"
-        f"任务：{task}\n设计稿：{json.dumps(design, ensure_ascii=False)[:800]}\n"
-        f"写码说明：{impl_txt[:800]}\n最终审查：{json.dumps(issues or {}, ensure_ascii=False)[:600]}"
+        f"任务：{task}\n{_handoff_design(state)}\n\n{_handoff_impl(state)}\n\n"
+        f"{_handoff_review(state, state.get('round', 0))}"
     )
     try:
         final = ask(ROLES["指挥官"]["model"], final_prompt,
                     system="你是总指挥，直接输出最终交付，不要输出思考过程。")
-        if final.startswith("The user") or "thinking" in final[:60].lower():
-            final = f"任务已完成。涉及文件：{files_done or '见工作目录'}\n\n写码说明：\n{impl_txt[:1500]}"
+        if not final or final.startswith("The user") or "thinking" in final[:60].lower():
+            final = (f"任务已完成。涉及文件：{files_done or '见工作目录'}\n\n"
+                     f"写码说明：\n{impl_txt[:1500]}")
     except Exception as e:
         final = f"[汇总失败] {e}\n\n写码说明：\n{impl_txt[:1500]}"
+    # 汇总末尾追加结构化异常标记
+    anomalous_rounds = [r["round"] for r in state.get("reviews", []) if r.get("anomalous")]
+    if anomalous_rounds:
+        final += "\n\n[结构化异常] 第 " + ",".join(str(r) for r in anomalous_rounds) + " 轮审查未完成"
+    state["final"] = {"summary": final}
+    state["status"] = "done"
+    _save_state_atomic(WORKDIR, state)
     print("\n" + "=" * 60)
     print(final)
     print("=" * 60)
+    return state
 
 
 # ---------------------------------------------------------------------------
 # auto 无人值守：循环跑 team
 # ---------------------------------------------------------------------------
-def auto(task=None, hours=None, tasks_file=None):
+def auto(task=None, hours=None, tasks_file=None, engine="builtin", allow_risky=False):
     """无人值守连续跑：循环跑多模型团队流水线，直到超时或 Ctrl+C。
 
     - 给 --tasks 清单文件时：按文件里每行一个任务，逐个跑（跑完一轮接一轮）。
@@ -627,7 +1252,7 @@ def auto(task=None, hours=None, tasks_file=None):
                    "不要推倒重来。")
 
         try:
-            team(cur)
+            team(cur, engine=engine, allow_risky=allow_risky)
         except KeyboardInterrupt:
             print("\n[auto] 手动中断，停止。")
             break
@@ -644,15 +1269,13 @@ def auto(task=None, hours=None, tasks_file=None):
 
 
 def list_models():
-    req = urllib.request.Request(
-        BASE_URL + "/models",
-        headers={"Authorization": "Bearer " + api_key(), "User-Agent": UA},
-    )
-    resp = urllib.request.urlopen(req, timeout=30, context=_ssl_ctx())
-    data = json.loads(resp.read().decode())
-    print(f"网关可用模型（{len(data['data'])} 个）:")
-    for m in data["data"]:
-        print("  -", m["id"])
+    """列出 GATEWAYS 里硬编码注册的模型（不触网，避免 BASE_URL 旧引用）。"""
+    print("网关可用模型（硬编码注册表）:")
+    for gw in GATEWAYS:
+        print(f"  [{gw['name']}] {gw['base_url']}")
+        for alias, real in sorted(gw["models"].items()):
+            tag = "" if alias == real else f"  (→ 上游 {real})"
+            print(f"    - {alias}{tag}")
 
 
 def menu():
@@ -660,7 +1283,10 @@ def menu():
         print("\n" + "=" * 56)
         print("  多模型协作编排器 (multi-model)")
         print("=" * 56)
-        print(f"  网关: {BASE_URL}")
+        gw_line = f"  主网关: {GATEWAYS[0]['base_url']}"
+        if len(GATEWAYS) > 1:
+            gw_line += f"  备选: {GATEWAYS[1]['base_url']}"
+        print(gw_line)
         print("  1. 单模型问答 (ask)")
         print("  2. 多模型同问对比 (parallel, 真并行)")
         print("  3. 指挥官拆解→多模型并行→汇总 (orchestrate)")
@@ -710,6 +1336,10 @@ def main():
     ap.add_argument("--api-key", default=None, help="覆盖 API Key")
     ap.add_argument("--workdir", default=None, help="工作目录（团队读写文件限定在此）")
     ap.add_argument("--no-run", action="store_true", help="禁用 run_command 工具")
+    ap.add_argument("--engine", choices=["builtin", "codex"], default="builtin",
+                    help="team/auto 实现阶段引擎：builtin(本脚本 agent_loop) 或 codex(本地 codex CLI)")
+    ap.add_argument("--allow-risky", action="store_true", default=False,
+                    help="放行命中危险命令黑名单的 run_command（默认拦截）")
     sub = ap.add_subparsers(dest="action")
 
     p = sub.add_parser("ask", help="单模型问答")
@@ -724,8 +1354,10 @@ def main():
     p.add_argument("task")
 
     p = sub.add_parser("team", help="真团队流水线(带工具+审查迭代)")
-    p.add_argument("task")
+    p.add_argument("task", nargs="?", default=None, help="任务文本（与 --resume 互斥）")
     p.add_argument("--rounds", type=int, default=3, help="审查迭代最大轮数")
+    p.add_argument("--resume", default=None, metavar="TASK_ID",
+                   help="从已持久化的状态续跑（与 task 位置参数互斥）")
 
     p = sub.add_parser("auto", help="无人值守连续跑多模型（挂机/跑一天一夜）")
     p.add_argument("task", nargs="?", default=None, help="要持续迭代的单个任务")
@@ -758,9 +1390,25 @@ def main():
     elif args.action == "orchestrate":
         orchestrate(args.task)
     elif args.action == "team":
-        team(args.task, max_rounds=args.rounds)
+        if args.resume:
+            # --resume 续跑：从持久化状态恢复
+            try:
+                st = _load_state(WORKDIR, args.resume)
+            except StateError as e:
+                print(f"[错误] 恢复状态失败: {e}")
+                sys.exit(2)
+            team(task=st["task"], max_rounds=args.rounds, state=st,
+                 engine=st.get("engine", "builtin"),
+                 allow_risky=st.get("allow_risky", False))
+        else:
+            if not args.task:
+                print("[错误] team 需要任务文本，或用 --resume TASK_ID 续跑")
+                sys.exit(2)
+            team(args.task, max_rounds=args.rounds,
+                 engine=args.engine, allow_risky=args.allow_risky)
     elif args.action == "auto":
-        sys.exit(auto(task=args.task, hours=args.hours, tasks_file=args.tasks))
+        sys.exit(auto(task=args.task, hours=args.hours, tasks_file=args.tasks,
+                      engine=args.engine, allow_risky=args.allow_risky))
     elif args.action == "list":
         list_models()
 
