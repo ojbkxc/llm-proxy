@@ -153,10 +153,20 @@ def run_remote(exec_prompt=None):
         sys.exit(0)
 
     # 交互 TUI: --remote 连服务器
-    cmd = [codex_bin(), "--remote", ws, "--remote-auth-token-env", "CODEX_WS_TOKEN"]
+    # codex 0.153 安全策略：--remote-auth-token-env 只允许 wss:// 或 loopback ws://，
+    # 明文 ws://公网IP 会被拒绝（ERROR: requires a `wss://` or loopback `ws://` remote）。
+    # 公网明文 ws 场景改用 -c remote_auth_token_env=... 配置注入，校验只针对 CLI flag。
+    is_loopback = cfg["host"] in ("127.0.0.1", "localhost", "::1")
+    cmd = [codex_bin(), "--remote", ws]
+    if is_loopback:
+        cmd += ["--remote-auth-token-env", "CODEX_WS_TOKEN"]
     env = dict(os.environ)
     env["CODEX_WS_TOKEN"] = token
     print(f"[远程 Codex] {ws} (服务器会话, 模型 kimi-k2.7-code, 线程存服务器)")
+    if not is_loopback:
+        print("  [提示] 公网明文 ws:// 不允许 CLI 传 token，改用 SSH 隧道更安全:")
+        print("         ssh -L 20130:127.0.0.1:20130 user@104.223.65.202")
+        print("         然后远程地址用 ws://127.0.0.1:20130")
     print("  执行:", " ".join(cmd))
     subprocess.run(cmd, env=env)
     sys.exit(0)
