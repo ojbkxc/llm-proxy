@@ -250,42 +250,46 @@ def _write_session_row(payload: dict):
         con.close()
 
 
-# Workspace 编辑器路径（token 失效时自动拉起，编辑器会自动登录刷新 db）
-WS_EDITOR = os.path.join(
-    os.environ.get("LOCALAPPDATA", ""), "Programs", "Workspace", "Workspace.exe"
-)
-
-
-def _try_relogin_via_editor(wait_sec: int = 45) -> bool:
-    """拉起 Workspace 编辑器并等待它自动重新登录（db 里的 session 被刷新）。
-
-    返回 True 表示 db 中出现了有效期更长的 accessToken（视为自愈成功）。
-    持有 _session_lock 调用（_refresh_session_locked 内），期间该锁不释放：
-    并发请求会阻塞在此，等编辑器刷新完一起恢复。
-    """
-    old_exp = 0
-    try:
-        old_exp = int(_decode_jwt(_load_session_from_db().get("accessToken") or "").get("exp", 0))
-    except Exception:
-        pass
-    try:
-        os.startfile(WS_EDITOR)  # 已在运行也无妨，startfile 只是再唤起一次
-        _log("[session] 已拉起 Workspace 编辑器，等待自动登录...")
-    except Exception as e:
-        _log("[session] 拉起编辑器失败: %s" % e)
-        return False
-    deadline = time.time() + wait_sec
-    while time.time() < deadline:
-        time.sleep(3)
-        try:
-            exp = int(_decode_jwt(_load_session_from_db().get("accessToken") or "").get("exp", 0))
-            if exp > old_exp:  # token 被编辑器刷新了
-                _log("[session] 编辑器自愈成功，登录态已刷新")
-                return True
-        except Exception:
-            continue
-    _log("[session] 等待编辑器自愈超时（%ss）" % wait_sec)
-    return False
+# ── 「拉起 Workspace 编辑器自愈」已停用：认证统一走浏览器登录 ──────────────
+# 代码注释保留备查。恢复方法：取消下方注释，并在 _refresh_session_locked 的
+# 浏览器登录失败分支里接回 `if _try_relogin_via_editor(): ...` 兜底逻辑。
+#
+# # Workspace 编辑器路径（token 失效时自动拉起，编辑器会自动登录刷新 db）
+# WS_EDITOR = os.path.join(
+#     os.environ.get("LOCALAPPDATA", ""), "Programs", "Workspace", "Workspace.exe"
+# )
+#
+#
+# def _try_relogin_via_editor(wait_sec: int = 45) -> bool:
+#     """拉起 Workspace 编辑器并等待它自动重新登录（db 里的 session 被刷新）。
+#
+#     返回 True 表示 db 中出现了有效期更长的 accessToken（视为自愈成功）。
+#     持有 _session_lock 调用（_refresh_session_locked 内），期间该锁不释放：
+#     并发请求会阻塞在此，等编辑器刷新完一起恢复。
+#     """
+#     old_exp = 0
+#     try:
+#         old_exp = int(_decode_jwt(_load_session_from_db().get("accessToken") or "").get("exp", 0))
+#     except Exception:
+#         pass
+#     try:
+#         os.startfile(WS_EDITOR)  # 已在运行也无妨，startfile 只是再唤起一次
+#         _log("[session] 已拉起 Workspace 编辑器，等待自动登录...")
+#     except Exception as e:
+#         _log("[session] 拉起编辑器失败: %s" % e)
+#         return False
+#     deadline = time.time() + wait_sec
+#     while time.time() < deadline:
+#         time.sleep(3)
+#         try:
+#             exp = int(_decode_jwt(_load_session_from_db().get("accessToken") or "").get("exp", 0))
+#             if exp > old_exp:  # token 被编辑器刷新了
+#                 _log("[session] 编辑器自愈成功，登录态已刷新")
+#                 return True
+#         except Exception:
+#             continue
+#     _log("[session] 等待编辑器自愈超时（%ss）" % wait_sec)
+#     return False
 
 
 def _refresh_token_via_refresh(refresh_token: str) -> dict:
@@ -314,23 +318,23 @@ def _refresh_session_locked(db_data: dict) -> dict:
         new = _refresh_token_via_refresh(rt)
     except Exception as e:
         # SSO 会话到期、网络异常等都归为刷新失败。
-        # 自愈优先级：浏览器登录（无需打开编辑器）→ 失败再拉起 Workspace 编辑器兜底
-        # （编辑器会自动重新登录刷新 db；代码保留，浏览器登录不可用时仍可走这条老路）
-        _log("[session] 自动刷新失败: %s，尝试浏览器登录" % e)
-        try:
-            return _browser_login_locked()
-        except Exception as be:
-            _log("[session] 浏览器登录不可用: %s，降级拉起编辑器自愈" % be)
-        _log("[session] 尝试拉起编辑器自愈")
-        if _try_relogin_via_editor():
-            try:
-                db_data2 = _load_session_from_db()
-                rt2 = db_data2.get("refreshToken") or rt
-                new = _refresh_token_via_refresh(rt2)
-            except Exception as e2:
-                raise RuntimeError("登录态已失效，编辑器自愈后仍刷新失败: %s" % e2) from e2
-        else:
-            raise RuntimeError("登录态已失效，请完成浏览器登录或打开 Workspace 编辑器重新登录后再试") from e
+        # 认证统一走浏览器登录；编辑器自愈兜底已停用（代码注释保留在上方）。
+        # _log("[session] 自动刷新失败: %s，尝试浏览器登录" % e)
+        # try:
+        #     return _browser_login_locked()
+        # except Exception as be:
+        #     _log("[session] 浏览器登录不可用: %s，降级拉起编辑器自愈" % be)
+        # _log("[session] 尝试拉起编辑器自愈")
+        # if _try_relogin_via_editor():
+        #     try:
+        #         db_data2 = _load_session_from_db()
+        #         rt2 = db_data2.get("refreshToken") or rt
+        #         new = _refresh_token_via_refresh(rt2)
+        #     except Exception as e2:
+        #         raise RuntimeError("登录态已失效，编辑器自愈后仍刷新失败: %s" % e2) from e2
+        # else:
+        #     raise RuntimeError("登录态已失效，请完成浏览器登录或打开 Workspace 编辑器重新登录后再试") from e
+        return _browser_login_locked()
     # 写回 db（含新 refreshToken，保证下次还能续期；对 ws.exe 透明）
     label = db_data.get("label", "")
     uid = db_data.get("id", "")

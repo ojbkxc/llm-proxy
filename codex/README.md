@@ -8,6 +8,31 @@
 
 ---
 
+## ★ 双网关与模型假名（2026-09 起的核心用法）
+
+模型分档统一使用 **gpt-\* 假名**，两个网关都认识同一套名字，**切换网关不用换模型名**，只改脚本顶部的 `DEFAULT_BASE_URL` 后重跑部署：
+
+| 网关 | 地址 | 说明 |
+|------|------|------|
+| **cfapi 云网关** | `https://cfapi.1232333.xyz/v1` | 远程 CF 网关，假名原生支持 |
+| **ws-proxy 本地** | `http://127.0.0.1:8787/v1` | `D:\GitHub\llm-proxy\proxy.py`，认证复用 Workspace 编辑器登录态，需保持 `python -X utf8 proxy.py` 常驻运行 |
+
+五个假名在两网关的映射（脚本只发假名，映射由网关自己做）：
+
+| 假名 | cfapi 上游 | ws-proxy 上游 |
+|------|-----------|---------------|
+| `gpt-6-astra` | 旗舰推理 | gpt-5.6-luna 上游 |
+| `gpt-5.6-luna` | 写码主力 | 同名直通 |
+| `gpt-5.6-luna-fast` | 快速 | qwen3.8-max |
+| `gpt-5.6-sol` | 深度推理 | aliyun-glm-5.2 |
+| `gpt-5.6-sol-fast` | 最快 | qwen3.7-plus |
+
+> 换网关示例：打开 `deploy_ai_cli.py`，把 `DEFAULT_BASE_URL = "https://cfapi.1232333.xyz/v1"` 改成 `http://127.0.0.1:8787/v1`，重跑部署（或临时 `--base-url http://127.0.0.1:8787/v1`）。
+> ws-proxy 附带合规层：违规词 403、密码/密钥/手机号等自动脱敏转发；本地不校验 API Key。
+> ws-proxy 只暴露部分模型：`hw-glm-5` / `qwen3.8-max` / `qwen3.7-plus` 仅本地网关可用，cfapi 无对应上游。
+
+---
+
 ## 〇、新电脑部署步骤（按顺序执行）
 
 > Windows 全流程约 5 分钟。前置条件：能上网；Windows 需管理员 PowerShell。
@@ -69,7 +94,7 @@ codex sandbox powershell -NoProfile -Command "ls | Select-Object -First 3"
 ```powershell
 codex                                            # TUI 交互模式（推荐，可逐条审批命令）
 codex exec --sandbox danger-full-access "任务"    # 自动化模式（无沙箱，信任任务用）
-codex --profile fast                             # 切快模型
+codex --profile fast                             # 切快模型（档位见第八章）
 ```
 
 ### macOS / Linux
@@ -96,8 +121,8 @@ codex exec "请回复：对话正常"
 
 | 目标 | 配置内容 |
 |------|----------|
-| **Codex** | 生成 `~/.codex/config.toml`（custom provider + env_key）、8 个模型分档 `*.config.toml`、`auth.json`、用户级环境变量 `CF_GATEWAY_KEY` |
-| **Claude** | 合并式写入 `~/.claude/settings.json`（保留你已有的字段）：三槽模型映射（opus/sonnet=glm-5.3，haiku=glm-5.3-flash）、`modelPicker` 注册 8 个非官方模型名（glm/deepseek/kimi 系，解决 `unrecognized_model`）、权限全放行 + `bypassPermissions`、语言中文；生成 3 个分工子代理 `~/.claude/agents/*.md`；写入 `ANTHROPIC_*` + `CLAUDE_DANGEROUS_MODE` 环境变量并清除致命的 `ANTHROPIC_MODEL` |
+| **Codex** | 生成 `~/.codex/config.toml`（custom provider + env_key）、8 个模型分档 `*.config.toml`（gpt-\* 假名 + qwen/hw 直名）、`auth.json`、用户级环境变量 `CF_GATEWAY_KEY` |
+| **Claude** | 合并式写入 `~/.claude/settings.json`（保留你已有的字段）：三槽模型映射（opus=gpt-6-astra，sonnet=gpt-5.6-luna，haiku=gpt-5.6-luna-fast）、`modelPicker` 注册 13 个非官方模型名（gpt-\* 假名系 + 保留 glm/deepseek/kimi 旧条目，解决 `unrecognized_model`）、权限全放行 + `bypassPermissions`、语言中文；生成 3 个分工子代理 `~/.claude/agents/*.md`；写入 `ANTHROPIC_*` + `CLAUDE_DANGEROUS_MODE` 环境变量并清除致命的 `ANTHROPIC_MODEL` |
 
 > Claude Code Haha 桌面端与官方 CLI 共用 `~/.claude`，以上配置它全部继承，重启即生效。
 
@@ -125,7 +150,7 @@ python deploy_ai_cli.py --rollback
 
 | 参数 | 说明 | 默认 |
 |------|------|------|
-| `--base-url` | 自定义网关地址（Codex 用它带 `/v1`；Claude 写入时自动剥掉 `/v1`，因为 SDK 自己拼） | `https://cfapi.1232333.xyz/v1` |
+| `--base-url` | 自定义网关地址（Codex 用它带 `/v1`；Claude 写入时自动剥掉 `/v1`，因为 SDK 自己拼）。cfapi 与 ws-proxy 都认 gpt-\* 假名，切网关只改这一项 | 脚本顶部 `DEFAULT_BASE_URL` |
 | `--api-key` | 网关 API Key（优先级最高；不提供则依次尝试 `--key-file` / 脚本内置 `DEFAULT_API_KEY` / 复用现有配置 / 交互询问） | 自动 |
 | `--key-file` | 从文件读取 API Key | — |
 | `--codex-home` | Codex 配置目录 | `~/.codex` |
@@ -216,20 +241,23 @@ DEFAULT_API_KEY = ""
 
 ### 非官方模型为什么能通过 CLI 校验（modelPicker 机制）
 
-官方 Claude Code CLI 会在本地校验 `--model` / `/model` 传入的模型名，非官方名（`glm-5.3` 等）直接报 `unrecognized_model`。解法是在 `~/.claude/settings.json` 写：
+官方 Claude Code CLI 会在本地校验 `--model` / `/model` 传入的模型名，非官方名（`gpt-5.6-luna` 等）直接报 `unrecognized_model`。解法是在 `~/.claude/settings.json` 写：
 
 ```json
 "modelPicker": {
   "options": [
-    { "model": "glm-5.3", "behavesAs": "claude-opus-4-8" },
-    { "model": "glm-5.3-flash", "behavesAs": "claude-haiku-4-5" }
+    { "model": "gpt-6-astra", "behavesAs": "claude-opus-4-8" },
+    { "model": "gpt-5.6-luna", "behavesAs": "claude-opus-4-8" },
+    { "model": "gpt-5.6-luna-fast", "behavesAs": "claude-haiku-4-5" },
+    { "model": "gpt-5.6-sol", "behavesAs": "claude-sonnet-4-6" },
+    { "model": "gpt-5.6-sol-fast", "behavesAs": "claude-haiku-4-5" }
   ]
 }
 ```
 
 - `behavesAs` 指定这个陌生模型按哪个官方模型处理（能力探测、effort 默认值等客户端行为）；
-- 实际请求仍把原始模型名（`glm-5.3`）发给网关，由网关映射到真实上游；
-- 本脚本默认注册 8 个：glm-5.3 / glm-5.3-flash / glm-5.2 / deepseek-v4-pro-0813 / deepseek-v4-flash-0731 / kimi-k2.7-code / kimi-k2.6 / glm-4.7-flash，全部实测通过。
+- 实际请求仍把原始模型名（`gpt-5.6-luna`）发给网关，由网关映射到真实上游；
+- 本脚本默认注册 13 个：gpt-6-astra / gpt-5.6-luna / gpt-5.6-luna-fast / gpt-5.6-sol / gpt-5.6-sol-fast（假名系）+ glm-5.3 / glm-5.3-flash / glm-5.2 / deepseek-v4-pro-0813 / deepseek-v4-flash-0731 / kimi-k2.7-code / kimi-k2.6 / glm-4.7-flash（旧条目保留兼容），全部实测通过。
 
 **仍然不能用的**：环境变量 `ANTHROPIC_MODEL`——设了它照样报 `unrecognized_model`（CLI 对这个变量不走 modelPicker 白名单），脚本会主动从注册表清掉它。模型映射只走 `ANTHROPIC_DEFAULT_OPUS/SONNET/HAIKU_MODEL` 三槽。
 
@@ -277,37 +305,38 @@ python3 deploy_ai_cli.py --key-file /etc/ai-gateway.key --non-interactive
 
 ## 八、部署完成后怎么用
 
-**Codex 模型分档切换**（8 档，经 Anthropic 协议实测可用）：
+**Codex 模型分档切换**（8 档假名，两网关通用；直接跑 `codex` 不带 profile 时用主模型 `gpt-5.6-luna`）：
 
 ```bash
-codex --profile fast     # glm-5.3-flash   日常快改
-codex --profile fast47   # glm-4.7-flash
-codex --profile dfast    # deepseek-v4-flash
-codex --profile mid      # glm-5.2          均衡主力
-codex --profile code     # kimi-k2.7-code   写码
-codex --profile kimi     # kimi-k2.6        长文本
-codex --profile dspro    # deepseek-v4-pro  深度推理
-codex --profile deep     # glm-5.3          全力
+codex --profile fast     # gpt-5.6-luna-fast  日常快改
+codex --profile sfast    # gpt-5.6-sol-fast   最快
+codex --profile mid      # gpt-5.6-sol        均衡主力
+codex --profile qwen     # qwen3.8-max        长上下文
+codex --profile qwenp    # qwen3.7-plus       轻量
+codex --profile hw       # hw-glm-5           （仅 ws-proxy 有此模型）
+codex --profile code     # gpt-5.6-luna       写码
+codex --profile deep     # gpt-6-astra        全力
 ```
 
 **Claude 子代理分工**（一次任务多模型接力）：
 
 | 子代理 | 绑定模型 | 用途 |
 |--------|---------|------|
-| `code-reviewer` | deepseek-v4-pro-0813 | 代码审查 |
-| `fast-writer` | glm-5.3-flash | 文档/文案/小修补 |
-| `architect` | glm-5.2 | 方案设计 |
+| `code-reviewer` | gpt-5.6-sol | 代码审查 |
+| `fast-writer` | gpt-5.6-luna-fast | 文档/文案/小修补 |
+| `architect` | gpt-6-astra | 方案设计 |
 
 **Claude 对话中手动切模型**（`/model <名字>`，已在 modelPicker 注册）：
 
 ```
-glm-5.3                主力（opus 档行为）
-glm-5.3-flash          快速（haiku 档行为）
-glm-5.2                均衡
-deepseek-v4-pro-0813   深度推理（偶发空响应，重试即可）
-deepseek-v4-flash-0731 最快（不支持图片）
-kimi-k2.7-code / kimi-k2.6 / glm-4.7-flash
+gpt-6-astra            旗舰推理（opus 档行为）
+gpt-5.6-luna           写码主力（opus 档行为）
+gpt-5.6-luna-fast      快速（haiku 档行为）
+gpt-5.6-sol            深度推理（sonnet 档行为）
+gpt-5.6-sol-fast       最快（haiku 档行为）
 ```
+
+> 旧条目 glm-5.3 / glm-5.3-flash / glm-5.2 / deepseek-v4-pro-0813 / deepseek-v4-flash-0731 / kimi-k2.7-code / kimi-k2.6 / glm-4.7-flash 仍保留在 modelPicker 兼容历史配置，但分档与子代理已全部切换到假名体系。
 
 ---
 
@@ -317,8 +346,8 @@ kimi-k2.7-code / kimi-k2.6 / glm-4.7-flash
 
 ```json
 {
-  "fast": ["glm-5.3-flash", "low"],
-  "deep": ["glm-5.3", "high"]
+  "fast": ["gpt-5.6-luna-fast", "low"],
+  "deep": ["gpt-6-astra", "high"]
 }
 ```
 

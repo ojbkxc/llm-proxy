@@ -1,0 +1,99 @@
+{"action": "pass", "user": "ex_mazy16", "protocol": "openai", "model": "gpt-6-astra", "stream": false, "prompt_tokens": 12, "completion_tokens": 5, "total_tokens": 17}
+{"action": "pass", "user": "ex_mazy16", "protocol": "openai", "model": "gpt-5.6-luna", "stream": false, "prompt_tokens": 12, "completion_tokens": 5, "total_tokens": 17}
+{"action": "pass", "user": "ex_mazy16", "protocol": "openai", "model": "gpt-5.6-luna-fast", "stream": false, "prompt_tokens": 66, "completion_tokens": 37, "total_tokens": 103}
+{"action": "pass", "user": "ex_mazy16", "protocol": "openai", "model": "gpt-5.6-sol", "stream": false, "prompt_tokens": 17, "completion_tokens": 141, "total_tokens": 158}
+{"action": "pass", "user": "ex_mazy16", "protocol": "openai", "model": "gpt-5.6-sol-fast", "stream": false, "prompt_tokens": 15, "completion_tokens": 25, "total_tokens": 40}
+{"action": "pass", "user": "ex_mazy16", "protocol": "openai", "model": "qwen3.8-max", "stream": false, "prompt_tokens": 66, "completion_tokens": 35, "total_tokens": 101}
+{"action": "pass", "user": "ex_mazy16", "protocol": "openai", "model": "qwen3.7-plus", "stream": false, "prompt_tokens": 15, "completion_tokens": 33, "total_tokens": 48}
+{"action": "pass", "user": "ex_mazy16", "protocol": "openai", "model": "aliyun-glm-5.2", "stream": false, "prompt_tokens": 17, "completion_tokens": 152, "total_tokens": 169}
+{"action": "pass", "user": "ex_mazy16", "protocol": "openai", "model": "deepseek_v4", "stream": false, "prompt_tokens": 9, "completion_tokens": 2, "total_tokens": 11}
+{"action": "upstream_retry", "user": "ex_mazy16", "protocol": "openai", "model": "gpt-6-astra", "status": 400, "max_tokens": 128000}
+{"action": "pass", "user": "ex_mazy16", "protocol": "openai", "model": "gpt-6-astra", "stream": false, "prompt_tokens": 12, "completion_tokens": 5, "total_tokens": 17}
+{"action": "upstream_retry", "user": "ex_mazy16", "protocol": "openai", "model": "gpt-5.6-luna", "status": 400, "max_tokens": 128000}
+{"action": "pass", "user": "ex_mazy16", "protocol": "openai", "model": "gpt-5.6-luna", "stream": false, "prompt_tokens": 12, "completion_tokens": 5, "total_tokens": 17}
+{"action": "upstream_error", "user": "ex_mazy16", "protocol": "openai", "model": "gpt-5.6-luna-fast", "status": 400}
+{"action": "upstream_error", "user": "ex_mazy16", "protocol": "openai", "model": "gpt-5.6-sol", "status": 400}
+{"action": "pass", "user": "ex_mazy16", "protocol": "openai", "model": "gpt-5.6-sol-fast", "stream": false, "prompt_tokens": 15, "completion_tokens": 24, "total_tokens": 39}
+{"action": "upstream_error", "user": "ex_mazy16", "protocol": "openai", "model": "qwen3.8-max", "status": 400}
+{"action": "pass", "user": "ex_mazy16", "protocol": "openai", "model": "qwen3.7-plus", "stream": false, "prompt_tokens": 15, "completion_tokens": 107, "total_tokens": 122}
+{"action": "upstream_error", "user": "ex_mazy16", "protocol": "openai", "model": "hw-glm-5", "status": 400}
+{"action": "upstream_error", "user": "ex_mazy16", "protocol": "openai", "model": "aliyun-glm-5.2", "status": 400}
+{"action": "upstream_error", "user": "ex_mazy16", "protocol": "openai", "model": "deepseek_v4", "status": 400}
+{"action": "upstream_retry", "user": "ex_mazy16", "protocol": "openai", "model": "gpt-5.6-luna", "status": 400, "max_tokens": 128000}
+{"action": "pass", "user": "ex_mazy16", "protocol": "openai", "model": "gpt-5.6-luna", "stream": false, "prompt_tokens": 7, "completion_tokens": 9, "total_tokens": 16}
+{"action": "upstream_retry", "user": "ex_mazy16", "protocol": "openai", "model": "gpt-5.6-luna", "status": 400, "max_tokens": 128000}
+{"action": "pass", "user": "ex_mazy16", "protocol": "openai", "model": "gpt-5.6-luna", "stream": false, "prompt_tokens": 7, "completion_tokens": 9, "total_tokens": 16}
+{"action": "upstream_retry", "user": "ex_mazy16", "protocol": "openai", "model": "gpt-5.6-luna", "status": 400, "max_tokens": 128000}
+{"action": "pass", "user": "ex_mazy16", "protocol": "openai", "model": "gpt-5.6-luna", "stream": false, "prompt_tokens": 7, "completion_tokens": 9, "total_tokens": 16}
+{"action": "upstream_retry", "user": "ex_mazy16", "protocol": "openai", "model": "gpt-5.6-luna", "status": 400, "max_tokens": 128000}
+{"action": "pass", "user": "ex_mazy16", "protocol": "openai", "model": "gpt-5.6-luna", "stream": false, "prompt_tokens": 7, "completion_tokens": 9, "total_tokens": 16}
+{"action": "upstream_retry", "user": "ex_mazy16", "protocol": "openai", "model": "gpt-5.6-luna", "status": 400, "max_tokens": 128000}
+{"action": "pass", "user": "ex_mazy16", "protocol": "openai", "model": "gpt-5.6-luna", "stream": false, "prompt_tokens": 7, "completion_tokens": 9, "total_tokens": 16}
+{"action": "upstream_retry", "user": "ex_mazy16", "protocol": "openai", "model": "gpt-5.6-luna", "status": 400, "max_tokens": 128000}
+{"action": "pass", "user": "ex_mazy16", "protocol": "openai", "model": "gpt-5.6-luna", "stream": false, "prompt_tokens": 7, "completion_tokens": 9, "total_tokens": 16}
+{"action": "upstream_retry", "user": "ex_mazy16", "protocol": "openai", "model": "gpt-5.6-luna", "status": 400, "max_tokens": 128000}
+{"action": "pass", "user": "ex_mazy16", "protocol": "openai", "model": "gpt-5.6-luna", "stream": false, "prompt_tokens": 7, "completion_tokens": 9, "total_tokens": 16}
+{"action": "pass", "user": "ex_mazy16", "protocol": "openai", "model": "qwen3.8-max", "stream": false, "prompt_tokens": 62, "completion_tokens": 27, "total_tokens": 89}
+{"action": "upstream_error", "user": "ex_mazy16", "protocol": "openai", "model": "qwen3.8-max", "status": 400}
+{"action": "pass", "user": "ex_mazy16", "protocol": "openai", "model": "hw-glm-5", "stream": false, "prompt_tokens": 17, "completion_tokens": 119, "total_tokens": 136}
+{"action": "upstream_error", "user": "ex_mazy16", "protocol": "openai", "model": "qwen3.8-max", "status": 400}
+{"action": "upstream_error", "user": "ex_mazy16", "protocol": "openai", "model": "qwen3.8-max", "status": 400}
+{"action": "upstream_error", "user": "ex_mazy16", "protocol": "openai", "model": "qwen3.8-max", "status": 400}
+{"action": "upstream_error", "user": "ex_mazy16", "protocol": "openai", "model": "qwen3.8-max", "status": 400}
+{"action": "upstream_error", "user": "ex_mazy16", "protocol": "openai", "model": "qwen3.8-max", "status": 400}
+{"action": "pass", "user": "ex_mazy16", "protocol": "openai", "model": "qwen3.7-plus", "stream": false, "prompt_tokens": 11, "completion_tokens": 317, "total_tokens": 328}
+{"action": "pass", "user": "ex_mazy16", "protocol": "openai", "model": "qwen3.7-plus", "stream": false, "prompt_tokens": 11, "completion_tokens": 346, "total_tokens": 357}
+{"action": "pass", "user": "ex_mazy16", "protocol": "openai", "model": "qwen3.7-plus", "stream": false, "prompt_tokens": 11, "completion_tokens": 251, "total_tokens": 262}
+{"action": "pass", "user": "ex_mazy16", "protocol": "openai", "model": "qwen3.7-plus", "stream": false, "prompt_tokens": 11, "completion_tokens": 357, "total_tokens": 368}
+{"action": "pass", "user": "ex_mazy16", "protocol": "openai", "model": "qwen3.7-plus", "stream": false, "prompt_tokens": 11, "completion_tokens": 342, "total_tokens": 353}
+{"action": "pass", "user": "ex_mazy16", "protocol": "openai", "model": "qwen3.7-plus", "stream": false, "prompt_tokens": 11, "completion_tokens": 234, "total_tokens": 245}
+{"action": "pass", "user": "ex_mazy16", "protocol": "openai", "model": "qwen3.7-plus", "stream": false, "prompt_tokens": 11, "completion_tokens": 280, "total_tokens": 291}
+{"action": "pass", "user": "ex_mazy16", "protocol": "openai", "model": "aliyun-glm-5.2", "stream": false, "prompt_tokens": 13, "completion_tokens": 142, "total_tokens": 155}
+{"action": "upstream_error", "user": "ex_mazy16", "protocol": "openai", "model": "aliyun-glm-5.2", "status": 400}
+{"action": "upstream_error", "user": "ex_mazy16", "protocol": "openai", "model": "aliyun-glm-5.2", "status": 400}
+{"action": "upstream_error", "user": "ex_mazy16", "protocol": "openai", "model": "aliyun-glm-5.2", "status": 400}
+{"action": "upstream_error", "user": "ex_mazy16", "protocol": "openai", "model": "aliyun-glm-5.2", "status": 400}
+{"action": "upstream_error", "user": "ex_mazy16", "protocol": "openai", "model": "aliyun-glm-5.2", "status": 400}
+{"action": "upstream_error", "user": "ex_mazy16", "protocol": "openai", "model": "aliyun-glm-5.2", "status": 400}
+{"action": "pass", "user": "ex_mazy16", "protocol": "openai", "model": "hw-glm-5", "stream": false, "prompt_tokens": 13, "completion_tokens": 205, "total_tokens": 218}
+{"action": "pass", "user": "ex_mazy16", "protocol": "openai", "model": "hw-glm-5", "stream": false, "prompt_tokens": 13, "completion_tokens": 207, "total_tokens": 220}
+{"action": "upstream_error", "user": "ex_mazy16", "protocol": "openai", "model": "hw-glm-5", "status": 400}
+{"action": "upstream_error", "user": "ex_mazy16", "protocol": "openai", "model": "hw-glm-5", "status": 400}
+{"action": "upstream_error", "user": "ex_mazy16", "protocol": "openai", "model": "hw-glm-5", "status": 400}
+{"action": "upstream_error", "user": "ex_mazy16", "protocol": "openai", "model": "hw-glm-5", "status": 400}
+{"action": "upstream_error", "user": "ex_mazy16", "protocol": "openai", "model": "hw-glm-5", "status": 400}
+{"action": "pass", "user": "ex_mazy16", "protocol": "openai", "model": "deepseek_v4", "stream": false, "prompt_tokens": 5, "completion_tokens": 89, "total_tokens": 94}
+{"action": "pass", "user": "ex_mazy16", "protocol": "openai", "model": "deepseek_v4", "stream": false, "prompt_tokens": 5, "completion_tokens": 28, "total_tokens": 33}
+{"action": "pass", "user": "ex_mazy16", "protocol": "openai", "model": "deepseek_v4", "stream": false, "prompt_tokens": 5, "completion_tokens": 97, "total_tokens": 102}
+{"action": "upstream_error", "user": "ex_mazy16", "protocol": "openai", "model": "deepseek_v4", "status": 400}
+{"action": "upstream_error", "user": "ex_mazy16", "protocol": "openai", "model": "deepseek_v4", "status": 400}
+{"action": "upstream_error", "user": "ex_mazy16", "protocol": "openai", "model": "deepseek_v4", "status": 400}
+{"action": "upstream_error", "user": "ex_mazy16", "protocol": "openai", "model": "deepseek_v4", "status": 400}
+{"action": "pass", "user": "ex_mazy16", "protocol": "responses", "model": "gpt-5.6-luna", "stream": false, "prompt_tokens": 12, "completion_tokens": 5, "total_tokens": 17}
+{"action": "pass", "user": "ex_mazy16", "protocol": "openai", "model": "qwen3.8-max", "stream": true}
+{"action": "pass", "user": "ex_mazy16", "protocol": "openai", "model": "qwen3.8-max", "stream": false, "prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30}
+{"action": "pass", "user": "ex_mazy16", "protocol": "responses", "model": "qwen3.8-max", "stream": true}
+{"action": "pass", "user": "ex_mazy16", "protocol": "responses", "model": "qwen3.8-max", "stream": true}
+{"action": "pass", "user": "ex_mazy16", "protocol": "anthropic", "model": "qwen3.8-max", "stream": true}
+{"action": "pass", "user": "ex_mazy16", "protocol": "openai", "model": "qwen3.8-max", "stream": false, "prompt_tokens": null, "completion_tokens": null, "total_tokens": null}
+{"action": "pass", "user": "ex_mazy16", "protocol": "openai", "model": "qwen3.8-max", "stream": false, "prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30}
+{"action": "pass", "user": "ex_mazy16", "protocol": "openai", "model": "qwen3.8-max", "stream": false, "prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30}
+{"action": "pass", "user": "ex_mazy16", "protocol": "openai", "model": "qwen3.8-max", "stream": false, "prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30}
+{"action": "pass", "user": "ZG00123", "protocol": "openai", "model": "qwen3.8-max", "stream": false, "prompt_tokens": null, "completion_tokens": null, "total_tokens": null}
+{"action": "pass", "user": "ex_mazy16", "protocol": "responses", "model": "qwen3.8-max", "stream": true}
+{"action": "pass", "user": "ex_mazy16", "protocol": "anthropic", "model": "qwen3.8-max", "stream": true}
+{"action": "pass", "user": "ex_mazy16", "protocol": "responses", "model": "qwen3.8-max", "stream": true}
+{"action": "pass", "user": "ex_mazy16", "protocol": "openai", "model": "qwen3.8-max", "stream": true}
+{"action": "pass", "user": "ex_mazy16", "protocol": "openai", "model": "qwen3.8-max", "stream": false, "prompt_tokens": null, "completion_tokens": null, "total_tokens": null}
+{"action": "pass", "user": "ex_mazy16", "protocol": "openai", "model": "qwen3.8-max", "stream": false, "prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30}
+{"action": "pass", "user": "ex_mazy16", "protocol": "responses", "model": "qwen3.8-max", "stream": true}
+{"action": "pass", "user": "ex_mazy16", "protocol": "anthropic", "model": "qwen3.8-max", "stream": true}
+{"action": "pass", "user": "ex_mazy16", "protocol": "responses", "model": "qwen3.8-max", "stream": true}
+{"action": "pass", "user": "ex_mazy16", "protocol": "anthropic", "model": "qwen3.8-max", "stream": true}
+{"user": "buf-test-1788767305279", "protocol": "openai", "ts": "t"}
+{"action": "upstream_retry", "user": "ex_mazy16", "protocol": "openai", "model": "qwen3.8-max", "status": 400, "max_tokens": 128000}
+{"action": "pass", "user": "ex_mazy16", "protocol": "openai", "model": "qwen3.8-max", "stream": false, "prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30}
+{"action": "pass", "user": "ex_mazy16", "protocol": "openai", "model": "qwen3.8-max", "stream": true}
+{"action": "pass", "user": "ex_mazy16", "protocol": "openai", "model": "qwen3.8-max", "stream": false, "prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30}
+{"action": "pass", "user": "ex_mazy16", "protocol": "openai", "model": "qwen3.8-max", "stream": false, "prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30}
+{"action": "pass", "user": "ex_mazy16", "protocol": "openai", "model": "qwen3.8-max", "stream": false, "prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30}
