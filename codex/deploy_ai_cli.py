@@ -48,7 +48,7 @@ MANIFEST_NAME = ".deploy_backup_manifest.json"
 
 # 网关地址：cfapi 云网关 / 本地 ws-proxy（proxy.py，端口 8787）都认识下面的
 # gpt-* 假名。换网关直接改这一行（本地 proxy 就改成 http://127.0.0.1:8787/v1）。
-DEFAULT_BASE_URL = "http://127.0.0.1:8787/v1"
+DEFAULT_BASE_URL = "https://cfapi.1232333.xyz/v1"
 
 # 网关 API Key 占位符：留空表示未启用。把真实密钥填到这里即可免参数/免交互部署。
 # 安全提示：密钥会随源码明文传播，请勿将填好密钥的副本提交到公开仓库或随意转发。
@@ -1315,7 +1315,5 @@ def main(argv: Optional[List[str]] = None) -> int:
         log.info("  5. Windows 已知问题：codex exec 的 workspace-write 在部分版本不生效，")
         log.info("     需要 codex exec --sandbox danger-full-access \"...\"（无隔离，仅信任任务使用）")
     return 0
-
-
 if __name__ == "__main__":
-    sys.exit(main())
+    main()

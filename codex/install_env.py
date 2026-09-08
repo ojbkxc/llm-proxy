@@ -28,6 +28,10 @@ Claude / Codex 环境一键安装脚本（install_env.py）
   codex 的安装命令是 `npm install -g @openai/codex`（npm 包名不含 cli），
   安装后可执行文件叫 `codex`。如果 npm 源慢，可先：
       npm config set registry https://registry.npmmirror.com
+
+  Codex 桌面版（ChatGPT 风格 GUI）安装命令（手动版）：
+      codex app 2>&1                      # 官方 CLI 子命令，缺失时自动打开安装器
+      winget install --id 9PLM9XGG6VKS -s msstore   # 微软商店源安装 ChatGPT 桌面版（需 winget + 商店授权）
 """
 
 from __future__ import annotations
@@ -336,6 +340,38 @@ def install_git() -> bool:
 
 
 # --------------------------------------------------------------------------- #
+# 可选：Codex 桌面版（ChatGPT 风格界面）安装
+# --------------------------------------------------------------------------- #
+
+def maybe_install_codex_app() -> bool:
+    """询问是否安装 Codex 桌面版（ChatGPT 风格 GUI）。
+
+    按 1 或直接回车 → 执行 `codex app 2>&1` 安装/启动桌面版；
+    按 0 → 跳过。
+    """
+    if not which("codex"):
+        log_warn("未检测到 codex，无法安装桌面版")
+        return False
+    log_step("Codex 桌面版（ChatGPT 风格界面）")
+    log("  执行 codex app 会下载并安装/启动官方桌面客户端。")
+    try:
+        s = input("  是否安装？[回车或 1 = 安装，0 = 跳过] > ").strip()
+    except (EOFError, KeyboardInterrupt):
+        s = ""  # 无输入 / Ctrl+C 一律按默认安装
+    if s == "0":
+        log_ok("已跳过 Codex 桌面版安装")
+        return False
+    log("  正在执行 codex app（首次会下载安装，可能较慢）...")
+    rc, _ = run("codex app 2>&1", timeout=1200)
+    if rc == 0:
+        log_ok("Codex 桌面版已安装/启动")
+        return True
+    log_warn(f"codex app 返回码 {rc}（可能已取消或已装好）。")
+    log_warn("  重开终端后手动验证：codex app 2>&1")
+    return False
+
+
+# --------------------------------------------------------------------------- #
 # 主流程
 # --------------------------------------------------------------------------- #
 
@@ -360,6 +396,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                         help="只检查环境并打印计划，不安装任何东西")
     parser.add_argument("--skip-deploy", action="store_true",
                         help="环境装好后不自动运行 deploy_ai_cli.py")
+    parser.add_argument("--skip-codex-app", action="store_true",
+                        help="跳过 Codex 桌面版（ChatGPT）安装询问（默认询问）")
     parser.add_argument("--deploy-script", default=None,
                         help="deploy_ai_cli.py 的路径（默认与本脚本同目录）")
     parser.add_argument("--verbose", action="store_true", help="输出详细日志")
@@ -450,6 +488,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         log_err(f"\n以下核心组件未就绪：{', '.join(failed_core)}")
         log_err("请按上方提示手动处理，然后重跑本脚本。")
         return 1
+
+    # 6. 询问是否安装 Codex 桌面版（ChatGPT 风格界面）
+    #    默认回车/按 1 = 安装，按 0 = 跳过；--skip-codex-app 直接跳过询问。
+    if not args.dry_run and not args.skip_codex_app and codex_ok:
+        maybe_install_codex_app()
+
     log("\n环境就绪！重开终端后即可使用 codex / claude。")
     return 0
 

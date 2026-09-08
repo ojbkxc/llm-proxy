@@ -16,10 +16,7 @@ multi-model.py — 多模型协作编排器（真·多模型共用 + 工具 + �
 
 用法:
     python multi-model.py ask <模型> "问题"            单模型问答
-    python multi-model.py parallel "问题"              多模型同问对比（真并行）
-    python multi-model.py orchestrate "任务"           指挥官拆解 → 多模型并行 → 汇总
-    python multi-model.py team "任务" [--workdir DIR]  真团队流水线(带工具+审查迭代)
-    python multi-model.py auto "任务" [--hours 24]     无人值守连续跑(挂机)
+    python multi-model.py team "任务" [--workdir DIR]  多模型团队流水线(并行写文件+审查迭代)
     python multi-model.py list                         列出可用模型
     python multi-model.py                              数字交互菜单
 
@@ -33,7 +30,6 @@ import os
 import re
 import secrets
 import shlex
-import shutil
 import ssl
 import subprocess
 import threading
@@ -114,22 +110,13 @@ GATEWAYS = [
 _GW_STATE = {}
 _GW_LOCK = threading.Lock()
 
-# 角色 → gpt-* 假名映射（网关层转发到真实模型，与 deploy_ai_cli.py 的分档一致）
-ROLE_DESCS = {
-    "指挥官": "总指挥/拆解/汇总",
-    "分析":   "深度分析/设计/审查",
-    "写码":   "实现/编码/落地",
-    "快速":   "快速杂活/整理",
-    "快答":   "快速问答",
-}
-
 # 多模型共用：全部硬编码在此，单机单人使用，不读任何外部注册表。
 ROLES = {
-    "指挥官": {"model": "gpt-6-astra",       "desc": "总指挥/拆解/汇总",   "temp": 0.4, "fallback": "gpt-5.6-luna"},
-    "分析":   {"model": "gpt-5.6-sol",       "desc": "深度分析/设计/审查", "temp": 0.3, "fallback": "gpt-5.6-luna"},
-    "写码":   {"model": "gpt-5.6-luna",      "desc": "实现/编码/落地",     "temp": 0.2, "fallback": "gpt-5.6-sol"},
-    "快速":   {"model": "gpt-5.6-sol-fast",  "desc": "快速杂活/整理",     "temp": 0.5, "fallback": "gpt-5.6-luna-fast"},
-    "快答":   {"model": "gpt-5.6-luna-fast", "desc": "快速问答",          "temp": 0.5, "fallback": "gpt-5.6-sol-fast"},
+    "指挥官": {"model": "gpt-6-astra",       "temp": 0.4, "fallback": "gpt-5.6-luna"},
+    "分析":   {"model": "gpt-5.6-sol",       "temp": 0.3, "fallback": "gpt-5.6-luna"},
+    "写码":   {"model": "gpt-5.6-luna",      "temp": 0.2, "fallback": "gpt-5.6-sol"},
+    "快速":   {"model": "gpt-5.6-sol-fast",  "temp": 0.5, "fallback": "gpt-5.6-luna-fast"},
+    "快答":   {"model": "gpt-5.6-luna-fast", "temp": 0.5, "fallback": "gpt-5.6-sol-fast"},
 }
 
 ALIASES = {
@@ -146,6 +133,19 @@ ALIASES = {
 
 WORKDIR = os.getcwd()
 ALLOW_RUN = True
+
+# 线程局部工作目录：team/auto 在各自线程内设置，避免并发任务串目录。
+# 未设置时回退到模块级 WORKDIR（CLI 单线程直接运行时的默认值）。
+_tls = threading.local()
+
+
+def _get_workdir():
+    wd = getattr(_tls, "workdir", None)
+    return wd if wd else WORKDIR
+
+
+def _set_workdir(wd):
+    _tls.workdir = wd
 
 # ---------------------------------------------------------------------------
 # TeamState 持久化：阶段边界原子落盘，支持 --resume 续跑
@@ -201,7 +201,7 @@ def _load_state(workdir, task_id):
     return state
 
 
-def _new_state(task, workdir, engine="builtin", allow_risky=False):
+def _new_state(task, workdir, allow_risky=False):
     """构造一份全新的流水线状态 dict。"""
     now = datetime.now().isoformat(timespec="seconds")
     return {
@@ -211,8 +211,8 @@ def _new_state(task, workdir, engine="builtin", allow_risky=False):
         "status": "running",
         "phase": 1,
         "round": 0,
-        "engine": engine,
         "allow_risky": bool(allow_risky),
+        "token_start": _daily_token_total(),
         "workdir": workdir,
         "design": {},
         "impl": {},
@@ -316,8 +316,8 @@ TOOLS = [
 
 
 def _safe_path(path):
-    """把相对路径解析到 WORKDIR 内，防止目录穿越。"""
-    base = os.path.realpath(WORKDIR)
+    """把相对路径解析到当前线程工作目录内，防止目录穿越。"""
+    base = os.path.realpath(_get_workdir())
     p = os.path.realpath(os.path.join(base, path))
     if os.path.commonpath([base, p]) != base:
         raise PermissionError(f"路径越出工作目录: {path}")
@@ -385,7 +385,7 @@ def _tool_search(pattern, path="."):
             with open(f, encoding="utf-8", errors="replace") as fh:
                 for i, line in enumerate(fh, 1):
                     if rx.search(line):
-                        hits.append(f"{os.path.relpath(f, WORKDIR)}:{i}: {line.rstrip()[:160]}")
+                        hits.append(f"{os.path.relpath(f, _get_workdir())}:{i}: {line.rstrip()[:160]}")
                         if len(hits) >= 60:
                             return "\n".join(hits) + "\n...[截断]"
         except (OSError, UnicodeDecodeError):
@@ -495,7 +495,7 @@ def _tool_run_command(cmd, allow_risky=False):
     prefix = f"[风险放行] 命中危险命令({hit})\n" if hit else ""
     try:
         r = subprocess.run(cmd, shell=True, capture_output=True, text=True,
-                           cwd=WORKDIR, timeout=300)
+                           cwd=_get_workdir(), timeout=300)
         out = (r.stdout or "") + (r.stderr or "")
         if len(out) > 3000:
             out = out[:3000] + "\n...[截断]"
@@ -536,7 +536,7 @@ RETRY_DELAYS = (0.5, 1.0, 2.0)   # 降级重试前的退避（递增，防打爆
 
 
 def _failure_log_path():
-    return os.path.join(WORKDIR, ".multi-model", "failures.jsonl")
+    return os.path.join(_get_workdir(), ".multi-model", "failures.jsonl")
 
 
 def _audit_failure(kind, model, gateway, error, elapsed):
@@ -575,6 +575,62 @@ def _gw_record(gw_name, failure):
             _GW_STATE[gw_name] = (0, time.time() + COOLDOWN_SEC)
         else:
             _GW_STATE[gw_name] = (fails, 0.0)
+
+
+# ---- 每日 token 累计（预算闸门用）----
+# 每次 call() 成功后把 usage 累加进「当日」用量文件（按天分桶，跨进程/跨任务累计）。
+# team() 以「今天已累计的 token」为口径判断是否超每日上限；默认无上限。
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_DAILY_LOCK = threading.Lock()
+
+
+def _daily_token_path():
+    return os.path.join(_SCRIPT_DIR, ".multi-model", "token-usage.json")
+
+
+def _today():
+    return datetime.now().strftime("%Y-%m-%d")
+
+
+def _read_daily_usage():
+    """读当日累计 (in, out)；日期不是今天或文件损坏 → (0, 0)。"""
+    today = _today()
+    try:
+        with open(_daily_token_path(), encoding="utf-8") as f:
+            d = json.load(f)
+        if d.get("date") == today:
+            return int(d.get("in") or 0), int(d.get("out") or 0)
+    except Exception:
+        pass
+    return 0, 0
+
+
+def _write_daily_usage(in_, out_):
+    p = _daily_token_path()
+    try:
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        tmp = p + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"date": _today(), "in": int(in_), "out": int(out_)}, f)
+        os.replace(tmp, p)
+    except Exception:
+        pass
+
+
+def _accumulate_usage(usage):
+    if not isinstance(usage, dict):
+        return
+    inc_in = int(usage.get("prompt_tokens") or 0)
+    inc_out = int(usage.get("completion_tokens") or 0)
+    with _DAILY_LOCK:
+        d_in, d_out = _read_daily_usage()
+        _write_daily_usage(d_in + inc_in, d_out + inc_out)
+
+
+def _daily_token_total():
+    with _DAILY_LOCK:
+        d_in, d_out = _read_daily_usage()
+    return d_in + d_out
 
 
 def call(model, messages, temperature=0.4, max_tokens=4000, timeout=600, tools=None, tool_choice=None):
@@ -624,6 +680,7 @@ def call(model, messages, temperature=0.4, max_tokens=4000, timeout=600, tools=N
                 resp = urllib.request.urlopen(req, timeout=timeout, context=_ssl_ctx())
                 data = json.loads(resp.read().decode())
                 _gw_record(gw["name"], failure=False)  # 成功 → 清零熔断计数
+                _accumulate_usage(data.get("usage"))
                 return data["choices"][0]["message"]
             except urllib.error.HTTPError as e:
                 last_err = e
@@ -683,10 +740,41 @@ _SUBMIT_JSON_TOOL = {
 }
 
 
+def extract_json(raw):
+    """从模型输出里提取并解析 JSON（仿 OMA structured-output 的容错顺序）。
+
+    依次尝试：整体即合法 JSON → ```json 围栏 → 裸 ``` 围栏 → 首 { 到末 } → 首 [ 到末 ]。
+    全部失败抛 ValueError。
+    """
+    s = (raw or "").strip()
+    try:
+        return json.loads(s)
+    except Exception:
+        pass
+    m = re.search(r"```json\s*([\s\S]*?)```", s)
+    if m:
+        try:
+            return json.loads(m.group(1).strip())
+        except Exception:
+            pass
+    m = re.search(r"```\s*([\s\S]*?)```", s)
+    if m:
+        try:
+            return json.loads(m.group(1).strip())
+        except Exception:
+            pass
+    for a, b in ((s.find("{"), s.rfind("}")), (s.find("["), s.rfind("]"))):
+        if a != -1 and b > a:
+            try:
+                return json.loads(s[a:b + 1])
+            except Exception:
+                pass
+    raise ValueError(f"无法从输出提取 JSON，开头: {s[:80]!r}")
+
+
 def call_json(model, system, user, temperature=0.3, timeout=600, use_tools=True):
     """调模型取 JSON。use_tools=True 时优先用 submit_json 工具强制结构化输出，
-    任一异常（网关不支持 tools / 无 tool_calls / json 解析失败）回退既有截取法。
-    use_tools=False 直接走回退路径。"""
+    任一异常（网关不支持 tools / 无 tool_calls / json 解析失败）回退 extract_json 截取法。"""
     msgs = [{"role": "system", "content": system},
             {"role": "user", "content": user}]
     if use_tools:
@@ -696,41 +784,82 @@ def call_json(model, system, user, temperature=0.3, timeout=600, use_tools=True)
                      tool_choice={"type": "function", "function": {"name": "submit_json"}})
             tcs = m.get("tool_calls") or []
             if tcs:
-                args_str = tcs[0]["function"].get("arguments", "")
-                args_obj = json.loads(args_str)
+                args_obj = json.loads(tcs[0]["function"].get("arguments", ""))
                 return json.loads(args_obj["result"])
             # 无 tool_calls → 落入回退
         except Exception:
             # 网关不支持 tools / 无 tool_calls / json 解析失败 → 回退
             pass
-    # 回退：既有「剥 ```json + find('{')/rfind('}')」截取法
     content = msg_text(call(model, msgs, temperature=temperature, timeout=timeout))
-    s = content.strip()
-    if s.startswith("```"):
-        s = s.split("```", 2)[1]
-        if s.startswith("json"):
-            s = s[4:]
-        s = s.strip()
-    # 容错：只取第一个 [ 到最后一个 ]
-    a, b = s.find("["), s.rfind("]")
-    if a == -1 or b == -1:
-        a, b = s.find("{"), s.rfind("}")
-    if a != -1 and b != -1:
-        s = s[a:b + 1]
-    return json.loads(s)
+    return extract_json(content)
+
+
+# ---------------------------------------------------------------------------
+# 循环检测：滑动窗口记录工具调用签名，连续重复即判定卡死（防空转烧 token）
+# ---------------------------------------------------------------------------
+LOOP_MAX_REPEATS = 3
+LOOP_WINDOW = 4
+
+
+def _sort_keys(value):
+    """递归排序 dict 键，让 {b:1,a:2} 与 {a:2,b:1} 得到相同 JSON。"""
+    if isinstance(value, dict):
+        return {k: _sort_keys(v) for k, v in sorted(value.items())}
+    if isinstance(value, list):
+        return [_sort_keys(v) for v in value]
+    return value
+
+
+def _tool_call_signature(tcs):
+    """一组工具调用的确定性签名（按名排序 + 参数键排序）。"""
+    items = []
+    for tc in tcs:
+        fn = tc.get("function") or {}
+        name = fn.get("name", "")
+        try:
+            args = _sort_keys(json.loads(fn.get("arguments") or "{}"))
+        except Exception:
+            args = fn.get("arguments") or ""
+        items.append((name, args))
+    items.sort(key=lambda x: (x[0], json.dumps(x[1], ensure_ascii=False, sort_keys=True)))
+    return json.dumps(items, ensure_ascii=False)
+
+
+def _consecutive_repeats(buf):
+    """缓冲区尾部连续相同项的数量；空/无重复返回 0。"""
+    if not buf:
+        return 0
+    last = buf[-1]
+    n = 0
+    for x in reversed(buf):
+        if x == last:
+            n += 1
+        else:
+            break
+    return n
 
 
 def agent_loop(model, system, user, tools=None, temperature=0.3, max_iter=20, allow_risky=False):
-    """带工具的 agent 循环：模型自主调用工具直到给出最终回答。返回 (文本, 工具轨迹)。"""
+    """带工具的 agent 循环：模型自主调用工具直到给出最终回答。返回 (文本, 工具轨迹)。
+
+    内置循环检测：同一工具调用签名连续重复 LOOP_MAX_REPEATS 次即提前停止，防空转烧 token。
+    """
     msgs = [{"role": "system", "content": system}]
     if user:
         msgs.append({"role": "user", "content": user})
     trace = []
+    tool_sigs = []
     for _ in range(max_iter):
         m = call(model, msgs, temperature=temperature, tools=tools, timeout=600)
         tcs = m.get("tool_calls") or []
         if not tcs:
             return msg_text(m), trace
+        sig = _tool_call_signature(tcs)
+        tool_sigs.append(sig)
+        if len(tool_sigs) > LOOP_WINDOW:
+            tool_sigs.pop(0)
+        if _consecutive_repeats(tool_sigs) >= LOOP_MAX_REPEATS:
+            return (f"(检测到重复工具调用已连续 {LOOP_MAX_REPEATS} 次，判定卡死，停止)", trace)
         # 记录 assistant 的 tool_calls 消息
         msgs.append({"role": "assistant", "content": m.get("content") or "",
                      "tool_calls": tcs})
@@ -868,36 +997,6 @@ def _handoff_review(state, round_num):
 
 
 # ---------------------------------------------------------------------------
-# codex 引擎：把实现/审查阶段委托给本地 codex CLI
-# ---------------------------------------------------------------------------
-class CodexEngineError(Exception):
-    """codex 引擎执行异常。"""
-    pass
-
-
-def _run_codex_stage(prompt, model, workdir, timeout=1800):
-    """用本地 codex exec 跑一个阶段，返回 (ok, detail)。
-    ok=True 时 detail 为 stdout；ok=False 时 detail 为错误文案。"""
-    codex_bin = shutil.which("codex")
-    if codex_bin is None:
-        return (False, "未找到 codex 可执行文件，建议 --engine builtin")
-    try:
-        r = subprocess.run(
-            [codex_bin, "exec", "--sandbox", "danger-full-access",
-             "-c", f"model={model}", prompt],
-            cwd=workdir, timeout=timeout, capture_output=True, text=True,
-            encoding="utf-8", errors="replace",
-        )
-    except subprocess.TimeoutExpired:
-        return (False, "codex exec 超时")
-    except Exception as e:
-        return (False, str(e))
-    if r.returncode != 0:
-        return (False, f"codex exec 退出码 {r.returncode}: {(r.stderr or '')[:500]}")
-    return (True, r.stdout or "")
-
-
-# ---------------------------------------------------------------------------
 # 基础命令
 # ---------------------------------------------------------------------------
 def parallel(prompt, models=None, max_workers=4):
@@ -942,7 +1041,6 @@ def orchestrate(task):
     def run_sub(item):
         role, sub_task = item["role"], item["task"]
         model = ROLES[role]["model"]
-        temp = ROLES[role]["temp"]
         sys_msg = f"你是团队里的「{role}」角色（模型 {model}）。只完成分配给你的子任务，输出简洁。"
         t0 = time.time()
         try:
@@ -979,7 +1077,6 @@ def orchestrate(task):
             final = "\n\n".join(report)
     except Exception as e:
         final = f"[汇总失败] {e}\n\n子任务原始结果：\n\n" + "\n\n".join(report)
-    # 追加结构化异常段（如有子任务执行失败）
     failed = [s for s in subs if outputs[(s["role"], s["task"])][3]]
     if failed:
         final += "\n\n[结构化异常] " + "、".join(
@@ -990,36 +1087,169 @@ def orchestrate(task):
 
 
 # ---------------------------------------------------------------------------
-# team 流水线：分析 → 写码 → 审查 → 迭代回改 → 汇总
+# team 流水线：分析 → 并行写码 → 审查 → 迭代回改 → 汇总
 # ---------------------------------------------------------------------------
 REVIEW_RETRIES = 2
 
+# 并行写码工人池：把不同文件/模块分配给不同模型并行写
+WRITERS = ["写码", "快速", "快答"]
 
-def team(task, max_rounds=3, state=None, engine=None, allow_risky=None):
-    """真团队流水线：带工具落地文件 + 审查迭代 + 状态持久化 + 引擎分派。
+
+def _plan_parallel_write(file_paths, design):
+    """让指挥官把文件清单按模块分组，每组指定一个写码角色。
+    返回 [{"writer": 角色, "files": [路径...]}, ...]；失败返回 None。"""
+    plan_prompt = (
+        "你是总指挥。下面是一份设计稿里的文件清单，请把它们按模块/依赖关系分组，"
+        "让不同工程师并行写。每个分组指定一个写码角色（写码/快速/快答 任选其一），"
+        "把文件平均分到各组，同一组内文件相关性强。只输出 JSON 数组：\n"
+        '[{"writer":"写码","files":["src/a.py","src/b.py"]},'
+        '{"writer":"快速","files":["src/c.py"]}]\n\n'
+        f"文件清单：{json.dumps(file_paths, ensure_ascii=False)}\n"
+        f"设计稿：{json.dumps(design, ensure_ascii=False)}"
+    )
+    try:
+        plan = call_json(ROLES["指挥官"]["model"], "你是总指挥，只输出 JSON。", plan_prompt)
+    except Exception:
+        return None
+    groups = []
+    for g in plan:
+        if isinstance(g, dict) and g.get("writer") in WRITERS and g.get("files"):
+            groups.append({"writer": g["writer"], "files": list(g["files"])})
+    return groups or None
+
+
+def _round_robin_split(file_paths):
+    """指挥官分组失败时的降级：把文件轮流分配给写码工人池。"""
+    groups = [{"writer": w, "files": []} for w in WRITERS]
+    for i, p in enumerate(file_paths):
+        groups[i % len(WRITERS)]["files"].append(p)
+    return [g for g in groups if g["files"]]
+
+
+_WRITTEN_LOCK = threading.Lock()
+_WRITTEN_FILES = set()
+
+
+def _written_snapshot():
+    with _WRITTEN_LOCK:
+        return sorted(_WRITTEN_FILES)
+
+
+def _mark_written(paths):
+    with _WRITTEN_LOCK:
+        for p in paths:
+            if p:
+                _WRITTEN_FILES.add(p)
+
+
+def _clear_written():
+    with _WRITTEN_LOCK:
+        _WRITTEN_FILES.clear()
+
+
+def _parallel_implement(file_paths, design, allow_risky, wd):
+    """把设计稿里的文件清单分配给多个写码模型并行写文件。
+    返回 (impl_files, impl_summary)。
+
+    并行写手通过一份共享「已写文件清单」互相可见，写之前先确认不与他人冲突
+    （针对设计/接口边界，降级为提示性告知，不强制阻塞）。
+    """
+    groups = _plan_parallel_write(file_paths, design) or _round_robin_split(file_paths)
+    print(f"  按 {len(groups)} 组并行写码: " +
+          ", ".join(f"{g['writer']}({len(g['files'])}个文件)" for g in groups))
+    _clear_written()
+    results = []
+
+    def run_group(g):
+        _set_workdir(wd)  # 写文件线程独立设置工作目录，避免串目录
+        writer = g["writer"]
+        paths = g["files"]
+        model = ROLES[writer]["model"]
+        prompt = (
+            f"你是「{writer}」工程师（模型 {model}）。根据下面的设计稿，用 write_file 工具"
+            f"把你负责的文件完整写到磁盘上。\n\n"
+            f"你负责的文件（只写这些，不要写其他文件）：\n{json.dumps(paths, ensure_ascii=False)}\n\n"
+            f"设计稿：{json.dumps(design, ensure_ascii=False)}\n\n"
+            f"要求：每个文件用一次 write_file 调用，content 是该文件的完整内容；"
+            f"先按需用 list_dir/read_file 了解现状，写完做自我检查。\n"
+            f"其他工程师并行负责的文件：{json.dumps([p for p in file_paths if p not in paths], ensure_ascii=False)}"
+        )
+        txt, trace = agent_loop(
+            model,
+            f"你是{writer}工程师，用 write_file 工具落地文件，只写分配给你的文件。",
+            prompt,
+            tools=[t for t in TOOLS if t["function"]["name"] in ("list_dir", "read_file", "write_file", "search")],
+            temperature=0.2,
+            allow_risky=allow_risky,
+        )
+        written = [a.get("path") for n, a, _ in trace if n == "write_file"]
+        _mark_written(written)
+        return writer, model, written, txt, trace
+
+    with ThreadPoolExecutor(max_workers=len(groups)) as ex:
+        futs = [ex.submit(run_group, g) for g in groups]
+        for f in as_completed(futs):
+            writer, model, written, txt, trace = f.result()
+            results.append((writer, model, written, txt))
+            for name, args, res in trace:
+                if name == "write_file":
+                    print(f"    ✎ [{writer}/{model}] {args.get('path')}  → {res}")
+
+    impl_files = []
+    for _, _, written, _ in results:
+        impl_files.extend(written)
+    summary = "\n".join(
+        f"[{w}/{m}] 写 {len(written)} 个文件: {', '.join(written) or '无'}"
+        for w, m, written, _ in results)
+    return impl_files, summary
+
+
+def team(task, max_rounds=3, state=None, allow_risky=None, workdir=None, max_token_budget=None):
+    """真团队流水线：带工具落地文件 + 审查迭代 + 状态持久化。
 
     新增参数：
-      state       — 传入则 resume（按 state['phase'] 续跑，已完成阶段零模型调用）
-      engine      — "builtin"(默认) 或 "codex"(委托本地 codex CLI 跑实现阶段)
-      allow_risky — True 时放行命中危险黑名单的 run_command
+      state            — 传入则 resume（按 state['phase'] 续跑，已完成阶段零模型调用）
+      allow_risky      — True 时放行命中危险黑名单的 run_command
+      max_token_budget — 每日 token 上限（input+output 合计，跨任务跨进程累计）；超限
+                         立即停止，未完成阶段标记 budget_exceeded。None = 无上限。
     返回 state dict（既有 CLI 调用不依赖返回值）。
     """
-    engine = engine or "builtin"
+    if workdir:
+        _set_workdir(os.path.abspath(workdir))
+    wd = _get_workdir()
     allow_risky = bool(allow_risky)
     if state is None:
-        state = _new_state(task, WORKDIR, engine, allow_risky)
+        state = _new_state(task, wd, allow_risky)
     else:
         task = state["task"]  # resume 模式以 state 内 task 为准
     ar = state["allow_risky"]
-    print(f"\n工作目录: {WORKDIR}")
+    print(f"\n工作目录: {wd}")
     print(f"任务: {task}")
-    print(f"引擎: {state['engine']}  task_id: {state['task_id']}  phase: {state['phase']}")
+    print(f"task_id: {state['task_id']}  phase: {state['phase']}")
+
+    # 每日预算闸门：判断「今天累计已用 token」是否超过上限（默认无上限）。
+    if max_token_budget is None:
+        max_token_budget = state.get("max_token_budget")
+
+    def _over_budget():
+        if not max_token_budget:
+            return False
+        return _daily_token_total() > int(max_token_budget)
+
+    def _stop_budget():
+        state["budget_exceeded"] = True
+        state["status"] = "budget_exceeded"
+        _save_state_atomic(wd, state)
+        print(f"\n[预算] 今日累计 token 已超上限 {max_token_budget}，停止后续阶段。")
+        return state
 
     design = state.get("design") or {}
     impl_txt = (state.get("impl") or {}).get("summary") or ""
 
     # 阶段1：分析出设计稿
     if state["phase"] <= 1:
+        if _over_budget():
+            return _stop_budget()
         print("\n[1/5] 分析 " + ROLES["分析"]["model"] + " 产出设计稿...")
         design_prompt = (
             "你是软件架构师。先查看当前项目结构（用 list_dir/read_file 工具），"
@@ -1037,37 +1267,29 @@ def team(task, max_rounds=3, state=None, engine=None, allow_risky=None):
             allow_risky=ar,
         )
         try:
-            a, b = design_txt.find("{"), design_txt.rfind("}")
-            design = json.loads(design_txt[a:b + 1] if a != -1 and b != -1 else design_txt)
+            design = extract_json(design_txt)
         except Exception as e:
             print(f"[警告] 设计稿解析失败({e})，退化为纯文本设计。")
             design = {"files": [], "plan": design_txt, "acceptance": ""}
         print(f"  设计稿: {json.dumps(design, ensure_ascii=False)[:500]}")
         state["design"] = design
         state["phase"] = 2
-        _save_state_atomic(WORKDIR, state)
+        _save_state_atomic(wd, state)
     else:
         print("\n[1/5] 设计稿已有(resume)，跳过。")
+    if _over_budget():
+        return _stop_budget()
 
-    # 阶段2：写码落地（按 engine 分派）
+    # 阶段2：写码落地（把不同文件并行分给不同写码模型）
     if state["phase"] <= 2:
-        print("\n[2/5] 写码 " + ROLES["写码"]["model"] + " 按设计稿落地文件...")
-        if state["engine"] == "codex":
-            impl_prompt = (
-                "你是资深工程师。根据下面的设计稿把代码真正写到磁盘上。"
-                "先了解现状，再逐个写文件。完成后简要说明写了哪些文件、如何验证。\n\n"
-                f"设计稿：{json.dumps(design, ensure_ascii=False)}"
-            )
-            ok, detail = _run_codex_stage(impl_prompt, ROLES["写码"]["model"], WORKDIR)
-            if ok:
-                impl_txt = detail
-                impl_files = []  # codex 模式无法精确追踪文件清单
-            else:
-                print(f"  [codex 引擎失败] {detail}")
-                state["stage_errors"].append({"phase": 2, "engine": "codex", "detail": detail})
-                impl_txt = f"[codex 引擎失败] {detail}"
-                impl_files = []
+        if _over_budget():
+            return _stop_budget()
+        print("\n[2/5] 写码：多模型并行分文件落地...")
+        file_paths = [f.get("path") for f in design.get("files", []) if isinstance(f, dict)]
+        if file_paths:
+            impl_files, impl_txt = _parallel_implement(file_paths, design, ar, wd)
         else:
+            # 设计稿没给文件清单：退回单一写码模型自主规划
             impl_prompt = (
                 "你是资深工程师。根据下面的设计稿，用 write_file 工具把代码真正写到磁盘上。"
                 "先用 list_dir/read_file 了解现状，再逐个写文件。完成后简要说明写了哪些文件、如何验证。\n\n"
@@ -1085,17 +1307,21 @@ def team(task, max_rounds=3, state=None, engine=None, allow_risky=None):
             for name, args, res in impl_trace:
                 if name == "write_file":
                     print(f"    ✎ {args.get('path')}  → {res}")
-        print(f"  写码完成")
+        print(f"  写码完成，共 {len(impl_files)} 个文件")
         state["impl"] = {"files": impl_files, "summary": impl_txt}
         state["phase"] = 3
-        _save_state_atomic(WORKDIR, state)
+        _save_state_atomic(wd, state)
     else:
         print("\n[2/5] 实现已有(resume)，跳过。")
 
     # 阶段3+4：审查 + 迭代回改
     if state["phase"] <= 3:
+        if _over_budget():
+            return _stop_budget()
         start_round = len(state.get("reviews") or [])
         for rnd in range(start_round + 1, max_rounds + 1):
+            if _over_budget():
+                return _stop_budget()
             state["round"] = rnd
             print(f"\n[3/5] 审查 {ROLES['分析']['model']} 读真实代码给意见（第 {rnd} 轮）...")
             review_prompt = (
@@ -1117,8 +1343,7 @@ def team(task, max_rounds=3, state=None, engine=None, allow_risky=None):
                     allow_risky=ar,
                 )
                 try:
-                    a, b = review_txt.find("{"), review_txt.rfind("}")
-                    issues = json.loads(review_txt[a:b + 1] if a != -1 and b != -1 else review_txt)
+                    issues = extract_json(review_txt)
                     break  # 解析成功
                 except Exception as e:
                     if attempt < REVIEW_RETRIES:
@@ -1140,10 +1365,12 @@ def team(task, max_rounds=3, state=None, engine=None, allow_risky=None):
                 "blocking": blocking, "minor": minor,
                 "anomalous": bool(issues.get("anomalous")),
             })
-            _save_state_atomic(WORKDIR, state)
+            _save_state_atomic(wd, state)
             if verdict == "pass" or not blocking:
                 break
             if rnd < max_rounds:
+                if _over_budget():
+                    return _stop_budget()
                 print(f"\n[4/5] 回改 {ROLES['写码']['model']} 按审查意见修复...")
                 fix_prompt = (
                     "根据下面的审查意见，用 read_file 读代码、write_file 修复问题。"
@@ -1165,13 +1392,17 @@ def team(task, max_rounds=3, state=None, engine=None, allow_risky=None):
                     "round": rnd,
                     "files": [args.get("path") for name, args, _ in fix_trace if name == "write_file"],
                 })
-                _save_state_atomic(WORKDIR, state)
+                _save_state_atomic(wd, state)
         state["phase"] = 5
-        _save_state_atomic(WORKDIR, state)
+        _save_state_atomic(wd, state)
     else:
         print("\n[3-4/5] 审查迭代已有(resume)，跳过。")
+    if _over_budget():
+        return _stop_budget()
 
     # 阶段5：汇总（用交接摘要替代 [:800]/[:1200]/[:600] 粗暴截断）
+    if _over_budget():
+        return _stop_budget()
     print("\n[5/5] 汇总 " + ROLES["指挥官"]["model"] + " 输出最终交付...")
     files_done = ", ".join(
         f.get("path", "") for f in design.get("files", []) if isinstance(f, dict))
@@ -1195,77 +1426,11 @@ def team(task, max_rounds=3, state=None, engine=None, allow_risky=None):
         final += "\n\n[结构化异常] 第 " + ",".join(str(r) for r in anomalous_rounds) + " 轮审查未完成"
     state["final"] = {"summary": final}
     state["status"] = "done"
-    _save_state_atomic(WORKDIR, state)
+    _save_state_atomic(wd, state)
     print("\n" + "=" * 60)
     print(final)
     print("=" * 60)
     return state
-
-
-# ---------------------------------------------------------------------------
-# auto 无人值守：循环跑 team
-# ---------------------------------------------------------------------------
-def auto(task=None, hours=None, tasks_file=None, engine="builtin", allow_risky=False):
-    """无人值守连续跑：循环跑多模型团队流水线，直到超时或 Ctrl+C。
-
-    - 给 --tasks 清单文件时：按文件里每行一个任务，逐个跑（跑完一轮接一轮）。
-    - 只给单个任务时：反复迭代同一个任务，从第二轮起提示模型基于现有产出继续改进，
-      不推倒重来（持续开发模式）。
-    每轮结束写一行日志到 WORKDIR/auto-run.log。
-    """
-    tasks = []
-    if tasks_file:
-        try:
-            with open(tasks_file, encoding="utf-8") as f:
-                tasks = [ln.strip() for ln in f if ln.strip() and not ln.startswith("#")]
-        except Exception as e:
-            print(f"[错误] 读取任务清单失败: {e}")
-            return 1
-    elif task:
-        tasks = [task]
-    if not tasks:
-        print("[错误] auto 模式需要任务：直接给任务，或用 --tasks 指定任务清单文件")
-        return 1
-
-    deadline = time.time() + hours * 3600 if hours else None
-    start = time.time()
-    idx = 0
-    log_path = os.path.join(WORKDIR, "auto-run.log")
-    print(f"[auto] 任务数 {len(tasks)}，时长上限 "
-          f"{str(hours)+'h' if hours else '不限(直到 Ctrl+C)'}，日志 {log_path}\n")
-
-    while True:
-        if deadline and time.time() > deadline:
-            print(f"\n[auto] 已运行满 {hours} 小时，正常停止。")
-            break
-        base = tasks[idx % len(tasks)]
-        idx += 1
-        elapsed = round((time.time() - start) / 3600, 2)
-        print("\n" + "=" * 60)
-        print(f"[auto] 第 {idx} 轮（累计 {elapsed}h）")
-        print("=" * 60)
-
-        cur = base
-        if idx > 1 and len(tasks) == 1:
-            cur = (base + f"\n\n[持续改进] 这是第 {idx} 轮迭代。工作目录里已有前几轮产出的代码，"
-                   "请先 list_dir/read_file 了解现状，基于现有成果继续完善、修复、扩展，"
-                   "不要推倒重来。")
-
-        try:
-            team(cur, engine=engine, allow_risky=allow_risky)
-        except KeyboardInterrupt:
-            print("\n[auto] 手动中断，停止。")
-            break
-        except Exception as e:
-            print(f"[auto] 本轮出错: {e}，记录后继续下一轮")
-        try:
-            with open(log_path, "a", encoding="utf-8") as f:
-                f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} | 第{idx}轮 | {base[:80]}\n")
-        except Exception:
-            pass
-
-    print(f"\n[auto] 结束：共 {idx} 轮，用时 {round((time.time()-start)/3600, 2)}h，日志见 {log_path}")
-    return 0
 
 
 def list_models():
@@ -1287,47 +1452,83 @@ def menu():
         if len(GATEWAYS) > 1:
             gw_line += f"  备选: {GATEWAYS[1]['base_url']}"
         print(gw_line)
-        print("  1. 单模型问答 (ask)")
-        print("  2. 多模型同问对比 (parallel, 真并行)")
-        print("  3. 指挥官拆解→多模型并行→汇总 (orchestrate)")
-        print("  4. 真团队流水线(带工具+审查迭代) (team) ★推荐")
-        print("  5. 无人值守连续跑 (auto)")
-        print("  6. 列出可用模型")
-        print("  7. 退出")
+        print("  1. 多模型团队模式（推荐）")
+        print("  2. 单模型模式")
+        print("  0. 退出")
         print("=" * 56)
         try:
-            s = input("  请选择 [1-7]: ").strip()
+            s = input("  请选择 [1/2/0，回车=1]: ").strip()
         except (EOFError, KeyboardInterrupt):
             print("\n退出")
             return
+        if s == "" or s == "1":
+            _menu_team()
+        elif s == "2":
+            _menu_ask()
+        elif s == "0":
+            print("再见")
+            return
+        else:
+            print("  无效选择，请重试")
+
+
+def _menu_team():
+    """多模型团队模式：输入任务，交给多模型并行写文件 + 审查迭代。"""
+    print("\n  [多模型团队模式] 输入任务，让多个模型分工写代码并审查迭代。")
+    print("  输入 0 返回主菜单。")
+    try:
+        task = input("  任务: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        return
+    if task == "0":
+        return
+    if not task:
+        print("  任务为空，返回主菜单")
+        return
+    try:
+        team(task)
+    except KeyboardInterrupt:
+        print("\n  已取消")
+    except Exception as e:
+        print(f"\n  出错: {e}")
+
+
+def _menu_ask():
+    """单模型模式：选模型问答。按数字选模型，回车默认第一个，0 返回主菜单。"""
+    model_names = list(ROLES.keys())
+    while True:
+        print("\n  [单模型模式] 选择一个模型:")
+        for i, name in enumerate(model_names, 1):
+            m = ROLES[name]["model"]
+            print(f"    {i}. {name} ({m})")
+        print("    0. 返回主菜单")
         try:
-            if s == "1":
-                m = input("  模型(astra/sol/luna/glm/deep/kimi...): ").strip()
-                m = ALIASES.get(m, m)
-                p = input("  问题: ").strip()
-                print("\n" + ask(m, p))
-            elif s == "2":
-                p = input("  问题: ").strip()
-                for m, c in parallel(p).items():
-                    print(f"\n--- {m} ---\n{c}")
-            elif s == "3":
-                orchestrate(input("  任务: ").strip())
-            elif s == "4":
-                team(input("  任务: ").strip())
-            elif s == "5":
-                t = input("  任务(持续迭代，直接回车跳过=用清单): ").strip()
-                hs = input("  时长上限小时(回车=不限): ").strip()
-                hours = float(hs) if hs else None
-                auto(task=t or None, hours=hours)
-            elif s == "6":
-                list_models()
-            elif s == "7":
-                print("再见")
-                return
-        except KeyboardInterrupt:
-            print("\n已取消，返回菜单")
+            s = input("  选择模型 [1-%d，回车=%s，0=返回]: " % (len(model_names), model_names[0])).strip()
+        except (EOFError, KeyboardInterrupt):
+            return
+        if s == "0":
+            return
+        if s == "":
+            chosen = model_names[0]
+        elif s.isdigit() and 1 <= int(s) <= len(model_names):
+            chosen = model_names[int(s) - 1]
+        else:
+            print("  无效选择，请重试")
+            continue
+        model = ROLES[chosen]["model"]
+        try:
+            q = input(f"  问题({chosen}/{model}): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            return
+        if q == "0":
+            return
+        if not q:
+            print("  问题为空")
+            continue
+        try:
+            print("\n" + ask(model, q))
         except Exception as e:
-            print(f"\n出错: {e}")
+            print(f"\n  出错: {e}")
 
 
 def main():
@@ -1336,33 +1537,23 @@ def main():
     ap.add_argument("--api-key", default=None, help="覆盖 API Key")
     ap.add_argument("--workdir", default=None, help="工作目录（团队读写文件限定在此）")
     ap.add_argument("--no-run", action="store_true", help="禁用 run_command 工具")
-    ap.add_argument("--engine", choices=["builtin", "codex"], default="builtin",
-                    help="team/auto 实现阶段引擎：builtin(本脚本 agent_loop) 或 codex(本地 codex CLI)")
-    ap.add_argument("--allow-risky", action="store_true", default=False,
-                    help="放行命中危险命令黑名单的 run_command（默认拦截）")
+    ap.add_argument("--allow-risky", action="store_true", default=True,
+                    help="放行命中危险命令黑名单的 run_command（默认全通过；用 --no-allow-risky 拦截）")
+    ap.add_argument("--no-allow-risky", action="store_false", dest="allow_risky",
+                    help="拦截命中危险命令黑名单的 run_command")
     sub = ap.add_subparsers(dest="action")
 
     p = sub.add_parser("ask", help="单模型问答")
     p.add_argument("model")
     p.add_argument("prompt")
 
-    p = sub.add_parser("parallel", help="多模型同问对比")
-    p.add_argument("prompt")
-    p.add_argument("--models", nargs="*", default=None, help="指定模型列表")
-
-    p = sub.add_parser("orchestrate", help="指挥官拆解→并行→汇总")
-    p.add_argument("task")
-
-    p = sub.add_parser("team", help="真团队流水线(带工具+审查迭代)")
+    p = sub.add_parser("team", help="多模型团队流水线(并行写文件+审查迭代)")
     p.add_argument("task", nargs="?", default=None, help="任务文本（与 --resume 互斥）")
     p.add_argument("--rounds", type=int, default=3, help="审查迭代最大轮数")
     p.add_argument("--resume", default=None, metavar="TASK_ID",
                    help="从已持久化的状态续跑（与 task 位置参数互斥）")
-
-    p = sub.add_parser("auto", help="无人值守连续跑多模型（挂机/跑一天一夜）")
-    p.add_argument("task", nargs="?", default=None, help="要持续迭代的单个任务")
-    p.add_argument("--hours", type=float, default=None, help="时长上限(小时)，不填=不限直到 Ctrl+C")
-    p.add_argument("--tasks", default=None, help="任务清单文件，每行一个任务，循环跑")
+    p.add_argument("--max-tokens", type=int, default=None,
+                   help="每日 token 上限（input+output 合计，跨任务累计），默认无上限")
 
     sub.add_parser("list", help="列出可用模型")
 
@@ -1381,34 +1572,21 @@ def main():
 
     if args.action == "ask":
         print(ask(ALIASES.get(args.model, args.model), args.prompt))
-    elif args.action == "parallel":
-        models = args.models or None
-        if models:
-            models = [ALIASES.get(m, m) for m in models]
-        for m, c in parallel(args.prompt, models).items():
-            print(f"\n--- {m} ---\n{c}")
-    elif args.action == "orchestrate":
-        orchestrate(args.task)
     elif args.action == "team":
         if args.resume:
-            # --resume 续跑：从持久化状态恢复
             try:
                 st = _load_state(WORKDIR, args.resume)
             except StateError as e:
                 print(f"[错误] 恢复状态失败: {e}")
                 sys.exit(2)
             team(task=st["task"], max_rounds=args.rounds, state=st,
-                 engine=st.get("engine", "builtin"),
                  allow_risky=st.get("allow_risky", False))
         else:
             if not args.task:
                 print("[错误] team 需要任务文本，或用 --resume TASK_ID 续跑")
                 sys.exit(2)
-            team(args.task, max_rounds=args.rounds,
-                 engine=args.engine, allow_risky=args.allow_risky)
-    elif args.action == "auto":
-        sys.exit(auto(task=args.task, hours=args.hours, tasks_file=args.tasks,
-                      engine=args.engine, allow_risky=args.allow_risky))
+            team(args.task, max_rounds=args.rounds, allow_risky=args.allow_risky,
+                 max_token_budget=args.max_tokens)
     elif args.action == "list":
         list_models()
 

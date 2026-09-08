@@ -172,7 +172,6 @@ TOOL_SPECS = [
         "inputSchema": {"type": "object", "properties": {
             "task": {"type": "string", "description": "任务描述，写清目标文件与验收标准"},
             "workdir": {"type": "string", "description": "工作目录，默认当前"},
-            "engine": {"type": "string", "enum": ["builtin", "codex"], "description": "写码引擎，默认 builtin；codex=调用 codex exec 执行写码/回改"},
             "rounds": {"type": "integer", "minimum": 1, "maximum": 5, "description": "审查迭代上限，默认 3"}
         }, "required": ["task"]}
     },
@@ -422,11 +421,13 @@ def _tool_multi_list_models(mm, params):
     替换为 _StderrProxy（→ stderr），故此处直接从 ROLES 构造文本，不调用 list_models。
     """
     try:
-        models = []
-        for role_name, role_info in mm.ROLES.items():
-            models.append({"role": role_name, "model": role_info["model"], "desc": role_info["desc"]})
-        text = "\n".join(f"  {m['role']:4s} → {m['model']:20s}  {m['desc']}" for m in models)
-        return {"content": [{"type": "text", "text": f"可用模型（{len(models)} 个角色）:\n{text}"}]}
+        lines = []
+        for gw in mm.GATEWAYS:
+            lines.append(f"[{gw['name']}] {gw['base_url']}")
+            for alias, real in sorted(gw["models"].items()):
+                tag = "" if alias == real else f"  (→ 上游 {real})"
+                lines.append(f"  - {alias}{tag}")
+        return {"content": [{"type": "text", "text": "可用模型（网关注册表）:\n" + "\n".join(lines)}]}
     except Exception as e:
         return {"isError": True, "content": [{"type": "text", "text": f"列出模型失败: {e}"}]}
 
@@ -489,19 +490,18 @@ def _spawn_job(task_type, workdir, target, args_tuple):
 def _tool_multi_team_start(mm, params):
     """启动五阶段团队流水线（异步）。
 
-    mm.team 的新签名：team(task, max_rounds=3, state=None, engine=None, allow_risky=None)
+    mm.team 的新签名：team(task, max_rounds=3, state=None, allow_risky=None, workdir=None)
     用 functools.partial 绑定 kwargs，再交给 _spawn_job 在后台线程调用。
     """
     task = params.get("task")
     if not task:
         return {"isError": True, "content": [{"type": "text", "text": "缺少必填参数 task"}]}
     workdir = params.get("workdir") or mm.WORKDIR
-    engine = params.get("engine", "builtin")
     rounds = params.get("rounds", 3)
     # 安全红线：MCP 不暴露 allow_risky，危险命令黑名单始终硬生效
     allow_risky = False
 
-    target = functools.partial(mm.team, task, max_rounds=rounds, engine=engine, allow_risky=allow_risky)
+    target = functools.partial(mm.team, task, max_rounds=rounds, allow_risky=allow_risky, workdir=workdir)
     ok, info = _spawn_job("team", workdir, target, ())
     if not ok:
         return {"isError": True, "content": [{"type": "text", "text": info}]}
@@ -554,7 +554,7 @@ def _tool_multi_task_status(mm, params):
     if job.task_type == "team":
         try:
             state = mm._load_state(job.workdir, task_id)
-            phase_names = {1: "设计", 2: "写码", 3: "审查", 4: "回改", 5: "汇总"}
+            phase_names = {1: "设计", 2: "写码", 3: "审查", 5: "汇总"}
             status_info = {
                 "task_id": task_id,
                 "task_type": job.task_type,
@@ -562,8 +562,7 @@ def _tool_multi_task_status(mm, params):
                 "phase": state.get("phase", 0),
                 "phase_name": phase_names.get(state.get("phase", 0), "?"),
                 "round": state.get("round", 0),
-                "engine": state.get("engine", "builtin"),
-                "files_written": (state.get("impl") or {}).get("files_written", []),
+                "files_written": (state.get("impl") or {}).get("files", []),
             }
             return {"content": [{"type": "text", "text": json.dumps(status_info, ensure_ascii=False)}]}
         except Exception:

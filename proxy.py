@@ -1468,6 +1468,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except Exception:
             pass
 
+    def handle(self):
+        # 客户端断开（超时/取消/工具被杀）可能发生在响应写出的任意一步：
+        # _json 的 end_headers、流式 _write_sse、send_response 等都有可能抛
+        # ConnectionReset/BrokenPipe/Aborted。局部 try/except 覆盖不全时异常
+        # 会冒泡到 handle_error；而其静默判断依赖 getsockopt(SO_ERROR)，Windows
+        # 上错误码常已被消费返回 0 导致误打印整屏 traceback。
+        # 统一在 handle() 顶层吞掉：这只说明客户端走了，不是服务端错误。
+        try:
+            http.server.BaseHTTPRequestHandler.handle(self)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            _log("[conn] 客户端断开，请求处理中断 (%s %s)"
+                 % (getattr(self, "command", "?"), getattr(self, "path", "?")))
+
     def _json(self, code: int, obj: dict, extra_headers: dict = None):
         data = json.dumps(obj, ensure_ascii=False).encode("utf-8")
         self.send_response(code)
