@@ -506,3 +506,52 @@ python deploy_ai_cli.py --force
 | 变量 | 默认 | 用途 |
 |------|------|------|
 | MM_SYNC_BUDGET_SEC | 55 | 同步工具（multi_ask）执行预算（秒） |
+
+---
+
+## 远程 Codex app-server 客户端（codex-remote-cli.py）
+
+`codex-remote-cli.py` 是一个**零依赖**（纯标准库）的 WebSocket + JSON-RPC 客户端，直接连远程 Codex app-server，在本地管理远程会话 / 发消息 / 切模型，无需进入 TUI。
+
+### 基本用法
+
+```bash
+python codex-remote-cli.py list                          # 列出远程会话
+python codex-remote-cli.py info                          # 远程 server 信息
+python codex-remote-cli.py model                         # 列出远程可用模型
+python codex-remote-cli.py model set gpt-6-astra         # 切模型（写远程 config）
+python codex-remote-cli.py start --cwd /opt/Codex "任务" # 新建会话 + 首条消息
+python codex-remote-cli.py send --thread <id> "追加"      # 空闲会话追加消息
+python codex-remote-cli.py read --thread <id>            # 读会话元数据
+python codex-remote-cli.py items --thread <id> [--turn <id>]  # 列 items
+```
+
+凭据优先级：`--token` > 环境变量 `CODEX_WS_TOKEN` > `codex-remote-config.json` 的 token。
+连接地址优先级：`--host`/`--port` > `CODEX_WS_HOST`/`CODEX_WS_PORT` > config 文件。
+
+### ★ 中途介入：不打断 vs 打断（重点）
+
+会话**进行中**想实时改变方向，有两条命令，语义截然不同：
+
+| 命令 | 底层方法 | 是否打断 | 效果 |
+|------|---------|---------|------|
+| `steer` | `turn/steer` | **不打断** | 给进行中的 turn 注入新指令，turn 保持 `inProgress` 继续跑，最终 `completed` |
+| `interrupt` | `turn/interrupt` | 打断 | 显式终止当前 turn，状态变 `interrupted` |
+
+```bash
+# 想「改方向但别停」——用 steer（不打断）：
+python codex-remote-cli.py steer --thread <id> --turn <id> "换个思路，改成 XX"
+
+# 想「叫停」——才用 interrupt：
+python codex-remote-cli.py interrupt --thread <id> --turn <id>
+```
+
+- `steer` 的 `--turn` 必须是**当前活跃 turn 的 id**，服务端校验不符会拒绝（避免打到旧 turn）。
+- `send` 走 `turn/start`，只在空闲会话上开新 turn，同样不打断。
+- 协议依据：`TurnStatus` 只有 `completed / interrupted / failed / inProgress` 四种，无独立的「steered」状态——steer 后 turn 仍是 `inProgress`，因此不产生中断。
+
+### 模型切换语义
+
+- `model set` 走协议 `config/value/write`（写远程 `config.toml` 的 `model` 字段），**不重启服务**，只影响之后新建的 turn。
+- 若远程环境需要「改写配置 + 重启 app-server」的切换方式，可改用同目录 `remote-model.py`（SSH 调用）。
+- 给**单个会话/单次 turn** 指定模型：`start` / `send` / `steer` 均支持 `--model <假名>` 覆盖。
