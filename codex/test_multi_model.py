@@ -279,7 +279,7 @@ class TestEnginePipeline(unittest.TestCase):
 
     def test_17_state_persistence(self):
         """R-B3: 状态文件原子写盘 + 可读回"""
-        state = self.mm._new_state("test task", self.tmpdir, "builtin", False)
+        state = self.mm._new_state("test task", self.tmpdir, False)
         self.mm._save_state_atomic(self.tmpdir, state)
         loaded = self.mm._load_state(self.tmpdir, state["task_id"])
         self.assertEqual(loaded["task_id"], state["task_id"])
@@ -288,7 +288,7 @@ class TestEnginePipeline(unittest.TestCase):
 
     def test_18_state_corrupt(self):
         """R-B5: 状态文件损坏 → StateError"""
-        state = self.mm._new_state("test", self.tmpdir, "builtin", False)
+        state = self.mm._new_state("test", self.tmpdir, False)
         self.mm._save_state_atomic(self.tmpdir, state)
         # 写坏文件
         path = self.mm._state_path(self.tmpdir, state["task_id"])
@@ -299,7 +299,7 @@ class TestEnginePipeline(unittest.TestCase):
 
     def test_19_state_schema_mismatch(self):
         """R-B5: schema_v 不符 → StateError"""
-        state = self.mm._new_state("test", self.tmpdir, "builtin", False)
+        state = self.mm._new_state("test", self.tmpdir, False)
         state["schema_v"] = 999  # 错误版本
         self.mm._save_state_atomic(self.tmpdir, state)
         with self.assertRaises(self.mm.StateError):
@@ -307,7 +307,7 @@ class TestEnginePipeline(unittest.TestCase):
 
     def test_20_handoff_summary(self):
         """R-B9: 交接摘要含三要素"""
-        state = self.mm._new_state("test task", self.tmpdir, "builtin", False)
+        state = self.mm._new_state("test task", self.tmpdir, False)
         state["design"] = {
             "files": [{"path": "src/foo.py", "purpose": "做某事"}],
             "plan": "关键决策：用策略模式。" * 100,  # 长文本
