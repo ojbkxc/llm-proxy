@@ -54,6 +54,40 @@ DEFAULT_BASE_URL = "https://cfapi.1232333.xyz/v1"
 # 安全提示：密钥会随源码明文传播，请勿将填好密钥的副本提交到公开仓库或随意转发。
 DEFAULT_API_KEY = "sk-wa-f9cb7d4ba48f403797fc3f55b928ceac"
 
+
+# --------------------------------------------------------------------------- #
+# .env 覆盖：同目录存在 .env 时，其 BASE_URL / API_KEY 覆盖上面硬编码默认值。
+# 优先级：命令行 --base-url/--api-key（最高）> 进程环境变量 > .env > 本文件硬编码。
+# --------------------------------------------------------------------------- #
+def _load_dotenv(path):
+    d = {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            for raw in f:
+                line = raw.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                k, v = k.strip(), v.strip()
+                if len(v) >= 2 and v[0] == v[-1] and v[0] in ("'", '"'):
+                    v = v[1:-1]
+                if k:
+                    d[k] = v
+    except OSError:
+        pass
+    return d
+
+
+_DOTENV = _load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+if os.environ.get("BASE_URL"):
+    DEFAULT_BASE_URL = os.environ["BASE_URL"]
+elif _DOTENV.get("BASE_URL"):
+    DEFAULT_BASE_URL = _DOTENV["BASE_URL"]
+if os.environ.get("API_KEY") or os.environ.get("CF_GATEWAY_KEY"):
+    DEFAULT_API_KEY = os.environ.get("API_KEY") or os.environ.get("CF_GATEWAY_KEY")
+elif _DOTENV.get("API_KEY"):
+    DEFAULT_API_KEY = _DOTENV["API_KEY"]
+
 # Codex 模型分档（gpt-* 假名，两网关通用）：
 # { 档位名: (模型名, reasoning effort) }
 DEFAULT_CODEX_PROFILES: Dict[str, Tuple[str, str]] = {

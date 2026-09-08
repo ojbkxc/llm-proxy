@@ -56,6 +56,29 @@ CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 DEFAULT_HOST = "104.223.65.202"
 DEFAULT_PORT = 10130  # orbien 公网映射（内网是 20130）
 DEFAULT_TOKEN = "3926a359a64235af4d488962f0de529e63bb6e398cc3562689f84ed44843f669"
+
+
+def _load_dotenv(path):
+    """读同目录 .env（KEY=VALUE），无/失败返回空 dict。"""
+    d = {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            for raw in f:
+                line = raw.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                k, v = k.strip(), v.strip()
+                if len(v) >= 2 and v[0] == v[-1] and v[0] in ("'", '"'):
+                    v = v[1:-1]
+                if k:
+                    d[k] = v
+    except OSError:
+        pass
+    return d
+
+
+_DOTENV = _load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 CLIENT_NAME = "codex-remote-cli"
 CLIENT_VERSION = "0.1.0"
 
@@ -87,15 +110,28 @@ def _unb64(s: str) -> bytes:
 
 
 def load_config() -> dict:
+    # 优先级：硬编码默认 < .env < 环境变量 CODEX_WS_* < config 文件 < 命令行参数。
     # 默认就写死远程服务器信息，直接 `python codex-remote-cli.py` 就能用；
-    # 但仍可用 config 文件 / 环境变量 / 命令行参数覆盖。
+    # 但仍可用 .env / 环境变量 / config 文件 / 命令行参数覆盖。
     cfg = {"host": DEFAULT_HOST, "port": DEFAULT_PORT, "token": DEFAULT_TOKEN}
+    # .env 覆盖（同目录 .env 的 CODEX_WS_HOST/PORT/TOKEN）
+    if _DOTENV.get("CODEX_WS_HOST"):
+        cfg["host"] = _DOTENV["CODEX_WS_HOST"]
+    if _DOTENV.get("CODEX_WS_PORT"):
+        try:
+            cfg["port"] = int(_DOTENV["CODEX_WS_PORT"])
+        except ValueError:
+            pass
+    if _DOTENV.get("CODEX_WS_TOKEN"):
+        cfg["token"] = _DOTENV["CODEX_WS_TOKEN"]
+    # config 文件覆盖
     try:
         with open(CONFIG_FILE, encoding="utf-8") as f:
             data = json.load(f)
         cfg.update({k: v for k, v in data.items() if k in cfg and v})
     except (OSError, ValueError):
         pass
+    # 环境变量覆盖
     if os.environ.get("CODEX_WS_HOST"):
         cfg["host"] = os.environ["CODEX_WS_HOST"]
     if os.environ.get("CODEX_WS_PORT"):

@@ -34,10 +34,31 @@ CONFIG_PATH = os.path.expanduser("~/.codex/config.toml")
 SERVICE_NAME = "codex-app-server"
 HEALTH_PORT = 20130
 
-# 网关 API（codex 的 custom provider 用，写死）
-GATEWAY_BASE_URL = "https://cfapi.1232333.xyz/v1"
-GATEWAY_ENV_KEY = "CUSTOM_API_KEY"
-GATEWAY_API_KEY = "sk-wa-f9cb7d4ba48f403797fc3f55b928ceac"
+# 网关 API（codex 的 custom provider 用）。有 .env 读 .env，没有则用硬编码。
+def _load_dotenv(path):
+    d = {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            for raw in f:
+                line = raw.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                k, v = k.strip(), v.strip()
+                if len(v) >= 2 and v[0] == v[-1] and v[0] in ("'", '"'):
+                    v = v[1:-1]
+                if k:
+                    d[k] = v
+    except OSError:
+        pass
+    return d
+
+
+_DOTENV = _load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+
+GATEWAY_BASE_URL = _DOTENV.get("BASE_URL") or "https://cfapi.1232333.xyz/v1"
+GATEWAY_ENV_KEY = _DOTENV.get("BASE_ENV_KEY") or "CUSTOM_API_KEY"
+GATEWAY_API_KEY = _DOTENV.get("API_KEY") or "sk-wa-f9cb7d4ba48f403797fc3f55b928ceac"
 
 # 档位 -> (模型假名, reasoning effort, 说明)。gpt-* 假名由网关转发到真实模型。
 PROFILES = {
