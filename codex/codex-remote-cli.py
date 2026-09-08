@@ -16,6 +16,7 @@ codex-remote-cli.py — 远程 Codex app-server 命令行客户端（零依赖�
     - 认证:   WebSocket Upgrade 头带 `Authorization: Bearer <token>`
 
 用法:
+    python codex-remote-cli.py                             # 交互式菜单（推荐，像 multi-model.py）
     python codex-remote-cli.py list                         # 列出远程会话
     python codex-remote-cli.py info                         # 远程 server 信息
     python codex-remote-cli.py model                        # 列出可用模型
@@ -53,7 +54,8 @@ import time
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            "codex-remote-config.json")
 DEFAULT_HOST = "104.223.65.202"
-DEFAULT_PORT = 20130
+DEFAULT_PORT = 10130  # orbien 公网映射（内网是 20130）
+DEFAULT_TOKEN = "3926a359a64235af4d488962f0de529e63bb6e398cc3562689f84ed44843f669"
 CLIENT_NAME = "codex-remote-cli"
 CLIENT_VERSION = "0.1.0"
 
@@ -85,7 +87,9 @@ def _unb64(s: str) -> bytes:
 
 
 def load_config() -> dict:
-    cfg = {"host": DEFAULT_HOST, "port": DEFAULT_PORT, "token": ""}
+    # 默认就写死远程服务器信息，直接 `python codex-remote-cli.py` 就能用；
+    # 但仍可用 config 文件 / 环境变量 / 命令行参数覆盖。
+    cfg = {"host": DEFAULT_HOST, "port": DEFAULT_PORT, "token": DEFAULT_TOKEN}
     try:
         with open(CONFIG_FILE, encoding="utf-8") as f:
             data = json.load(f)
@@ -491,6 +495,31 @@ class CodexRemote:
 # --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
+def _fix_msys_cwd(raw: str) -> str:
+    """修复 Windows Git Bash(MSYS) 对 POSIX 路径的误转译。
+
+    Git Bash 会把 `/opt/codex` 转成 `D:/Program Files/Git/opt/codex` 这类
+    Windows 路径传给 Python。远程是 Linux 服务器，这里把里面夹带的 Linux
+    绝对路径（/root /opt /home /www /tmp /usr /var /etc）还原出来。
+    """
+    if not raw:
+        return raw
+    # 已经是干净的 POSIX 绝对路径，直接返回
+    if raw.startswith("/") and ":" not in raw.split()[0]:
+        return raw
+    # 形如 `盘符:/xxx` 或含 `:/` 的 Windows 风格路径，尝试提取 Linux 段
+    for root in ("/root", "/opt", "/home", "/www", "/tmp", "/usr", "/var", "/etc"):
+        i = raw.find(root)
+        if i >= 0:
+            fixed = raw[i:]
+            sys.stderr.write(f"[提示] 检测到 Git Bash 路径转译，已把 cwd 还原为 {fixed}\n")
+            return fixed
+    return raw
+
+
+# --------------------------------------------------------------------------- #
+# CLI
+# --------------------------------------------------------------------------- #
 def _fmt_thread(t: dict) -> str:
     name = t.get("name") or t.get("preview") or "(未命名)"
     if len(name) > 48:
@@ -540,6 +569,170 @@ class StreamPrinter:
             err = params.get("error", {})
             print(f"\n[错误] {json.dumps(err, ensure_ascii=False)[:300]}",
                   file=sys.stderr, flush=True)
+
+
+# --------------------------------------------------------------------------- #
+# 交互式菜单
+# --------------------------------------------------------------------------- #
+def _select_thread(client: CodexRemote) -> str:
+    """列出会话并让用户按序号选一个，返回 threadId。"""
+    while True:
+        threads = client.list_threads()
+        if not threads:
+            print("  没有可用的远程会话，先返回主菜单用「新建会话」创建一个。")
+            return ""
+        print("\n  [远程会话]")
+        for i, t in enumerate(threads, 1):
+            print(f"    {i}. {_fmt_thread(t)}")
+        print("    0. 返回")
+        s = input("  选择会话 [序号，回车=最新]: ").strip()
+        if s == "0":
+            return ""
+        if s == "":
+            return threads[0].get("id", "")
+        if s.isdigit() and 1 <= int(s) <= len(threads):
+            return threads[int(s) - 1].get("id", "")
+        print("  无效选择，请重试")
+
+
+def _menu_chat(client: CodexRemote, args):
+    """会话内交互：发消息 / steer / interrupt / read / items。"""
+    thread_id = _select_thread(client)
+    if not thread_id:
+        return
+    while True:
+        print(f"\n  [会话 {thread_id[:12]}…]")
+        print("    1. 发消息（空闲会话开新 turn）")
+        print("    2. 中途改方向（steer，不打断当前 turn）")
+        print("    3. 打断当前 turn（interrupt）")
+        print("    4. 查看会话详情")
+        print("    0. 返回")
+        try:
+            s = input("  请选择 [1/2/3/4/0]: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            return
+        if s == "0":
+            return
+        if s == "1":
+            try:
+                msg = input("  消息: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                return
+            if msg:
+                try:
+                    client.run_turn(thread_id, msg, timeout=args.timeout)
+                except (WSClose, WSProtocolError, TimeoutError) as e:
+                    print(f"  [出错] {e}")
+        elif s == "2":
+            turns = client.thread_turns(thread_id)
+            active = [t for t in turns if t.get("status") == "inProgress"]
+            if not active:
+                print("  当前没有进行中的 turn，无法 steer（请先「发消息」启动）。")
+                continue
+            turn_id = active[0].get("id")
+            try:
+                msg = input(f"  注入新指令（turn {turn_id[:12]}…）: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                return
+            if msg:
+                try:
+                    client.turn_steer(thread_id, turn_id, msg)
+                    print("  [OK] 已注入，不打断当前 turn")
+                except (WSClose, WSProtocolError) as e:
+                    print(f"  [出错] {e}")
+        elif s == "3":
+            turns = client.thread_turns(thread_id)
+            active = [t for t in turns if t.get("status") == "inProgress"]
+            if not active:
+                print("  当前没有进行中的 turn，无需打断。")
+                continue
+            turn_id = active[0].get("id")
+            try:
+                client.turn_interrupt(thread_id, turn_id)
+                print("  [OK] 已打断")
+            except (WSClose, WSProtocolError) as e:
+                print(f"  [出错] {e}")
+        elif s == "4":
+            thread = client.thread_read(thread_id)
+            print("  " + _fmt_thread(thread))
+            for t in client.thread_turns(thread_id):
+                print(f"    - turn {t.get('id','')[:12]} status={t.get('status','')}")
+        else:
+            print("  无效选择，请重试")
+
+
+def menu(args):
+    """主菜单：像 multi-model.py 一样直接交互使用。"""
+    print("\n" + "=" * 56)
+    print("  远程 Codex 客户端 (codex-remote-cli)")
+    print("=" * 56)
+    print(f"  服务器: {args.host}:{args.port}  (WS token 已内置)")
+    print("  1. 新建会话并发消息")
+    print("  2. 进入已有会话（发消息 / 中途改方向 / 打断）")
+    print("  3. 列出远程会话")
+    print("  4. 切换模型（写远程 config）")
+    print("  5. 查看 server 信息")
+    print("  0. 退出")
+    print("=" * 56)
+
+    client = CodexRemote(args.host, args.port, args.token)
+    try:
+        client.connect()
+    except (OSError, WSProtocolError) as e:
+        print(f"[连接失败] {e}", file=sys.stderr)
+        return
+    client._on_stream = StreamPrinter(quiet=False, json_out=False).on_stream
+
+    try:
+        while True:
+            try:
+                s = input("  请选择 [1/2/3/4/5/0]: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print("\n再见")
+                return
+            if s == "0":
+                print("再见")
+                return
+            if s == "1":
+                try:
+                    cwd = input("  远程工作目录 [/opt/codex]: ").strip() or "/opt/codex"
+                    msg = input("  消息: ").strip()
+                except (EOFError, KeyboardInterrupt):
+                    return
+                cwd = _fix_msys_cwd(cwd)
+                if not msg:
+                    print("  消息为空")
+                    continue
+                try:
+                    r = client.thread_start(cwd)
+                    tid = r.get("thread", {}).get("id", "")
+                    print(f"[OK] 会话已创建: {tid}")
+                    client.run_turn(tid, msg, timeout=args.timeout)
+                except (WSClose, WSProtocolError, TimeoutError) as e:
+                    print(f"  [出错] {e}")
+            elif s == "2":
+                _menu_chat(client, args)
+            elif s == "3":
+                threads = client.list_threads()
+                print(f"共 {len(threads)} 个会话:")
+                for t in threads:
+                    print("  " + _fmt_thread(t))
+            elif s == "4":
+                try:
+                    m = input("  模型假名 [gpt-5.6-luna]: ").strip() or "gpt-5.6-luna"
+                except (EOFError, KeyboardInterrupt):
+                    return
+                try:
+                    client.model_set(m)
+                    print(f"[OK] 模型已写为 {m}（影响之后新建的 turn）")
+                except (WSClose, WSProtocolError) as e:
+                    print(f"  [出错] {e}")
+            elif s == "5":
+                print(json.dumps(client.server_info, ensure_ascii=False, indent=2))
+            else:
+                print("  无效选择，请重试")
+    finally:
+        client.close()
 
 
 def main(argv=None) -> int:
@@ -604,7 +797,7 @@ def main(argv=None) -> int:
     token = args.token if args.token is not None else cfg["token"]
 
     if not args.cmd:
-        ap.print_help()
+        menu(args)
         return 0
 
     # 建立连接
@@ -648,7 +841,8 @@ def main(argv=None) -> int:
             return 0
 
         if args.cmd == "start":
-            r = client.thread_start(args.cwd, model=args.model,
+            cwd = _fix_msys_cwd(args.cwd)
+            r = client.thread_start(cwd, model=args.model,
                                     ephemeral=args.ephemeral)
             thread = r.get("thread", {})
             tid = thread.get("id", "")
