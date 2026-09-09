@@ -38,16 +38,15 @@
   黑名单拦截；阶段边界状态原子落盘支持 `--resume`；`auto` 无人值守循环跑。
 - `--engine codex` 可把写码阶段委托给本地 codex CLI。
 
-### 4. 接入面：panel / MCP / 远程 / allin
+### 4. 接入面：MCP / 远程 / allin
 
-- `panel.py`：Tk 图形面板包 multi-model。
 - `mcp_server.py`：MCP stdio server，8 个工具已定义（multi_ask / multi_list_models /
   multi_team_start / multi_orchestrate_start / multi_parallel_start / multi_task_status /
   multi_task_result / multi_ping），但 `tools/call` 尚未实现（T7 占位错误）。
 - `codex-remote-cli.py`：纯标准库 WebSocket JSON-RPC 客户端连远程 app-server。
 - `win-code.py`：本地/远程 Codex 启动器，含旧版 `PROFILES` 表（真名 glm/kimi/deepseek）。
 - `remote-multi.py`：SSH(paramiko) 到服务器跑 multi-model.py。
-- `allin.py`：拉起 proxy.py + 等认证 + 转发给 multi-model/panel。
+- `allin.py`：拉起 proxy.py + 等认证 + 转发给 multi-model。
 - 服务器侧 `codex-tm.py`：tmux 一场景一模型管理。
 
 ---
@@ -71,7 +70,7 @@
 
 ```text
 ┌────────────────────────────────────────────────────────────┐
-│ 接入面  codex CLI / Claude / panel.py / MCP server / 远程  │
+│ 接入面  codex CLI / Claude / MCP server / 远程  │
 ├────────────────────────────────────────────────────────────┤
 │ 编排层  multi-model.py（角色→任务，路由→模型）             │
 ├────────────────────────────────────────────────────────────┤
@@ -139,11 +138,11 @@
 - **失败降级链**：`call()` 层加 per-model 降级表（如 luna 失败→sol-fast），
   错误分类（429/5xx/超时）触发不同降级策略，全部记入 stage_errors。
 
-### P2：共用计费与审计 + 面板升级
+### P2：共用计费与审计
 
 - 编排层加统一用量采集（每模型 token/延迟/成本），落 `~/.multi-model/usage.jsonl`，
   `multi_list_models` 增补健康度与成本字段。
-- `panel.py` 加模型健康/成本视图；远程 dashboard 接入同一审计流。
+- 远程 dashboard 接入同一审计流。
 - 与父目录 AIGX 路线图（P0 计费预扣、P1 成本看板）对齐，网关侧保留 request id 链路。
 
 ---

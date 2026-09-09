@@ -516,10 +516,13 @@ python deploy_ai_cli.py --force
 ### 基本用法
 
 ```bash
+python codex-remote-cli.py                              # 交互式菜单（推荐，像 multi-model.py）
 python codex-remote-cli.py list                          # 列出远程会话
 python codex-remote-cli.py info                          # 远程 server 信息
 python codex-remote-cli.py model                         # 列出远程可用模型
-python codex-remote-cli.py model set gpt-6-astra         # 切模型（写远程 config）
+python codex-remote-cli.py model set gpt-6-astra         # 切模型档位（写 model + effort）
+python codex-remote-cli.py model set astra               # 支持别名
+python codex-remote-cli.py model set 2                   # 支持档位号（2 = astra + high）
 python codex-remote-cli.py start --cwd /opt/Codex "任务" # 新建会话 + 首条消息
 python codex-remote-cli.py send --thread <id> "追加"      # 空闲会话追加消息
 python codex-remote-cli.py read --thread <id>            # 读会话元数据
@@ -528,6 +531,41 @@ python codex-remote-cli.py items --thread <id> [--turn <id>]  # 列 items
 
 凭据优先级：`--token` > 环境变量 `CODEX_WS_TOKEN` > `codex-remote-config.json` 的 token。
 连接地址优先级：`--host`/`--port` > `CODEX_WS_HOST`/`CODEX_WS_PORT` > config 文件。
+
+### 交互式菜单（数字面板）
+
+直接 `python codex-remote-cli.py`（不带子命令）进入数字面板，布局对齐 multi-model.py：
+
+```
+  服务器: 104.223.65.202:10130  (WS token 已内置)
+  1. 新建会话并发消息（推荐）
+  2. 进入已有会话（发消息 / 中途改方向 / 打断）
+  3. 列出远程会话
+  4. 切换模型档位（写远程 config，自动带 effort）
+  5. 查看 server 信息
+  6. 本地多模型团队流水线（multi-model）
+  0. 退出
+```
+
+- 选项 6 复用同目录 `multi-model.py` 的 `team()` 团队流水线（分析 → 并行写码 → 审查迭代），本地跑，不经过远程 codex。
+- 服务器信息已内置硬编码，`python codex-remote-cli.py` 开箱即用；仍可用 `.env` / 环境变量 / config 文件覆盖。
+
+### 模型档位（model + effort 绑定）
+
+选项 4 和 `model set` 都走「档位」而非裸模型名，切档位同时写 `model` 和 `model_reasoning_effort`：
+
+| 档位号 | 模型假名 | effort | 说明 |
+|-------|---------|--------|------|
+| 1 | gpt-5.6-luna | high | 写码主力（默认） |
+| 2 | gpt-6-astra | high | 旗舰推理 |
+| 3 | gpt-5.6-sol | medium | 深度分析 |
+| 4 | gpt-5.6-luna-fast | low | 快速 |
+| 5 | gpt-5.6-sol-fast | low | 最快 |
+| 6 | gpt-5.6-terra | medium | 均衡 |
+
+别名：`astra` / `sol` / `luna` / `sol-fast` / `luna-fast` / `terra`。
+
+> **effort 只用 low / medium / high / max，不要用 ultra / xhigh**：上游网关（cfapi）对 `reasoning.ultra` 和 `reasoning.xhigh` 直接返回 `invalid_request_error`（数据不合法），会导致 turn 直接 `failed`。实测 6 个模型在 `low/medium/high/max` 全通过，`ultra` 全被拒。
 
 ### ★ 中途介入：不打断 vs 打断（重点）
 
@@ -552,6 +590,7 @@ python codex-remote-cli.py interrupt --thread <id> --turn <id>
 
 ### 模型切换语义
 
-- `model set` 走协议 `config/value/write`（写远程 `config.toml` 的 `model` 字段），**不重启服务**，只影响之后新建的 turn。
+- `model set` 走协议 `config/value/write`（写远程 `config.toml` 的 `model` 和 `model_reasoning_effort` 字段），**不重启服务**，只影响之后新建的 turn。
+- `model set` 现在写**两个字段**：`model` + `model_reasoning_effort`（档位绑定）。传档位号/别名会自动带安全 effort；传裸模型名则只写 `model`（不动 effort）。
 - 若远程环境需要「改写配置 + 重启 app-server」的切换方式，可改用同目录 `remote-model.py`（SSH 调用）。
 - 给**单个会话/单次 turn** 指定模型：`start` / `send` / `steer` 均支持 `--model <假名>` 覆盖。

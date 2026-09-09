@@ -20,7 +20,9 @@ codex-remote-cli.py — 远程 Codex app-server 命令行客户端（零依赖�
     python codex-remote-cli.py list                         # 列出远程会话
     python codex-remote-cli.py info                         # 远程 server 信息
     python codex-remote-cli.py model                        # 列出可用模型
-    python codex-remote-cli.py model set gpt-6-astra        # 切模型（写 config）
+    python codex-remote-cli.py model set gpt-6-astra        # 切模型档位（写 model + effort）
+    python codex-remote-cli.py model set astra              # 支持别名
+    python codex-remote-cli.py model set 2                  # 支持档位号（2=astra+high）
     python codex-remote-cli.py start --cwd /opt/Codex "任务描述"
     python codex-remote-cli.py send --thread <id> "追加消息"
     python codex-remote-cli.py steer --thread <id> --turn <id> "中途改方向"
@@ -477,10 +479,24 @@ class CodexRemote:
         return self._request("model/list",
                              {"includeHidden": include_hidden}).get("data", [])
 
-    def model_set(self, model: str) -> dict:
+    def config_write(self, key_path: str, value, merge_strategy: str = "replace") -> dict:
         return self._request("config/value/write", {
-            "keyPath": "model", "value": model, "mergeStrategy": "replace",
+            "keyPath": key_path, "value": value, "mergeStrategy": merge_strategy,
         })
+
+    def model_set(self, model: str) -> dict:
+        return self.config_write("model", model)
+
+    def set_profile(self, model: str, effort: str = None) -> dict:
+        """切模型档位：写 model（可选一并写 model_reasoning_effort）。
+
+        effort 用 low/medium/high/max（避开 ultra/xhigh，上游网关不支持）。
+        返回最后一次 config 写入结果。
+        """
+        r = self.config_write("model", model)
+        if effort:
+            r = self.config_write("model_reasoning_effort", effort)
+        return r
 
     def config_read(self) -> dict:
         return self._request("config/read", {"includeLayers": True})
@@ -608,6 +624,59 @@ class StreamPrinter:
 
 
 # --------------------------------------------------------------------------- #
+# 模型档位（整合 multi-model.py 的角色 + remote-model.py 的 (model, effort)）
+# --------------------------------------------------------------------------- #
+# 档位 -> (模型假名, reasoning effort, 说明)。effort 只用上游网关支持的
+# low/medium/high/max；ultra/xhigh 网关会拒（已实测 astra 因此挂掉）。
+MODEL_PROFILES = {
+    "1": ("gpt-5.6-luna",      "high",   "写码主力（默认）"),
+    "2": ("gpt-6-astra",       "high",   "旗舰推理"),
+    "3": ("gpt-5.6-sol",       "medium", "深度分析"),
+    "4": ("gpt-5.6-luna-fast", "low",    "快速"),
+    "5": ("gpt-5.6-sol-fast",  "low",    "最快"),
+    "6": ("gpt-5.6-terra",     "medium", "均衡"),
+}
+
+MODEL_ALIASES = {
+    "astra": "gpt-6-astra",
+    "sol": "gpt-5.6-sol",
+    "luna": "gpt-5.6-luna",
+    "sol-fast": "gpt-5.6-sol-fast",
+    "luna-fast": "gpt-5.6-luna-fast",
+    "terra": "gpt-5.6-terra",
+}
+
+
+def _resolve_model(name: str) -> str:
+    """档位号/别名 -> 模型假名；未知输入原样返回。"""
+    name = (name or "").strip()
+    if name in MODEL_PROFILES:
+        return MODEL_PROFILES[name][0]
+    return MODEL_ALIASES.get(name, name)
+
+
+def _pick_model(menu_title: str) -> str:
+    """数字选模型（带 effort 档位），返回模型假名；0 返回空串。"""
+    while True:
+        print(f"\n  [{menu_title}] 选择模型档位:")
+        for k in ("1", "2", "3", "4", "5", "6"):
+            model, effort, label = MODEL_PROFILES[k]
+            print(f"    {k}. {model:20s} effort={effort:7s} {label}")
+        print("    0. 返回")
+        try:
+            s = input("  选择 [1-6，回车=1]: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            return ""
+        if s == "0":
+            return ""
+        if s == "":
+            s = "1"
+        if s in MODEL_PROFILES:
+            return MODEL_PROFILES[s][0]
+        print("  无效选择，请重试")
+
+
+# --------------------------------------------------------------------------- #
 # 交互式菜单
 # --------------------------------------------------------------------------- #
 def _select_thread(client: CodexRemote) -> str:
@@ -697,17 +766,46 @@ def _menu_chat(client: CodexRemote, args):
             print("  无效选择，请重试")
 
 
+def _menu_local_team():
+    """本地多模型团队流水线（复用 multi-model.py 的 team()）。"""
+    try:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "multi_model", os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                        "multi-model.py"))
+        mm = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mm)
+    except Exception as e:
+        print(f"  无法加载 multi-model.py: {e}", file=sys.stderr)
+        return
+    print("\n  [本地多模型团队模式] 输入任务，多模型并行写文件 + 审查迭代。")
+    print("  输入 0 返回主菜单。")
+    try:
+        task = input("  任务: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        return
+    if task == "0" or not task:
+        return
+    try:
+        mm.team(task)
+    except KeyboardInterrupt:
+        print("\n  已取消")
+    except Exception as e:
+        print(f"\n  出错: {e}")
+
+
 def menu(args):
     """主菜单：像 multi-model.py 一样直接交互使用。"""
     print("\n" + "=" * 56)
     print("  远程 Codex 客户端 (codex-remote-cli)")
     print("=" * 56)
     print(f"  服务器: {args.host}:{args.port}  (WS token 已内置)")
-    print("  1. 新建会话并发消息")
+    print("  1. 新建会话并发消息（推荐）")
     print("  2. 进入已有会话（发消息 / 中途改方向 / 打断）")
     print("  3. 列出远程会话")
-    print("  4. 切换模型（写远程 config）")
+    print("  4. 切换模型档位（写远程 config，自动带 effort）")
     print("  5. 查看 server 信息")
+    print("  6. 本地多模型团队流水线（multi-model）")
     print("  0. 退出")
     print("=" * 56)
 
@@ -722,7 +820,7 @@ def menu(args):
     try:
         while True:
             try:
-                s = input("  请选择 [1/2/3/4/5/0]: ").strip()
+                s = input("  请选择 [1/2/3/4/5/6/0]: ").strip()
             except (EOFError, KeyboardInterrupt):
                 print("\n再见")
                 return
@@ -754,17 +852,20 @@ def menu(args):
                 for t in threads:
                     print("  " + _fmt_thread(t))
             elif s == "4":
+                m = _pick_model("切换模型")
+                if not m:
+                    continue
+                effort = next(v[1] for k, v in MODEL_PROFILES.items() if v[0] == m)
                 try:
-                    m = input("  模型假名 [gpt-5.6-luna]: ").strip() or "gpt-5.6-luna"
-                except (EOFError, KeyboardInterrupt):
-                    return
-                try:
-                    client.model_set(m)
-                    print(f"[OK] 模型已写为 {m}（影响之后新建的 turn）")
+                    client.set_profile(m, effort)
+                    print(f"[OK] 模型已切为 {m}，reasoning_effort={effort}"
+                          f"（影响之后新建的 turn）")
                 except (WSClose, WSProtocolError) as e:
                     print(f"  [出错] {e}")
             elif s == "5":
                 print(json.dumps(client.server_info, ensure_ascii=False, indent=2))
+            elif s == "6":
+                _menu_local_team()
             else:
                 print("  无效选择，请重试")
     finally:
@@ -821,9 +922,9 @@ def main(argv=None) -> int:
     p_items.add_argument("--thread", required=True)
     p_items.add_argument("--turn", dest="turn_id", default=None)
 
-    p_model = sub.add_parser("model", help="列出可用模型")
+    p_model = sub.add_parser("model", help="列出可用模型 / 切换模型档位")
     p_model.add_argument("action", nargs="?", choices=["list", "set"], default="list")
-    p_model.add_argument("value", nargs="?")
+    p_model.add_argument("value", nargs="?", help="模型假名/别名/档位号，如 gpt-6-astra、astra、2")
 
     args = ap.parse_args(argv)
 
@@ -833,6 +934,9 @@ def main(argv=None) -> int:
     token = args.token if args.token is not None else cfg["token"]
 
     if not args.cmd:
+        args.host = host
+        args.port = port
+        args.token = token
         menu(args)
         return 0
 
@@ -864,8 +968,12 @@ def main(argv=None) -> int:
                 if not args.value:
                     print("请提供模型名: model set <name>", file=sys.stderr)
                     return 2
-                r = client.model_set(args.value)
-                print(f"[OK] 模型已写为 {args.value}")
+                model = _resolve_model(args.value)
+                effort = next((v[1] for v in MODEL_PROFILES.values() if v[0] == model),
+                              None)
+                client.set_profile(model, effort)
+                print(f"[OK] 模型已切为 {model}"
+                      + (f"，reasoning_effort={effort}" if effort else ""))
                 return 0
             models = client.model_list()
             print("可用模型:")

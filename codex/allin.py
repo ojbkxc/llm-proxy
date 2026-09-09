@@ -3,10 +3,9 @@
 """
 allin.py — 一键入口：同目录调用 proxy.py + 自动认证 + 多模型共用
 
-不需要 pip 装任何东西，只依赖 Python 标准库 + 同目录三个文件：
+不需要 pip 装任何东西，只依赖 Python 标准库 + 同目录两个文件：
     proxy.py        本地 8787 代理（认证复用 Workspace 登录态，token 挂了自动开浏览器）
     multi-model.py  多模型协作引擎（gpt-* 假名，网关层转发，直连代理）
-    panel.py        图形面板（可选）
 
 allin.py 负责把流程串起来：
     1. 检查 8787 有没有代理在跑，没有就后台拉起 proxy.py
@@ -16,7 +15,6 @@ allin.py 负责把流程串起来：
 
 用法:
     python allin.py                      # 起代理+等认证 → 多模型数字菜单
-    python allin.py --panel              # 起代理+等认证 → 图形面板
     python allin.py --auto "任务" --hours 24   # 起代理+等认证 → 无人值守连跑
     python allin.py team "任务"          # 起代理+等认证 → 直接跑一次 team
     python allin.py ask luna "问题"      # 起代理+等认证 → 单模型问答
@@ -49,7 +47,6 @@ if sys.platform == "win32":
 HERE = os.path.dirname(os.path.abspath(__file__))
 PROXY_PY = os.path.join(HERE, "proxy.py")
 MULTI_PY = os.path.join(HERE, "multi-model.py")
-PANEL_PY = os.path.join(HERE, "panel.py")
 PORT = int(os.environ.get("WS_PROXY_PORT", "8787"))
 HEALTH_URL = "http://127.0.0.1:%d/health" % PORT
 
@@ -128,14 +125,11 @@ def wait_proxy_ready(timeout=600):
 def main():
     args = sys.argv[1:]
 
-    # --panel / --auto 是 allin 自己的开关，其余透传给 multi-model.py
-    panel = False
+    # --auto 是 allin 自己的开关，其余透传给 multi-model.py
     auto = False
     rest = []
     for a in args:
-        if a == "--panel":
-            panel = True
-        elif a == "--auto":
+        if a == "--auto":
             auto = True
         else:
             rest.append(a)
@@ -144,10 +138,6 @@ def main():
         sys.exit(1)
     if not wait_proxy_ready():
         sys.exit(2)
-
-    if panel:
-        print("[allin] 认证就绪，打开图形面板...\n")
-        sys.exit(subprocess.call([sys.executable, PANEL_PY]))
 
     # --auto: 转成 multi-model.py auto 子命令
     if auto:

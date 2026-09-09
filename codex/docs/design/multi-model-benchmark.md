@@ -100,8 +100,7 @@
   调度多模型团队；MCP 工具加 `multi_usage` 汇报成本。
 - **P1**：远程 app-server 也指向同一 `models.json`/网关，`codex-tm.py` 场景
   改按 profile 启动，消灭「一场景一模型」的旧模式。
-- **P1**：agentops 式观测：统一 `usage.jsonl`（每模型 token/延迟/成本/错误），
-  panel.py 画简单看板。
+- **P1**：agentops 式观测：统一 `usage.jsonl`（每模型 token/延迟/成本/错误）。
 
 ### 4. 计费/观测（对照父目录 AIGX roadmap）
 
