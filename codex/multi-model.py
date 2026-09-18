@@ -132,7 +132,7 @@ ALIASES = {
 
 
 WORKDIR = os.getcwd()
-ALLOW_RUN = True
+ALLOW_RUN = False
 
 # 线程局部工作目录：team/auto 在各自线程内设置，避免并发任务串目录。
 # 未设置时回退到模块级 WORKDIR（CLI 单线程直接运行时的默认值）。
@@ -1286,7 +1286,18 @@ def team(task, max_rounds=3, state=None, allow_risky=None, workdir=None, max_tok
             return _stop_budget()
         print("\n[2/5] 写码：多模型并行分文件落地...")
         file_paths = [f.get("path") for f in design.get("files", []) if isinstance(f, dict)]
-        if file_paths:
+        # 判断设计稿是否明确说"无需修改/新增文件"——是则跳过写码阶段
+        plan_raw = design.get("plan") or ""
+        plan_text = (json.dumps(plan_raw, ensure_ascii=False) if not isinstance(plan_raw, str) else plan_raw).lower()
+        skip_keywords = ("无需修改", "无需新增", "不需要修改", "不需要新增",
+                         "无代码变更", "不触发代码", "不涉及代码", "无需写码",
+                         "无需新建", "已存在", "no code change", "no modification")
+        should_skip = (not file_paths) or any(kw in plan_text for kw in skip_keywords)
+        if should_skip:
+            print("  设计稿判定无需写码（无文件清单或明确声明不修改），跳过写码阶段。")
+            impl_files = []
+            impl_txt = "设计稿判定无需写码，跳过。"
+        elif file_paths:
             impl_files, impl_txt = _parallel_implement(file_paths, design, ar, wd)
         else:
             # 设计稿没给文件清单：退回单一写码模型自主规划
@@ -1454,10 +1465,13 @@ def menu():
         print(gw_line)
         print("  1. 多模型团队模式（推荐）")
         print("  2. 单模型模式")
+        print("  3. 指挥官编排（拆解+并行分发+汇总）")
+        print("  4. 多模型同问对比")
+        print("  5. 列出可用模型")
         print("  0. 退出")
         print("=" * 56)
         try:
-            s = input("  请选择 [1/2/0，回车=1]: ").strip()
+            s = input("  请选择 [1/2/3/4/5/0，回车=1]: ").strip()
         except (EOFError, KeyboardInterrupt):
             print("\n退出")
             return
@@ -1465,6 +1479,12 @@ def menu():
             _menu_team()
         elif s == "2":
             _menu_ask()
+        elif s == "3":
+            _menu_orchestrate()
+        elif s == "4":
+            _menu_parallel()
+        elif s == "5":
+            list_models()
         elif s == "0":
             print("再见")
             return
@@ -1531,14 +1551,57 @@ def _menu_ask():
             print(f"\n  出错: {e}")
 
 
+def _menu_orchestrate():
+    """指挥官编排：拆解任务 → 并行分发 → 汇总。"""
+    print("\n  [指挥官编排] 输入任务，指挥官拆解后并行分发给各角色执行并汇总。")
+    print("  输入 0 返回主菜单。")
+    try:
+        task = input("  任务: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        return
+    if task == "0" or not task:
+        return
+    try:
+        orchestrate(task)
+    except KeyboardInterrupt:
+        print("\n  已取消")
+    except Exception as e:
+        print(f"\n  出错: {e}")
+
+
+def _menu_parallel():
+    """多模型同问对比：同一问题发给所有模型，对比回答。"""
+    print("\n  [多模型同问对比] 输入问题，所有模型同时回答，对比差异。")
+    print("  输入 0 返回主菜单。")
+    try:
+        prompt = input("  问题: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        return
+    if prompt == "0" or not prompt:
+        return
+    try:
+        results = parallel(prompt)
+        print("\n" + "=" * 56)
+        for model, answer in results.items():
+            print(f"\n【{model}】")
+            print(answer[:800])
+            if len(answer) > 800:
+                print("...[截断]")
+        print("\n" + "=" * 56)
+    except KeyboardInterrupt:
+        print("\n  已取消")
+    except Exception as e:
+        print(f"\n  出错: {e}")
+
+
 def main():
     global WORKDIR, ALLOW_RUN
     ap = argparse.ArgumentParser(description="多模型协作编排器")
     ap.add_argument("--api-key", default=None, help="覆盖 API Key")
     ap.add_argument("--workdir", default=None, help="工作目录（团队读写文件限定在此）")
     ap.add_argument("--no-run", action="store_true", help="禁用 run_command 工具")
-    ap.add_argument("--allow-risky", action="store_true", default=True,
-                    help="放行命中危险命令黑名单的 run_command（默认全通过；用 --no-allow-risky 拦截）")
+    ap.add_argument("--allow-risky", action="store_true", default=False,
+                    help="放行命中危险命令黑名单的 run_command（默认拦截；用 --allow-risky 放行）")
     ap.add_argument("--no-allow-risky", action="store_false", dest="allow_risky",
                     help="拦截命中危险命令黑名单的 run_command")
     sub = ap.add_subparsers(dest="action")
