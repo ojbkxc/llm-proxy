@@ -14,8 +14,8 @@
 
 | 网关 | 地址 | 说明 |
 |------|------|------|
-| **cfapi 云网关** | `https://cfapi.1232333.xyz/v1` | 远程 CF 网关，假名原生支持 |
-| **ws-proxy 本地** | `http://127.0.0.1:8787/v1` | `D:\GitHub\llm-proxy\proxy.py`，认证复用 Workspace 编辑器登录态，需保持 `python -X utf8 proxy.py` 常驻运行 |
+| **ws-proxy 本地**（主用） | `http://127.0.0.1:8787/v1` | `D:\GitHub\llm-proxy\proxy.py`，认证复用 Workspace 编辑器登录态，需保持 `python -X utf8 proxy.py` 常驻运行 |
+| **cfapi 云网关**（备选） | `https://cfapi.1232333.xyz/v1` | 远程 CF 网关，假名原生支持；当前被 Cloudflare 反爬拦截(1010)/上游 500，仅作降级备选 |
 
 五个假名在两网关的映射（脚本只发假名，映射由网关自己做）：
 
@@ -27,7 +27,10 @@
 | `gpt-5.6-sol` | 深度推理 | aliyun-glm-5.2 |
 | `gpt-5.6-sol-fast` | 最快 | qwen3.7-plus |
 
-> 换网关示例：打开 `deploy_ai_cli.py`，把 `DEFAULT_BASE_URL = "https://cfapi.1232333.xyz/v1"` 改成 `http://127.0.0.1:8787/v1`，重跑部署（或临时 `--base-url http://127.0.0.1:8787/v1`）。
+> `gpt-5.6-terra` 仅在 codex-remote-cli.py 的档位表里保留（cfapi 声称支持），本地 ws-proxy 代理当前没有对应上游，实际不可用。
+
+> 当前默认配置：`.env` 里 `BASE_URL=http://127.0.0.1:8787/v1`（本地主用），`BASE_FALLBACK=https://cfapi.1232333.xyz/v1`（备选）。
+> 换网关：改 `.env` 的 `BASE_URL` 即可，multi-model.py 和 codex-remote-cli.py 都读 `.env`。
 > ws-proxy 附带合规层：违规词 403、密码/密钥/手机号等自动脱敏转发；本地不校验 API Key。
 > ws-proxy 只暴露部分模型：`hw-glm-5` / `qwen3.8-max` / `qwen3.7-plus` 仅本地网关可用，cfapi 无对应上游。
 
@@ -547,7 +550,8 @@ python codex-remote-cli.py items --thread <id> [--turn <id>]  # 列 items
   0. 退出
 ```
 
-- 选项 6 复用同目录 `multi-model.py` 的 `team()` 团队流水线（分析 → 并行写码 → 审查迭代），本地跑，不经过远程 codex。
+- 选项 6 复用同目录 `multi-model.py` 的 `team()` 团队流水线（分析 → 并行写码 → 审查迭代），本地跑，不经过远程 codex，**不需要远程 WS 连接**（远程不可达时也能用）。
+- 选项 1-5 才需要远程 WS 连接，连接在首次选择时延迟建立（连不上不影响选项 6）。
 - 服务器信息已内置硬编码，`python codex-remote-cli.py` 开箱即用；仍可用 `.env` / 环境变量 / config 文件覆盖。
 
 ### 模型档位（model + effort 绑定）

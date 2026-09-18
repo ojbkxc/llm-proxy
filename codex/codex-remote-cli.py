@@ -809,13 +809,23 @@ def menu(args):
     print("  0. 退出")
     print("=" * 56)
 
-    client = CodexRemote(args.host, args.port, args.token)
-    try:
-        client.connect()
-    except (OSError, WSProtocolError) as e:
-        print(f"[连接失败] {e}", file=sys.stderr)
-        return
-    client._on_stream = StreamPrinter(quiet=False, json_out=False).on_stream
+    client = None
+    _stream_printer = StreamPrinter(quiet=False, json_out=False)
+
+    def _ensure_connected():
+        """延迟连接：选项 6（本地团队）不需要远程 WS，跳过连接。"""
+        nonlocal client
+        if client is not None:
+            return client
+        client = CodexRemote(args.host, args.port, args.token)
+        try:
+            client.connect()
+        except (OSError, WSProtocolError) as e:
+            print(f"[连接失败] {e}", file=sys.stderr)
+            client = None
+            return None
+        client._on_stream = _stream_printer.on_stream
+        return client
 
     try:
         while True:
@@ -827,6 +837,13 @@ def menu(args):
             if s == "0":
                 print("再见")
                 return
+            if s == "6":
+                _menu_local_team()
+                continue
+            # 选项 1-5 需要远程连接
+            c = _ensure_connected()
+            if c is None:
+                continue
             if s == "1":
                 try:
                     cwd = input("  远程工作目录 [/opt/codex]: ").strip() or "/opt/codex"
@@ -838,16 +855,16 @@ def menu(args):
                     print("  消息为空")
                     continue
                 try:
-                    r = client.thread_start(cwd)
+                    r = c.thread_start(cwd)
                     tid = r.get("thread", {}).get("id", "")
                     print(f"[OK] 会话已创建: {tid}")
-                    client.run_turn(tid, msg, timeout=args.timeout)
+                    c.run_turn(tid, msg, timeout=args.timeout)
                 except (WSClose, WSProtocolError, TimeoutError) as e:
                     print(f"  [出错] {e}")
             elif s == "2":
-                _menu_chat(client, args)
+                _menu_chat(c, args)
             elif s == "3":
-                threads = client.list_threads()
+                threads = c.list_threads()
                 print(f"共 {len(threads)} 个会话:")
                 for t in threads:
                     print("  " + _fmt_thread(t))
@@ -857,19 +874,18 @@ def menu(args):
                     continue
                 effort = next(v[1] for k, v in MODEL_PROFILES.items() if v[0] == m)
                 try:
-                    client.set_profile(m, effort)
+                    c.set_profile(m, effort)
                     print(f"[OK] 模型已切为 {m}，reasoning_effort={effort}"
                           f"（影响之后新建的 turn）")
                 except (WSClose, WSProtocolError) as e:
                     print(f"  [出错] {e}")
             elif s == "5":
-                print(json.dumps(client.server_info, ensure_ascii=False, indent=2))
-            elif s == "6":
-                _menu_local_team()
+                print(json.dumps(c.server_info, ensure_ascii=False, indent=2))
             else:
                 print("  无效选择，请重试")
     finally:
-        client.close()
+        if client is not None:
+            client.close()
 
 
 def main(argv=None) -> int:
