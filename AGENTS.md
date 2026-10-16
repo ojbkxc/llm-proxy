@@ -35,6 +35,12 @@
 | `audit_redact.jsonl` | 脱敏原文审计（敏感，勿外传） |
 | `audit_pass.jsonl` | 放行请求元信息审计 |
 | `proxy.log` | 运行日志 |
+| `qoder_proxy.py` | 阿里 Qoder CN 代理（约 1642 行）：三协议转换、凭证抓取（DPAPI+AES-GCM）、自动续期、跨机迁移 |
+| `qoder_credentials.json` | qoder_proxy 凭证包（--capture/--import 生成，含 token/refreshToken） |
 
 > 自动续期相关函数：`_load_session_from_db` / `_write_session_row` / `_refresh_token_via_refresh` /
 > `_refresh_session_locked` / `_read_session`。`REFRESH_AHEAD_SEC = 3600` 为临期阈值。
+>
+> `qoder_proxy.py` 续期相关函数：`_do_refresh`（调 deviceToken/refresh，带 machine_token 失败降级重试）/
+> `_refresh_token`（并发去重 + 持久化写回 qoder_credentials.json）/ `_read_session`（缓存 60s + 临期触发）。
+> `REFRESH_AHEAD_SEC = 3600`，refresh token 有效期约 1 年。
