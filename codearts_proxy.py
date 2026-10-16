@@ -8,8 +8,10 @@ CodeArts Agent (华为) 官方模型本地代理 - 纯 Python 标准库 + crypto
   Anthropic 兼容 POST /v1/messages、POST /v1/messages/count_tokens
   健康检查       GET /health
 
-模型（实测可用）：
-  GLM-5.2 / glm-5.2-sft-harmony / openpangu-2.0-pro / openpangu-2.0-flash
+模型（实测可用，2026-10-16 客户端 26.9.501 内核日志 + 上游实测）：
+  GLM-5.2 / glm-5.2-sft-harmony / glm-5.3 / openpangu-2.0-pro / openpangu-2.0-flash
+  （官方清单还挂了 glm-5.3-flash / deepseek-v4 系列，实测 404 未注册或持续 TPM 限流，未纳入）
+  glm-5.3 上游仅支持流式：非流式请求由本代理内部转流式再聚合，对客户端透明。
 
 认证完全复用 CodeArts Agent 客户端的登录态：
   凭证（AK/SK/securitytoken）从客户端的 state.vscdb 解出
@@ -96,19 +98,23 @@ SESSION_KEY = 'secret://{"extensionId":"huaweicloud.authentication","key":"Huawe
 # 上游（与内核 INFERHUB_BASE_URLS 一致，主用 .com 备用 .cn）
 UPSTREAM = "https://snap-access.cn-north-4.myhuaweicloud.com/api/v2/chat/completions"
 
-# 模型清单（内核日志实测：模型 id 与上下文窗口）
-# max_tokens = 上游对 input+output 总 token 的硬限（超限返回 limit_err，实测值）
-# ctx = 上下文窗口（/v1/models 暴露给客户端，通常 ≥ max_tokens）
+# 模型清单（2026-10-16 内核日志 "provider models update body" + 上游实测）
+# ctx = 官方 context 窗口（/v1/models 暴露给客户端）
+# max_tokens = 上游 RANGE_VALIDATOR 对 max_tokens 参数的上限（统一 65536，超限直接 400）
+# limit_err = input+output 总 token 超上游硬限时的错误码（超限返回 413 提示）
+# stream_only = 上游仅支持流式路由（非流式请求代理内部转流式再聚合）
 MODELS = {
-    "GLM-5.2":              {"name": "GLM-5.2",           "ctx": 307200, "max_tokens": 307200, "limit_err": 81027, "desc": "最新旗舰模型，专为长程任务打造"},
-    "glm-5.2-sft-harmony":  {"name": "GLM-5.2-ArkTS-SPARK", "ctx": 196608, "max_tokens": 196608, "limit_err": 81001, "desc": "基于GLM-5.2增训鸿蒙代码与开发知识"},
-    "openpangu-2.0-pro":    {"name": "OpenPangu-2.0-Pro",  "ctx": 512000, "max_tokens": 512000, "limit_err": 81001, "desc": "最新旗舰模型，复杂工程稳定交付"},
-    "openpangu-2.0-flash":  {"name": "OpenPangu-2.0-Flash", "ctx": 512000, "max_tokens": 512000, "limit_err": 81001, "desc": "均衡推理效果与性能"},
+    "GLM-5.2":              {"name": "GLM-5.2",             "ctx": 202752, "max_tokens": 65536, "limit_err": 81027, "desc": "旗舰模型，专为长程任务打造"},
+    "glm-5.2-sft-harmony":  {"name": "GLM-5.2-ArkTS-SPARK", "ctx": 202752, "max_tokens": 65536, "limit_err": 81001, "desc": "基于GLM-5.2增训鸿蒙代码与开发知识"},
+    "glm-5.3":              {"name": "GLM-5.3",             "ctx": 202752, "max_tokens": 65536, "limit_err": 81001, "desc": "最新旗舰模型", "stream_only": True},
+    "openpangu-2.0-pro":    {"name": "OpenPangu-2.0-Pro",   "ctx": 524288, "max_tokens": 65536, "limit_err": 81001, "desc": "最新旗舰模型，复杂工程稳定交付"},
+    "openpangu-2.0-flash":  {"name": "OpenPangu-2.0-Flash", "ctx": 524288, "max_tokens": 65536, "limit_err": 81001, "desc": "均衡推理效果与性能"},
 }
 # 别名 → 真实 model id（想加别名只改这张表）
 MODEL_ALIAS = {
     "glm-5.2": "GLM-5.2",
     "glm-5.2-harmony": "glm-5.2-sft-harmony",
+    "GLM-5.3": "glm-5.3",
     "pangu-pro": "openpangu-2.0-pro",
     "pangu-flash": "openpangu-2.0-flash",
 }
@@ -909,6 +915,81 @@ def _rand():
     return hashlib.md5(os.urandom(8)).hexdigest()[:24]
 
 
+def aggregate_sse(frames, model_id=""):
+    """上游 SSE data 帧 → 标准 chat.completion dict。三种形态：
+      1. 单帧完整 chat.completion（上游非流式伪流式）→ 原样返回
+      2. 多帧 chat.completion.chunk（stream_only 模型内部转流式）→ 聚合
+         content/reasoning_content/tool_calls/finish_reason/usage
+      3. 上游错误帧（{"error_code":...} / {"error":{...}}）→ 加 error 键原样返回，
+         由调用方转成错误响应
+    无有效帧返回 None。"""
+    if not frames:
+        return None
+    try:
+        first_obj = json.loads(frames[0])
+    except Exception:
+        first_obj = None
+    if isinstance(first_obj, dict) and first_obj.get("object") == "chat.completion":
+        return first_obj
+    content, reasoning, tool_calls = [], [], []
+    finish, usage, first, role = None, None, None, "assistant"
+    for f in frames:
+        try:
+            obj = json.loads(f)
+        except Exception:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        if obj.get("error_code") or obj.get("error"):
+            return {"error": obj}
+        if obj.get("object") != "chat.completion.chunk":
+            continue
+        if first is None:
+            first = obj
+        chs = obj.get("choices") or []
+        ch = chs[0] if chs else {}
+        d = ch.get("delta") or {}
+        if d.get("role"):
+            role = d["role"]
+        if d.get("content"):
+            content.append(d["content"])
+        if d.get("reasoning_content"):
+            reasoning.append(d["reasoning_content"])
+        for tc in d.get("tool_calls") or []:
+            idx = tc.get("index", 0)
+            while len(tool_calls) <= idx:
+                tool_calls.append({"id": "", "type": "function", "function": {"name": "", "arguments": ""}})
+            slot = tool_calls[idx]
+            if tc.get("id"):
+                slot["id"] = tc["id"]
+            fn = tc.get("function") or {}
+            if fn.get("name"):
+                slot["function"]["name"] += fn["name"]
+            if fn.get("arguments"):
+                slot["function"]["arguments"] += fn["arguments"]
+        if ch.get("finish_reason"):
+            finish = ch["finish_reason"]
+        if obj.get("usage"):
+            usage = obj["usage"]
+    if first is None:
+        return None
+    msg = {"role": role, "content": "".join(content) or None}
+    if reasoning:
+        msg["reasoning_content"] = "".join(reasoning)
+    if tool_calls:
+        msg["tool_calls"] = tool_calls
+    out = {
+        "id": first.get("id") or ("chatcmpl-" + _rand()),
+        "object": "chat.completion",
+        "created": first.get("created") or int(time.time()),
+        "model": first.get("model") or model_id,
+        "choices": [{"index": 0, "message": msg, "finish_reason": finish or "stop"}],
+    }
+    if usage:
+        out["usage"] = usage
+    return out
+
+
 def convert_responses_to_openai(body: dict) -> dict:
     """/v1/responses 请求体 → OpenAI chat.completions 请求体。"""
     oa = {}
@@ -1673,13 +1754,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
         req["model"] = real
         minfo = MODELS[real]
 
-        # 3a) max_tokens 硬限：客户端若指定 max_tokens 超过上游硬限，直接钳制到硬限，
-        #     避免上游报 limit_err（81027/81001）。不指定则不动（让上游自己按硬限截断）。
+        # 3a) max_tokens 参数上限：客户端若指定 max_tokens 超过上游 RANGE_VALIDATOR
+        #     上限（统一 65536），直接钳制，避免上游 400 参数校验错误。不指定则不动。
         hard_cap = minfo.get("max_tokens")
         if hard_cap and isinstance(req.get("max_tokens"), int) and req["max_tokens"] > hard_cap:
             req["max_tokens"] = hard_cap
 
         is_stream = bool(req.get("stream"))
+
+        # 3b) stream_only 模型（glm-5.3 上游仅支持流式路由，非流式直接 400 空 body）：
+        #     非流式请求内部强制转流式，响应侧聚合回标准 chat.completion，对客户端透明。
+        force_aggregate = bool(minfo.get("stream_only")) and not is_stream
+        if force_aggregate:
+            req["stream"] = True
 
         # 4+5) 凭证 + 签名 + 转发上游（401 重试一次：池模式换下一个账号；单账号模式清缓存重取）
         resp = None
@@ -1845,14 +1932,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
             text = data.decode("utf-8", "replace")
             frames = [ln[len("data:"):].strip() for ln in text.splitlines()
                       if ln.startswith("data:") and ln.strip() != "data: [DONE]"]
-            if frames:
-                try:
-                    merged = json.loads(frames[-1])
-                    if merged.get("object") == "chat.completion" and len(frames) == 1:
-                        data = json.dumps(merged, ensure_ascii=False).encode("utf-8")
-                        ct = "application/json"
-                except Exception:
-                    pass
+            merged = aggregate_sse(frames, real)
+            if merged is not None and not merged.get("error"):
+                data = json.dumps(merged, ensure_ascii=False).encode("utf-8")
+                ct = "application/json"
+            elif merged is not None:
+                # 上游在 SSE 里夹了错误帧（如 429 限流文本帧）：转成错误响应
+                detail = json.dumps(merged["error"], ensure_ascii=False)[:400]
+                _print_err("上游 SSE 错误帧 %s %s: %s" % (resp.status, real, detail[:200]))
+                return self._json(502, {"error": {"message": "上游错误: %s" % detail}})
 
         # 协议响应转换（openai 直通；responses/anthropic 转换后返回）
         if protocol == "responses":
