@@ -16,7 +16,13 @@ CodeArts Agent (华为) 官方模型本地代理 - 纯 Python 标准库 + crypto
 认证完全复用 CodeArts Agent 客户端的登录态：
   凭证（AK/SK/securitytoken）从客户端的 state.vscdb 解出
   （Electron os_crypt DPAPI + AES-256-GCM 双层加密）。
-  token 过期时打开 CodeArts Agent 客户端让它自动刷新即可。
+  客户端登录态（无账号池）：进程感知接管——客户端在跑时纯读快照不续期
+  （客户端每小时续期且 refresh_token rotation，抢先续期会打死客户端的链）；
+  客户端没跑时代理在临期自动接管该链（收编进池统一续期，rotation 后链归代理，
+  客户端下次打开需重新登录）。快照未临期时零副作用纯读。
+  账号池模式（--login 建立独立链）：临期自动续期（rotation 链归代理所有）；续期失败
+  但 CAS 凭证仍有效时继续用到自然过期（refresh_dead 标记，不再重试）；CAS 过期但
+  refresh 链未死的账号仍会被选中续期复活（refresh 链 30 天 >> CAS 2h）。
 
 本代理不做任何内容拦截/脱敏/审计（用户明确：CodeArts 通道不需要管控层），也不写日志文件。
 
@@ -27,19 +33,23 @@ CodeArts Agent (华为) 官方模型本地代理 - 纯 Python 标准库 + crypto
   python codearts_proxy.py --remove LABEL # 从账号池移除指定账号
   python codearts_proxy.py --export 路径   # 导出账号池到指定 json 文件（跨电脑迁移）
   python codearts_proxy.py --import 路径   # 从 json 文件导入账号（合并，同标签覆盖）
+  python codearts_proxy.py --sync-models  # 从内核日志读官方清单+实测新模型可用性，确认后纳入 MODELS 表
 
 多账号轮询：
-  默认直接复用客户端当前登录态（单账号）。
-  需要轮换时：客户端登录账号 A → --capture，切换账号 B 登录 → --capture …… 
+  默认直接复用客户端当前登录态（单账号，纯读快照不续期）。
+  需要轮换时：python codearts_proxy.py --login 登录账号 A → 继续 y 登录 B ……
   账号池（codearts_accounts.json）非空后，请求自动 round-robin 轮询，
   过期账号自动跳过；每个账号使用独立 session id（上游按 session id 计
   并发会话数，N 个账号等效 N×3 个并发会话额度）。
-  凭证过期后：打开 CodeArts Agent 客户端登录刷新，再 --capture 覆盖更新。
+  ★ --login 是唯一推荐的入池方式（独立 refresh 链，30 天有效，代理自动续期）；
+  --capture 抓的是与客户端共享的链——客户端开着时每小时续期轮换 token（抓取的
+  refresh_token 寿命 ≤1h）；客户端关闭后代理会在临期自动接管该链继续滚动。
   环境变量 CODEARTS_PROXY_ACCOUNTS_FILE 可指定池文件路径（如放网盘共享，多电脑指向同一文件）。
 """
 import argparse
 import base64
 import ctypes
+import glob
 import hashlib
 import hmac
 import http.client
@@ -49,6 +59,7 @@ import os
 import secrets
 import shutil
 import sqlite3
+import subprocess
 import sys
 import threading
 import time
@@ -72,23 +83,26 @@ API_KEY = os.environ.get("CODEARTS_PROXY_API_KEY", "")
 # 请求体大小上限（防 OOM，对齐 trae_proxy maxBodyBytes=8MB）
 MAX_BODY_BYTES = 8 << 20
 
-# token 自动续期（逆向自 huaweicloud.authentication 扩展 plugin.js）
+# token 自动续期（逆向自 huaweicloud.authentication 扩展 plugin.js 5.4.2）
 # 端点 POST {iamStsHost}/v1/oauth2/tokens，form: client_id/code_verifier/grant_type=refresh_token/refresh_token
 # DPoP 头 = ES256 JWS(typ=dpop+jwt)，payload={htm,htu,iat,jti}，用 loginContext.dpopKeyPair 私钥签
+# ★ refresh_token rotation：响应带新 refresh_token，旧的用一次即作废（renewSession 存 e.refresh_token）。
+#   客户端开着时每小时准点续期（认证日志 "renew session success"）→ 此时代理绝不抢先续期
+#   （会打死客户端的链）；客户端没跑时代理是唯一续期者，临期自动接管该链（收编进池）。
+#   即"谁活着，链归谁"。
 REFRESH_ENDPOINT = "https://sts.cn-north-4.myhuaweicloud.com/v1/oauth2/tokens"
-REFRESH_AHEAD_SEC = 3600          # 临期 1h 内触发续期（对齐客户端 safelyRenewTokenInterval≈3600s）
+REFRESH_AHEAD_SEC = 3600          # 临期 1h 内触发续期（CAS 凭证 2h 有效，对齐客户端提前 1h 续）
 CLIENT_ID = os.environ.get("CODEARTS_PROXY_CLIENT_ID", "codearts-agent")  # = env.uriScheme
+CLIENT_PROC_NAME = "codearts-agent.exe"   # CodeArts Agent 客户端进程名（进程感知接管的判断依据）
 
-# ── 浏览器登录（逆向自 huaweicloud.authentication/dist/plugin.js 5.3.0）──────────
-# refresh_token 也失效（30 天边界）时，自动/手动触发：起本地 callback server → 开浏览器
+# ── 浏览器登录（逆向自 huaweicloud.authentication/dist/plugin.js 5.4.2）──────────
+# 建立独立登录链（refresh_token 归代理所有，30 天有效）：起本地 callback server → 开浏览器
 # 到华为云 portal 授权 → 拿 code → 换 token → 入账号池。复刻客户端 buildLoginUrl + requestToken。
 PORTAL_HOST = os.environ.get("CODEARTS_PROXY_PORTAL_HOST", "https://codearts.huaweicloud.com/portal")
 AUTH_REDIRECT_PATH = "/oauth/callback"          # 客户端 AUTH_REDIRECT_URL
 LOGIN_PLUGIN_NAME = "snap_AIIDE"                 # 客户端 LOGIN_PLUGIN_NAME
-EXTENSION_VERSION = "5.3.0"                      # 扩展版本（authorize URL 里带）
+EXTENSION_VERSION = "5.4.2"                      # 扩展版本（authorize URL 里带，对齐客户端 26.9.501）
 LOGIN_TIMEOUT_SEC = int(os.environ.get("CODEARTS_PROXY_LOGIN_TIMEOUT", "300"))  # 默认 5 分钟
-# refresh 失败时是否自动 fallback 到浏览器登录（1=是，0=报错让用户手动 --login）
-AUTO_BROWSER_LOGIN = os.environ.get("CODEARTS_PROXY_AUTO_BROWSER_LOGIN", "1") == "1"
 
 # CodeArts Agent (Electron) 的用户数据
 LOCAL_STATE = os.path.join(HOME, "AppData", "Roaming", "codearts-agent", "Local State")
@@ -119,7 +133,102 @@ MODEL_ALIAS = {
     "pangu-flash": "openpangu-2.0-flash",
 }
 
-# ── 多账号池：--capture 抓取当前客户端登录态，运行时 round-robin 轮询 ─────
+# --sync-models 探测纳入的模型写到此文件，启动时合并到 MODELS（只加不覆盖手写配置）
+MODELS_EXTRA_FILE = os.environ.get("CODEARTS_PROXY_MODELS_EXTRA") or \
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "codearts_models_extra.json")
+
+
+def _load_models_extra():
+    """启动时把 codearts_models_extra.json 里 --sync-models 探测纳入的模型合并进 MODELS。
+    只加 MODELS 里没有的 key（不覆盖手写配置），幂等可重复调。"""
+    if not os.path.exists(MODELS_EXTRA_FILE):
+        return
+    try:
+        with open(MODELS_EXTRA_FILE, encoding="utf-8") as f:
+            extra = json.load(f)
+    except Exception:
+        return
+    for mid, entry in (extra or {}).items():
+        if isinstance(entry, dict) and mid not in MODELS:
+            MODELS[mid] = entry
+
+
+_load_models_extra()
+
+
+# ── --sync-models：从内核日志读官方模型清单 ──────────────────────────────
+KERNEL_LOG_DIR = os.path.join(HOME, ".codeartsdoer", "codearts-data", "log") if sys.platform == "win32" \
+    else os.path.join(HOME, ".codeartsdoer", "codearts-data", "log")
+_KERNEL_MARK = "provider models update body is "
+
+
+def _parse_kernel_models(line: str) -> dict:
+    """解析一行内核日志 '... provider models update body is {JSON}. globalConfig is ...'
+    → {model_id: {id, input, output, context, reasoning, model_name}}。失败返回 {}。"""
+    i = line.find(_KERNEL_MARK)
+    if i < 0:
+        return {}
+    j = i + len(_KERNEL_MARK)
+    if j >= len(line) or line[j] != "{":
+        return {}
+    depth, in_str, esc, end = 0, False, False, -1
+    for k in range(j, len(line)):
+        c = line[k]
+        if in_str:
+            if esc:
+                esc = False
+            elif c == "\\":
+                esc = True
+            elif c == '"':
+                in_str = False
+        else:
+            if c == '"':
+                in_str = True
+            elif c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0:
+                    end = k + 1
+                    break
+    if end < 0:
+        return {}
+    try:
+        body = json.loads(line[j:end])
+    except Exception:
+        return {}
+    out = {}
+    for pinfo in (body.get("provider") or {}).values():
+        for mid, minfo in (pinfo.get("models") or {}).items():
+            limit = minfo.get("limit") or {}
+            out[mid] = {"id": mid,
+                        "input": limit.get("input"),
+                        "output": limit.get("output"),
+                        "context": limit.get("context"),
+                        "reasoning": minfo.get("reasoning", False),
+                        "model_name": minfo.get("model_name")}
+    return out
+
+
+def _load_kernel_model_list(log_dir: str = None) -> tuple:
+    """从日志目录读最新一份官方模型清单。返回 (models_dict, log_filename)。
+    按 mtime 倒序找第一个含 'provider models update body is ' 的行。"""
+    d = log_dir or KERNEL_LOG_DIR
+    logs = sorted(glob.glob(os.path.join(d, "kernel-*.log")),
+                  key=os.path.getmtime, reverse=True)
+    for lf in logs:
+        try:
+            with open(lf, encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    if _KERNEL_MARK in line and "head -c" not in line and "grep" not in line:
+                        m = _parse_kernel_models(line)
+                        if m:
+                            return m, lf
+        except Exception:
+            continue
+    return {}, None
+
+# ── 多账号池：--login 独立登录（推荐）或 --capture 短期借用，运行时 round-robin ──
 ACCOUNTS_FILE = os.environ.get("CODEARTS_PROXY_ACCOUNTS_FILE") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "codearts_accounts.json")
 
 _pool_lock = threading.Lock()
@@ -157,10 +266,11 @@ def _decrypt_full_session() -> dict:
     }
 
 
-def _capture_current() -> dict:
-    """解出当前 CodeArts Agent 客户端登录态（不走缓存），返回账号池条目（含续期所需字段）。"""
+def _capture_current(allow_expired: bool = False) -> dict:
+    """解出当前 CodeArts Agent 客户端登录态（不走缓存），返回账号池条目（含续期所需字段）。
+    allow_expired=True 用于客户端没跑时的接管路径：CAS 过期但 refresh 链（30 天）可能仍活。"""
     s = _decrypt_full_session()
-    if s["exp"] and s["exp"] < time.time():
+    if not allow_expired and s["exp"] and s["exp"] < time.time():
         raise RuntimeError("当前客户端凭证已过期（%s），请先在 CodeArts Agent 里登录刷新" % s["expires_at"])
     s["ot_session_id"] = _uid()
     s["user_session_id"] = _uid()
@@ -223,7 +333,9 @@ def capture_to_pool() -> str:
 
 
 def _next_account() -> dict:
-    """round-robin 取一个未过期账号；全部过期则报错提示重新登录。"""
+    """round-robin 取一个可用账号；全部不可用则报错提示重新登录。
+    可用 = CAS 未过期，或（有 refresh_token 且链未死）——后者允许过期账号被选中
+    后由 _maybe_refresh 续期复活（refresh 链 30 天 >> CAS 2h）。"""
     now = time.time()
     global _rr
     with _pool_lock:
@@ -231,17 +343,19 @@ def _next_account() -> dict:
         accs = _pool["accounts"]
         n = len(accs)
         if n == 0:
-            raise RuntimeError("账号池为空，请运行 python codearts_proxy.py --login（或 --capture）添加账号")
+            raise RuntimeError("账号池为空，请运行 python codearts_proxy.py --login 登录（或 --capture 短期借用客户端登录态）")
         for i in range(n):
             a = accs[(_rr + i) % n]
-            if not a.get("exp") or a["exp"] > now:
+            if not a.get("exp") or a["exp"] > now \
+                    or (a.get("refresh_token") and not a.get("refresh_dead")):
                 _rr = (_rr + i + 1) % n
                 return a
     raise RuntimeError("账号池全部 %d 个账号均已过期，请运行 python codearts_proxy.py --login 重新登录" % n)
 
 
 def _mark_session_failed(session: dict):
-    """上游 401 后：池账号标记过期（下次轮询自动跳过）；单账号模式清 10s 缓存。"""
+    """上游 401 后：池账号标记过期（下次轮询自动跳过）；单账号模式清 10s 缓存。
+    仅用于 CAS 凭证确已失效（上游 401）的场景。"""
     sid = session.get("ot_session_id")
     if sid:
         with _pool_lock:
@@ -251,6 +365,21 @@ def _mark_session_failed(session: dict):
                     _save_pool_locked()
                     return
     _session_cache.update({"at": 0.0, "data": None})
+
+
+def _mark_refresh_dead(session: dict):
+    """refresh_token 链确认死亡（STS 400 invalid refresh token 等）：
+    标记 refresh_dead、不动 exp——CAS 凭证是独立签发的（2h 寿命），剩余时间内继续可用。
+    标记后 _maybe_refresh 不再对该账号重复尝试续期。"""
+    sid = session.get("ot_session_id")
+    if not sid:
+        return
+    with _pool_lock:
+        for a in _pool["accounts"]:
+            if a.get("ot_session_id") == sid and a.get("ak") == session.get("ak"):
+                a["refresh_dead"] = True
+                _save_pool_locked()
+                return
 
 
 # ── 凭证：DPAPI + AES-256-GCM 解 CodeArts Agent 的登录态 ──────────────────
@@ -321,8 +450,31 @@ def _parse_exp(s):
             return 0.0
 
 
+_client_run_cache = {"at": 0.0, "v": None}   # _client_running 结果缓存（30s）
+
+
+def _client_running() -> bool:
+    """检测 CodeArts Agent 客户端进程是否在运行（Windows tasklist，30s 缓存）。
+    客户端在跑 = 它是 refresh 链的续期者，代理不抢；没跑 = 代理可安全接管。
+    非 Windows / 检测异常按"没跑"处理（该平台本就读不了客户端登录态 / 代理优先续期）。"""
+    now = time.time()
+    if _client_run_cache["v"] is not None and now - _client_run_cache["at"] < 30:
+        return _client_run_cache["v"]
+    v = False
+    try:
+        out = subprocess.run(
+            ["tasklist", "/FI", "IMAGENAME eq " + CLIENT_PROC_NAME],
+            capture_output=True, text=True, timeout=5).stdout or ""
+        v = CLIENT_PROC_NAME in out.lower()
+    except Exception:
+        pass
+    _client_run_cache.update({"at": now, "v": v})
+    return v
+
+
 def _read_client_session() -> dict:
-    """单账号路径：解出客户端登录态完整字段，10s 进程内缓存。"""
+    """单账号路径：解出客户端登录态完整字段，10s 进程内缓存。
+    过期不在此处拦截——由 _read_session 做进程感知决策（客户端没跑时接管续期救活）。"""
     if sys.platform != "win32":
         raise RuntimeError("非 Windows 环境，无法读取 CodeArts Agent 客户端登录态。请先 --import 导入账号池。")
     now = time.time()
@@ -333,15 +485,13 @@ def _read_client_session() -> dict:
         if _session_cache["data"] and time.time() - _session_cache["at"] < 10:
             return _session_cache["data"]
         session = _decrypt_full_session()
-        if session["exp"] and session["exp"] < now:
-            raise RuntimeError("凭证已过期（%s），请打开 CodeArts Agent 客户端让它自动刷新后重试" % session["expires_at"])
         _session_cache.update({"at": time.time(), "data": session})
         return session
 
 
 # ── token 自动续期：DPoP(ES256) + POST /v1/oauth2/tokens ──────────────────────
 _refresh_lock = threading.Lock()
-_refreshing = set()   # 正在刷新的 session 标识（ot_session_id 或 'client'），防并发重复刷新
+_refreshing = set()   # 正在刷新的 session 标识（ot_session_id），防并发重复刷新
 
 
 def _b64url(b: bytes) -> str:
@@ -554,14 +704,24 @@ def _wait_for_code(port: int, timeout: int) -> str:
 
 
 def _token_request(form: dict, pkce: dict, dpop: dict) -> dict:
-    """POST STS OAuth 端点（form + DPoP 头），返回原始响应 JSON。"""
+    """POST STS OAuth 端点（form + DPoP 头），返回原始响应 JSON。
+    失败时读出响应体（error_code/error_msg，如 STS5.1806 invalid refresh token）
+    抛 RuntimeError，不丢诊断信息。"""
     dpop_header = _dpop_sign(dpop["privateKeyJwk"], dpop["publicKeyJwk"], "POST", REFRESH_ENDPOINT)
     req = urllib.request.Request(REFRESH_ENDPOINT,
                                  data=urllib.parse.urlencode(form).encode("utf-8"), method="POST")
     req.add_header("Content-Type", "application/x-www-form-urlencoded")
     req.add_header("DPoP", dpop_header)
-    resp = _opener.open(req, timeout=60)
-    return json.loads(resp.read().decode("utf-8"))
+    try:
+        resp = _opener.open(req, timeout=60)
+        return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        detail = ""
+        try:
+            detail = e.read().decode("utf-8", "replace")[:300]
+        except Exception:
+            pass
+        raise RuntimeError("STS %s: %s" % (e.code, detail or e.reason))
 
 
 def _session_from_sts(data: dict, base: dict, pkce: dict, dpop: dict) -> dict:
@@ -682,12 +842,15 @@ def _update_pool_account(old: dict, new: dict):
                 return
 
 
-def _maybe_refresh(session: dict, pool: bool) -> dict:
-    """临期（< REFRESH_AHEAD_SEC）自动续期。pool=True 写回池文件；否则更新内存缓存。"""
+def _maybe_refresh(session: dict) -> dict:
+    """临期（< REFRESH_AHEAD_SEC）自动续期（池账号，链归代理所有）。
+    CAS 过期但 refresh 链未死的账号也会被续期救活（_next_account 已放宽选中条件）。"""
     exp = session.get("exp") or 0
     if exp and exp - time.time() > REFRESH_AHEAD_SEC:
         return session   # 未临期
-    sid = session.get("ot_session_id") or "client"
+    if session.get("refresh_dead"):
+        return session   # refresh 链已确认失效，不再重试（CAS 有效期内继续用）
+    sid = session.get("ot_session_id") or "pool"
     with _refresh_lock:
         if sid in _refreshing:
             return session   # 别的线程正在刷，先用旧的
@@ -696,43 +859,50 @@ def _maybe_refresh(session: dict, pool: bool) -> dict:
         new = _refresh_session(session)
     except Exception as e:
         _print_err("自动续期失败(%s): %s" % (sid, e))
-        if pool:
-            _mark_session_failed(session)   # 刷新失败 → 标记过期，轮询跳过
-            return session   # 返回旧的（上游若 401 会触发自愈换号）
-        # 客户端模式：refresh_token 也死了，fallback 浏览器登录重新拿一套凭证
-        if AUTO_BROWSER_LOGIN:
-            try:
-                _print_err("refresh_token 失效，触发浏览器登录重新建立会话...")
-                new = _browser_login()
-                new["ot_session_id"] = session.get("ot_session_id") or _uid()
-                new["user_session_id"] = session.get("user_session_id") or _uid()
-                new["captured_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-            except Exception as e2:
-                _print_err("浏览器登录失败(%s): %s" % (sid, e2))
-                return session   # 返回旧的，上游 401 会报错让用户手动 --login
-        else:
+        if exp and exp > time.time():
+            # CAS 凭证仍有效（与 refresh 链独立的 2h 寿命）：继续用，标记链死亡不再重试。
+            # 常见原因：--capture 抓的 refresh_token 已被客户端续期轮换作废（STS5.1806）。
+            _mark_refresh_dead(session)
+            _print_err("refresh 链已失效，CAS 凭证剩余 %d 分钟，到期请 --login 重新登录"
+                       % max(1, int((exp - time.time()) / 60)))
             return session
+        # CAS 也过期了：双标记（refresh_dead 防 _next_account 反复选中重试 + exp 过期跳过）
+        _mark_refresh_dead(session)
+        _mark_session_failed(session)
+        return session
     finally:
         with _refresh_lock:
             _refreshing.discard(sid)
-    if pool:
-        _update_pool_account(session, new)
-    else:
-        _session_cache.update({"at": time.time(), "data": new})
+    _update_pool_account(session, new)
     _print_err("自动续期成功(%s): 新过期 %s" % (sid, new.get("expires_at")))
     return new
 
 
 def _read_session() -> dict:
-    """取凭证：账号池非空时走池（round-robin，过期自动跳过）；否则回退客户端登录态。
-    取出后若临期（< 1h）自动续期。"""
+    """取凭证：账号池非空走池（round-robin + 临期自动续期，refresh 链归代理所有）；
+    否则回退客户端登录态——进程感知接管：
+      - 快照未临期：纯读返回（零副作用）。
+      - 临期 + 客户端在跑：透传快照（客户端是续期者，vscdb 更新后 10s 缓存自然拿到新值）。
+      - 临期/过期 + 客户端没跑：代理接管该链——收编进池（_capture_current）后走池模式
+        统一续期。rotation 后链归代理所有，客户端下次打开需重新登录（谁活着，链归谁）。"""
     if os.path.exists(ACCOUNTS_FILE):
         with _pool_lock:
             _load_pool_locked()
             has = bool(_pool["accounts"])
         if has:
-            return _maybe_refresh(_next_account(), pool=True)
-    return _maybe_refresh(_read_client_session(), pool=False)
+            return _maybe_refresh(_next_account())
+    s = _read_client_session()
+    exp = s.get("exp") or 0
+    if not exp or exp - time.time() > REFRESH_AHEAD_SEC:
+        return s   # 未临期（或无法判期）：纯读快照
+    if _client_running():
+        if exp < time.time():
+            raise RuntimeError("凭证已过期（%s），CodeArts Agent 客户端正在运行，"
+                               "稍候让其自动续期后重试（或 --login 建独立链）" % s.get("expires_at"))
+        return s
+    label = _add_session_to_pool(_capture_current(allow_expired=True))
+    _print_err("客户端未运行，代理已接管登录态（收编进池）: %s" % label)
+    return _maybe_refresh(_next_account())
 
 
 # ── AKSK 签名（复刻 agentkernel 的 AKSKSigner.sign，华为云 SDK-HMAC-SHA256）──
@@ -815,6 +985,47 @@ def upstream_headers(session: dict) -> dict:
         "X-Language": "zh-cn",
     }
     return sign_request("POST", UPSTREAM, h, session["ak"], session["sk"])
+
+
+def _probe_model(session: dict, model_id: str) -> dict:
+    """实测单个模型可用性 + stream_only 特性（用 'hi' 无害内容，max_tokens=10）。
+    返回 {usable, stream_only, reason}：
+      - 非流式 200 → usable, stream_only=False
+      - 非流式 400 空 body → 试流式；流式 200 → usable, stream_only=True（glm-5.3 那类）
+      - 404/429/其他 → 不可用"""
+    def _post(stream):
+        payload = json.dumps({"model": model_id, "messages": [{"role": "user", "content": "hi"}],
+                              "max_tokens": 10, "stream": stream}, ensure_ascii=False).encode("utf-8")
+        headers = upstream_headers(session)
+        headers["Content-Type"] = "application/json"
+        req = urllib.request.Request(UPSTREAM, data=payload, headers=headers, method="POST")
+        return _opener.open(req, timeout=30)
+    try:
+        resp = _post(False)
+        resp.read(); resp.close()
+        return {"usable": True, "stream_only": False, "reason": "非流式 200 OK"}
+    except urllib.error.HTTPError as e:
+        body = e.read()
+        if e.code == 400 and not body:
+            try:
+                resp = _post(True)
+                chunk = resp.read(512); resp.close()
+                if chunk:
+                    return {"usable": True, "stream_only": True, "reason": "非流式400空body→流式200"}
+                return {"usable": False, "stream_only": True, "reason": "非流式400空body,流式空响应"}
+            except urllib.error.HTTPError as e2:
+                t = e2.read()[:200].decode("utf-8", "replace")
+                return {"usable": False, "stream_only": True, "reason": "非流式400空body,流式HTTP%d: %s" % (e2.code, t)}
+            except Exception as e2:
+                return {"usable": False, "stream_only": True, "reason": "非流式400空body,流式异常 %r" % (e2,)}
+        text = body[:300].decode("utf-8", "replace")
+        if e.code == 404:
+            return {"usable": False, "stream_only": False, "reason": "404 未注册"}
+        if e.code == 429:
+            return {"usable": False, "stream_only": False, "reason": "429 限流"}
+        return {"usable": False, "stream_only": False, "reason": "HTTP %d: %s" % (e.code, text)}
+    except Exception as e:
+        return {"usable": False, "stream_only": False, "reason": "异常 %r" % (e,)}
 
 
 # 忽略系统代理（公司代理可能不支持直连回环/篡改头）
@@ -1674,7 +1885,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                             })
                     s = _read_client_session()
                     return self._json(200, {"ok": True, "mode": "client", "account": s["account"],
-                                            "credExp": s["expires_at"] or "unknown"})
+                                            "credExp": s["expires_at"] or "unknown",
+                                            "expired": bool(s.get("exp") and s["exp"] < time.time())})
                 except Exception as e:
                     return self._json(200, {"ok": False, "error": str(e)})
             if path in ("/v1/models", "/models"):
@@ -1977,6 +2189,75 @@ class QuietServer(http.server.ThreadingHTTPServer):
         traceback.print_exc()
 
 
+def _cmd_sync_models(yes: bool = False) -> int:
+    """从内核日志读官方模型清单 → 实测新模型可用性 + stream_only → 确认 → 写入 extra.json。
+    写入后自动合并到 MODELS 表立即生效（/v1/models 即可返回，客户端可请求）。"""
+    print("读取内核日志官方模型清单...")
+    models, logname = _load_kernel_model_list()
+    if not models:
+        print("未在 %s 找到模型清单（kernel-*.log 里无 'provider models update body'）。" % KERNEL_LOG_DIR)
+        print("请先启动 CodeArts Agent 客户端让它拉取清单，再重试。")
+        return 1
+    print("来源: %s（%d 个模型）" % (os.path.basename(logname or ""), len(models)))
+    new = [mid for mid in models if mid not in MODELS]
+    if not new:
+        print("官方清单里的模型代理已全部纳入（%d 个），无需同步。" % len(models))
+        return 0
+    print("\n发现 %d 个新模型，开始实测可用性..." % len(new))
+    try:
+        session = _read_session()
+    except Exception as e:
+        print("无法获取凭证进行实测: %s" % e)
+        print("请先 --login 登录或确保客户端登录态可用。")
+        return 1
+    usable = []
+    for mid in new:
+        p = _probe_model(session, mid)
+        info = models[mid]
+        tag = "[OK]" if p["usable"] else "[NO]"
+        so = " [仅流式]" if p.get("stream_only") else ""
+        print("  %s %-24s ctx=%s%s  %s" % (tag, mid, info.get("context") or "?", so, p["reason"]))
+        if p["usable"]:
+            usable.append((mid, info, p))
+    if not usable:
+        print("\n新模型均不可用（404/限流），不写入。")
+        return 0
+    print("\n可纳入 %d 个模型：" % len(usable))
+    for mid, info, p in usable:
+        print("  %-24s ctx=%-6s max_tokens=65536 %s" % (
+            mid, info.get("context") or "?", "[stream_only]" if p["stream_only"] else ""))
+    if not yes:
+        try:
+            ans = input("\n写入 %s？(y/N): " % os.path.basename(MODELS_EXTRA_FILE)).strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print(); ans = ""
+        if ans not in ("y", "yes"):
+            print("已取消。")
+            return 1
+    extra = {}
+    if os.path.exists(MODELS_EXTRA_FILE):
+        try:
+            with open(MODELS_EXTRA_FILE, encoding="utf-8") as f:
+                extra = json.load(f)
+        except Exception:
+            extra = {}
+    for mid, info, p in usable:
+        entry = {"name": info.get("model_name") or mid,
+                 "ctx": info.get("context") or 0,
+                 "max_tokens": 65536,
+                 "limit_err": 81001,
+                 "desc": "--sync-models 探测纳入"}
+        if p["stream_only"]:
+            entry["stream_only"] = True
+        extra[mid] = entry
+    with open(MODELS_EXTRA_FILE, "w", encoding="utf-8") as f:
+        json.dump(extra, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+    _load_models_extra()
+    print("已写入 %d 个模型到 %s，已合并到 MODELS 表立即生效。" % (len(usable), os.path.basename(MODELS_EXTRA_FILE)))
+    return 0
+
+
 def _cmd_capture() -> int:
     if sys.platform != "win32":
         print("--capture 仅支持 Windows（需要 CodeArts Agent 客户端的 DPAPI 加密登录态）。")
@@ -1989,6 +2270,9 @@ def _cmd_capture() -> int:
         return 1
     print("已抓取账号: %s" % label)
     print("池文件: %s" % ACCOUNTS_FILE)
+    print("[注意] 抓取的 refresh_token 与客户端共享同一条链：客户端开着时每小时续期会将其")
+    print("       轮换作废；关闭客户端后代理会在临期自动接管该链继续滚动（30 天）。")
+    print("       多账号轮询或跨机器使用请改用 --login 建立独立登录链。")
     return 0
 
 
@@ -2057,7 +2341,7 @@ def _cmd_export(path: str) -> int:
         _load_pool_locked()
         accs = list(_pool["accounts"])
     if not accs:
-        print("账号池为空，无可导出内容。请先 --capture 抓取账号。")
+        print("账号池为空，无可导出内容。请先 --login 登录或 --capture 抓取账号。")
         return 1
     with open(path, "w", encoding="utf-8") as f:
         json.dump({"accounts": accs}, f, ensure_ascii=False, indent=2)
@@ -2172,6 +2456,8 @@ def main():
     ap.add_argument("--remove", metavar="LABEL", help="从账号池移除指定账号")
     ap.add_argument("--export", metavar="PATH", help="导出当前账号池到指定 json 文件")
     ap.add_argument("--import", metavar="PATH", dest="import_path", help="从指定 json 文件导入账号（合并，同标签覆盖）")
+    ap.add_argument("--sync-models", action="store_true", help="从内核日志读官方清单 + 实测新模型可用性，确认后纳入 MODELS 表")
+    ap.add_argument("--yes", action="store_true", help="--sync-models 跳过确认直接写入")
     ap.add_argument("--menu", action="store_true", help="启动前弹交互菜单（默认无参数且 tty 时自动弹）")
     ap.add_argument("--serve", action="store_true", help="跳过菜单直接启动代理")
     args = ap.parse_args()
@@ -2191,6 +2477,8 @@ def main():
         sys.exit(_cmd_export(args.export))
     if args.import_path:
         sys.exit(_cmd_import(args.import_path))
+    if args.sync_models:
+        sys.exit(_cmd_sync_models(yes=args.yes))
 
     # 无子命令：--serve 直接启动；否则弹交互菜单
     if not args.serve:
@@ -2211,7 +2499,8 @@ def main():
     if os.path.exists(ACCOUNTS_FILE):
         print("认证: 账号池轮询（%s）" % ACCOUNTS_FILE)
     else:
-        print("认证: 自动复用 CodeArts Agent 登录态（多账号请用 --capture 建池）")
+        print("认证: 复用 CodeArts Agent 登录态（客户端开着: 它续期代理不抢；客户端关闭: 临期代理自动接管）")
+        print("      多账号/长期使用请用 --login 建独立登录链（--capture 仅短期借用，链与客户端共享）")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
