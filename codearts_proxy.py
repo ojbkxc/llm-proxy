@@ -2404,19 +2404,28 @@ def _interactive_menu() -> int:
         if not accs and os.path.exists(STATE_VSCDB):
             print("  （未建池，可直接复用客户端登录态）")
         print("-" * 56)
-        print("  0) 启动代理（用现有账号池 / 客户端登录态）")
-        print("  1) 登录华为云加入账号池（浏览器/二维码，可连续登多个）")
-        print("  2) 终端二维码登录（Linux server / SSH 无浏览器）")
         if sys.platform == "win32":
-            print("  3) 抓取 CodeArts Agent 客户端当前登录态")
-        print("  l) 查看账号池详情")
-        print("  r) 移除账号")
-        print("  e) 导出账号池（跨电脑迁移）")
-        print("  i) 导入账号池")
-        print("  q) 退出")
+            print("  0 启动代理（用现有账号池 / 客户端登录态）")
+            print("  1 登录华为云加入账号池（浏览器/二维码，可连续登多个）")
+            print("  2 终端二维码登录（Linux server / SSH 无浏览器）")
+            print("  3 抓取 CodeArts Agent 客户端当前登录态")
+            print("  4 查看账号池详情")
+            print("  5 移除账号")
+            print("  6 导出账号池（跨电脑迁移）")
+            print("  7 导入账号池")
+            print("  8 退出")
+        else:
+            print("  0 启动代理（用现有账号池 / 客户端登录态）")
+            print("  1 登录华为云加入账号池（浏览器/二维码，可连续登多个）")
+            print("  2 终端二维码登录（Linux server / SSH 无浏览器）")
+            print("  3 查看账号池详情")
+            print("  4 移除账号")
+            print("  5 导出账号池（跨电脑迁移）")
+            print("  6 导入账号池")
+            print("  7 退出")
         print("-" * 56)
         try:
-            choice = input("请选择: ").strip().lower()
+            choice = input("请选择: ").strip()
         except (EOFError, KeyboardInterrupt):
             print()
             return ('quit', False)
@@ -2426,24 +2435,50 @@ def _interactive_menu() -> int:
             return ('login', False)
         if choice == "2":
             return ('login', True)
-        if choice == "3" and sys.platform == "win32":
-            return ('capture', False)
-        if choice == "l":
-            _cmd_list(); continue
-        if choice == "r":
-            label = input("要移除的账号标签: ").strip()
-            if label: _cmd_remove(label)
-            continue
-        if choice == "e":
-            path = input("导出路径: ").strip()
-            if path: _cmd_export(path)
-            continue
-        if choice == "i":
-            path = input("导入文件路径: ").strip()
-            if path: _cmd_import(path)
-            continue
-        if choice == "q":
-            return ('quit', False)
+        if sys.platform == "win32":
+            if choice == "3":
+                return ('capture', False)
+            if choice == "4":
+                _cmd_list()
+                continue
+            if choice == "5":
+                label = input("要移除的账号标签: ").strip()
+                if label:
+                    _cmd_remove(label)
+                continue
+            if choice == "6":
+                path = input("导出路径: ").strip()
+                if path:
+                    _cmd_export(path)
+                continue
+            if choice == "7":
+                path = input("导入文件路径: ").strip()
+                if path:
+                    _cmd_import(path)
+                continue
+            if choice == "8":
+                return ('quit', False)
+        else:
+            if choice == "3":
+                _cmd_list()
+                continue
+            if choice == "4":
+                label = input("要移除的账号标签: ").strip()
+                if label:
+                    _cmd_remove(label)
+                continue
+            if choice == "5":
+                path = input("导出路径: ").strip()
+                if path:
+                    _cmd_export(path)
+                continue
+            if choice == "6":
+                path = input("导入文件路径: ").strip()
+                if path:
+                    _cmd_import(path)
+                continue
+            if choice == "7":
+                return ('quit', False)
         print("无效选择，重试")
 
 
