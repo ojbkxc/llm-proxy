@@ -165,7 +165,7 @@ python test_trae_proxy.py --integration         # 单元 + 集成测试
 把 Qoder CN（阿里 AI IDE）客户端的官方模型通道转成本地三协议兼容 API。
 
 **上游只用带 Cosy 签名的 `/algo` 通道**。签名与请求体编码原先在客户端的 `qoder_auth_wasm` 里，
-现已逐字节还原成 **纯 Python**（`qoder_cosy.py`：自定义 base64 + 分块重排、AES-128-CBC、
+现已逐字节还原成 **纯 Python 并内联在 `qoder_proxy.py` 里**（自定义 base64 + 分块重排、AES-128-CBC、
 RSA-1024 PKCS#1 v1.5、MD5 签名原像），并用插桩 WASM 的确定性回放 + 网关真机请求验收。
 代理默认 **不需要 Node**：`QODER_PROXY_SIGN_BACKEND=auto` 优先纯 Python，异常才回落
 `qoder_sign.mjs` sidecar（`py` / `node` 可强制单一后端）。只有 `--login` 的设备码流程仍用 Node
@@ -277,10 +277,16 @@ Local State.os_crypt.encrypted_key → DPAPI → 32B AES key
 → 写入账号池 ~/.qoder-cn-proxy/accounts.json
 ```
 
-**账号池**：多个账号自动 round-robin；上游 401/403 时把该账号标记失败并冷却
-`FAIL_COOLDOWN_SEC = 300`，然后自动换下一个账号。池文件里是真 token，所以默认路径放在
-仓库外（`~/.qoder-cn-proxy/accounts.json`，可用 `QODER_PROXY_ACCOUNTS` 覆盖）——`llm-proxy`
-是 git 工作区且没有 `.gitignore`，放脚本旁边很容易被一次 `git add .` 提交出去。
+**账号池**：多个账号自动 round-robin（指针自增在池锁内，并发取号不会挤到同一个账号）；
+上游 401/403 时把该账号标记失败并冷却 `FAIL_COOLDOWN_SEC = 300`，然后自动换下一个账号。
+上游 429 时按响应头的 `Retry-After`（没有则 `RATE_COOLDOWN_SEC = 60`）把该账号放进
+`cool_until` 冷却并换号，`/health` 的 `cooling_sec` 可以看到还剩几秒。连接失败和
+502/503/504 走指数退避重试（`RETRY_MAX = 2`，`RETRY_BACKOFF_SEC = 0.5` 起），重试不吃换号
+预算；上游 500 **不重试**——它可能已经把这一轮跑完并扣了额度，重放等于二次消费。
+池文件里是真 token，所以默认路径放在
+仓库外（`~/.qoder-cn-proxy/accounts.json`，可用 `QODER_PROXY_ACCOUNTS` 覆盖）。仓库根已加
+`.gitignore` 挡住 `*_accounts.json` / `*-pack.json`，但 `git add -f` 仍能强推出去——别这么干，
+也别把池文件贴到公开渠道（见「最小部署：两个文件」关于同目录副本的说明）。
 
 **自动续期**：token 临期 1 天内（`QODER_PROXY_REFRESH_AHEAD`，默认 86400）或请求前扫到期，
 自动调 `POST openapi.qoder.com.cn/api/v1/deviceToken/refresh`（body 带 `refresh_token` /
@@ -288,10 +294,10 @@ Local State.os_crypt.encrypted_key → DPAPI → 32B AES key
 `device_token` + `refresh_token` 写回池文件。access token 约 30 天、refresh token 约 1 年，
 期间无需人工干预；续期链彻底失效（400/401/403）时把账号标记 `refresh_dead`，不再反复重试。
 
-**脱客户端运行**：客户端进程不需要开着，签名 sidecar 只读磁盘上的登录态与安装目录里的
-worker runtime 文件。拿不到客户端登录态（换了机器、没装客户端）就用 `--login` 走浏览器设备码
-授权，入池之后与 `--capture` 的账号完全等价。`--export` / `--import` 做跨机迁移（目标机不需要
-Windows/DPAPI，但仍需 Node + 一份 `qoder-worker-runtime.obf.mjs`，用 `QODER_WORKER_BUNDLE` 指路）。
+**脱客户端运行**：客户端进程不需要开着，签名是纯 Python、只用磁盘上已落盘的登录态，不读安装目录。
+拿不到客户端登录态（换了机器、没装客户端）就用 `--login` 走浏览器设备码授权——**只有这条需要
+Node + 一份 `qoder-worker-runtime.obf.mjs`**（`QODER_WORKER_BUNDLE` 指路）。`--export` / `--import`
+做跨机迁移，目标机不需要 Windows/DPAPI、也不需要 Node，入池之后与 `--capture` 的账号完全等价。
 
 ```bash
 python qoder_proxy.py --login                 # 浏览器设备码登录入池（不需要客户端）
@@ -304,6 +310,30 @@ python qoder_proxy.py --models            # 签名拉取模型清单
 python qoder_proxy.py --check             # 网关/账号池/签名器/模型 四项自检
 python qoder_proxy.py --test-chat "hi"    # 一次最小真实对话（手工验证请用无害占位内容）
 ```
+
+### 最小部署：两个文件
+
+`qoder_proxy.py` + `qoder_accounts.json` 放进服务器同一目录即可跑，不需要 `qoder_cosy.py`
+（签名已内联进代理）、不需要 Node、不需要装客户端。账号池路径按优先级解析：
+
+1. `QODER_PROXY_ACCOUNTS` 显式指定；
+2. `~/.qoder-cn-proxy/accounts.json` 存在就用它（本机日常走这条，行为不变）；
+3. 脚本同目录的 `qoder_accounts.json`（两件套部署免配置即跑）；
+4. 都不存在时回到第 2 项的路径，首次写池时自动创建。
+
+所以同一台 Windows 上无论仓库里有没有 `qoder_accounts.json`，读的都是 home 那份、不会两份池子漂移；
+只有全新机器/容器（没有 home 池）才会用同目录那份。`--export` / `--import` 是另一条迁移路线，
+适合只搬某几个账号或换池文件布局。
+
+```bash
+# 服务器侧
+scp qoder_proxy.py qoder_accounts.json user@host:/opt/qoder-proxy/
+cd /opt/qoder-proxy && chmod 600 qoder_accounts.json
+QODER_PROXY_API_KEY=$(openssl rand -hex 16) python3 qoder_proxy.py --serve
+```
+
+**注意鉴权**：监听地址写死 `0.0.0.0`，而 `QODER_PROXY_API_KEY` 默认为空（=不鉴权）。
+跨机使用前必须先设 API Key，或把端口留在本机、走 SSH 隧道 / nginx 鉴权再暴露。
 
 ### 设备码登录 `--login`
 
@@ -341,7 +371,7 @@ node qoder_sign.mjs --login --site https://qoder.cn --openapi https://openapi.qo
 |---|---|---|
 | `QODER_PROXY_PORT` | 8791 | 监听端口（`--port` 覆盖） |
 | `QODER_PROXY_API_KEY` | (空) | API Key 鉴权（空=不鉴权；`Authorization: Bearer` 或 `X-Api-Key`） |
-| `QODER_PROXY_ACCOUNTS` | `~/.qoder-cn-proxy/accounts.json` | 账号池文件 |
+| `QODER_PROXY_ACCOUNTS` | `~/.qoder-cn-proxy/accounts.json`；不存在且同目录有 `qoder_accounts.json` 时用后者 | 账号池文件 |
 | `QODER_PROXY_SIGN_BACKEND` | `auto` | 签名后端：`auto`=纯 Python 优先、异常回落 node；`py`=只用纯 Python；`node`=只用 sidecar |
 | `QODER_SIGN_JS` | 脚本同目录 `qoder_sign.mjs` | Node sidecar 路径（`--login` / node 回落用） |
 | `QODER_PROXY_NODE` | `node` | Node 可执行文件（`--login` / node 回落用） |
@@ -401,11 +431,11 @@ llm-proxy/
 ├── test_trae_proxy.py         # trae_proxy 测试套件
 ├── trae_login.py              # TRAE 登录辅助
 
-├── qoder_proxy.py             # 阿里 Qoder CN 代理（Cosy 签名通道 + 账号池 + 自动续期）
-├── qoder_cosy.py              # 纯 Python Cosy 签名器（WASM 逐字节复刻，默认后端）
-├── qoder_sign.mjs             # Node 签名 sidecar（--login 设备码 / 签名回落）
+├── qoder_proxy.py             # 阿里 Qoder CN 代理（Cosy 签名 + 账号池 + 自动续期；单文件即跑）
+├── qoder_accounts.json        # 账号池副本（真 token；.gitignore 已挡住，勿提交/勿外传）
+├── qoder_sign.mjs             # Node 签名 sidecar（仅 --login 设备码 / 签名回落需要）
 ├── test_qoder_proxy.py        # qoder_proxy 离线测试（全 mock，不触网）
-├── test_qoder_cosy.py         # qoder_cosy 离线测试（WASM 回放向量）
+├── test_qoder_cosy.py         # Cosy 签名向量测试（测的是 qoder_proxy 里的内联实现）
 ├── .reverse/                  # Qoder CN 逆向笔记（协议/签名/凭证）
 ├── proxy.py                   # ws-proxy 合规层（账号拦截/脱敏/审计）
 ├── test_proxy.py              # ws-proxy 测试

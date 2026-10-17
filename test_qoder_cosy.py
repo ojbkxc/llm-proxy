@@ -1,5 +1,8 @@
 # -*- coding: utf-8 -*-
-"""qoder_cosy 的离线回归测试：向量来自客户端 wasm 的确定性回放（全部 dummy 凭据）。"""
+"""Cosy 签名的离线回归测试：向量来自客户端 wasm 的确定性回放（全部 dummy 凭据）。
+
+实现已从 qoder_cosy.py 内联进 qoder_proxy.py（单文件部署），所以这里测的是 qoder_proxy。
+"""
 import base64
 import json
 import os
@@ -8,7 +11,7 @@ import unittest
 import uuid
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import qoder_cosy as qc
+import qoder_proxy as qc
 
 ENC_VECTORS = [
  [

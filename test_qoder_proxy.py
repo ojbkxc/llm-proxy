@@ -6,7 +6,8 @@ test_qoder_proxy.py — qoder_proxy.py 离线测试套件（不触网、不碰�
   1. 纯函数：expiresAt 解析、SSE 信封解包、chunk 聚合、三协议请求/响应转换、流式状态机
   2. HTTP 端到端（mock 签名器 + mock 上游）：/health、/v1/models、/v1/chat/completions
      （流式 + 非流式）、/v1/messages、/v1/responses、/v1/messages/count_tokens
-  3. 账号池：入池/去重/导出导入/移除、401 换号、临期自动续期
+  3. 账号池：入池/去重/导出导入/移除、401 换号、429 冷却换号、5xx 退避重试、并发取号均匀、
+     临期自动续期
   4. 边界：API Key 鉴权、body 超限 413、未知模型 404、上游错误帧 502
 
 运行：python test_qoder_proxy.py
@@ -58,6 +59,8 @@ class _MockUpstream:
     def __init__(self):
         self.received = []          # [(path, body_text, headers_dict)]
         self.force_status = None    # 设成 401 等可直接测错误分支
+        self.status_queue = []      # 按请求次序逐个弹出；0/None 表示这次正常回 200
+        self.retry_after = None     # 错误响应带上 Retry-After，测 429 冷却时长
         self.error_frames = False
         srv_mod = _srv
 
@@ -71,6 +74,8 @@ class _MockUpstream:
                 b = json.dumps(obj).encode("utf-8")
                 self.send_response(code)
                 self.send_header("Content-Type", "application/json")
+                if code >= 400 and self.up.retry_after is not None:
+                    self.send_header("Retry-After", str(self.up.retry_after))
                 self.send_header("Content-Length", str(len(b)))
                 self.end_headers()
                 self.wfile.write(b)
@@ -100,8 +105,10 @@ class _MockUpstream:
                 n = int(self.headers.get("Content-Length") or 0)
                 raw = self.rfile.read(n).decode("utf-8", "replace")
                 self.up.received.append((self.path, raw, dict(self.headers)))
-                if self.up.force_status:
-                    return self._json({"message": "rejected"}, self.up.force_status)
+                st = self.up.status_queue.pop(0) if self.up.status_queue else None
+                st = st or self.up.force_status
+                if st:
+                    return self._json({"message": "rejected"}, st)
                 if "TOOL" in raw:
                     return self._sse(_tool_chunks(), with_error=self.up.error_frames)
                 if "ERRFRAME" in raw:
@@ -265,12 +272,15 @@ class _Env:
         self.signer = _FakeSigner(self.upstream.base)
 
         # 备份并打桩
+        self.sleeps = []       # 记录退避第几次，测试不真等
         self._saved = {k: getattr(Q, k) for k in
-                       ("ACCOUNTS_FILE", "GATEWAY", "OPENAPI", "API_KEY", "_signer")}
+                       ("ACCOUNTS_FILE", "GATEWAY", "OPENAPI", "API_KEY", "_signer",
+                        "_backoff_sleep")}
         Q.ACCOUNTS_FILE = self.accounts_file
         Q.GATEWAY = self.upstream.base
         Q.OPENAPI = self.upstream.base
         Q._signer = self.signer
+        Q._backoff_sleep = lambda n: self.sleeps.append(n)
         Q._pool.update({"accounts": [], "mtime": 0.0})
         Q._rr = 0
         Q._models.update({"at": 0.0, "list": [], "by_id": {}, "alias": {}})
@@ -826,6 +836,119 @@ def test_upstream_401_switch_account():
         ok = (first_bad and code2 == 200 and json.loads(raw2)["choices"][0]["message"]["content"]
               and marked and marked[0]["exp"] < time.time())
         _record("upstream_401_switch_account", ok, "%s %s" % (code, code2))
+    finally:
+        env.close()
+
+
+def test_upstream_429_cools_account_and_switches():
+    """429：按 Retry-After 冷却挨限流的号，并换下一个号把这一轮对话救回来。"""
+    a = _fake_account("uid-rate0001", token="dt-limited")
+    b = _fake_account("uid-rate0002", token="dt-free")
+    env = _Env(accounts=[a, b])
+    try:
+        env.upstream.retry_after = 7
+        env.upstream.status_queue = [429, 0]
+        code, raw = _post(env.url + "/v1/chat/completions",
+                          {"model": "fkmodel", "messages": [{"role": "user", "content": "hi"}]})
+        with open(env.accounts_file, encoding="utf-8") as f:
+            pool = json.load(f)["accounts"]
+        cooled = [x for x in pool if x.get("cool_until", 0) > time.time()]
+        left = cooled[0]["cool_until"] - time.time() if cooled else -1
+        ok = (code == 200 and len(cooled) == 1 and cooled[0]["failed_status"] == 429
+              and 5 <= left <= 7 and len(env.upstream.received) == 2 and not env.sleeps)
+        _record("upstream_429_cools_account_and_switches", ok,
+                "%s cooled=%d left=%.1f hits=%d" % (code, len(cooled), left,
+                                                    len(env.upstream.received)))
+    finally:
+        env.close()
+
+
+def test_upstream_429_all_cooling_returns_429():
+    """所有号都被限流：客户端拿到 429（而不是被误报成 401 或 502）。"""
+    env = _Env(accounts=[_fake_account("uid-rate0001"), _fake_account("uid-rate0002")])
+    try:
+        env.upstream.retry_after = 30
+        env.upstream.force_status = 429
+        code, raw = _post(env.url + "/v1/chat/completions",
+                          {"model": "fkmodel", "messages": [{"role": "user", "content": "hi"}]})
+        with open(env.accounts_file, encoding="utf-8") as f:
+            pool = json.load(f)["accounts"]
+        cooled = [x for x in pool if x.get("cool_until", 0) > time.time()]
+        hcode, hraw = _get(env.url + "/health")
+        shown = json.loads(hraw)["accounts"][0].get("cooling_sec", 0) > 0
+        ok = code == 429 and "限流" in raw.decode("utf-8", "replace") \
+            and len(cooled) == 2 and shown
+        _record("upstream_429_all_cooling_returns_429", ok,
+                "%s cooled=%d health_cooling=%s" % (code, len(cooled), shown))
+    finally:
+        env.close()
+
+
+def test_upstream_503_retried_then_success():
+    """502/503/504 退避重试；重试不吃换号预算。"""
+    env = _Env()
+    try:
+        env.upstream.status_queue = [503, 504, 0]
+        code, raw = _post(env.url + "/v1/chat/completions",
+                          {"model": "fkmodel", "messages": [{"role": "user", "content": "hi"}]})
+        ok = (code == 200 and len(env.upstream.received) == 3 and env.sleeps == [1, 2]
+              and json.loads(raw)["choices"][0]["message"]["content"])
+        _record("upstream_503_retried_then_success", ok,
+                "%s hits=%d sleeps=%s" % (code, len(env.upstream.received), env.sleeps))
+    finally:
+        env.close()
+
+
+def test_upstream_retry_exhausted_502():
+    """超过 RETRY_MAX 还是 5xx：原样回 502，不无限重试。"""
+    env = _Env()
+    try:
+        env.upstream.force_status = 502
+        code, raw = _post(env.url + "/v1/chat/completions",
+                          {"model": "fkmodel", "messages": [{"role": "user", "content": "hi"}]})
+        ok = code == 502 and len(env.upstream.received) == Q.RETRY_MAX + 1
+        _record("upstream_retry_exhausted_502", ok,
+                "%s hits=%d" % (code, len(env.upstream.received)))
+    finally:
+        env.close()
+
+
+def test_upstream_500_not_retried():
+    """上游 500 不重试：它可能已经跑完这一轮并扣了额度，重放等于二次消费。"""
+    env = _Env()
+    try:
+        env.upstream.status_queue = [500, 0]
+        code, raw = _post(env.url + "/v1/chat/completions",
+                          {"model": "fkmodel", "messages": [{"role": "user", "content": "hi"}]})
+        ok = code == 502 and len(env.upstream.received) == 1 and not env.sleeps
+        _record("upstream_500_not_retried", ok,
+                "%s hits=%d sleeps=%s" % (code, len(env.upstream.received), env.sleeps))
+    finally:
+        env.close()
+
+
+def test_next_account_thread_safe_spread():
+    """并发取号：_rr 自增在锁内，60 次调用必须均匀摊到 3 个号（各 20 次）。"""
+    accs = [_fake_account("uid-rr000%d" % i) for i in range(3)]
+    env = _Env(accounts=accs)
+    try:
+        picked = []
+        lock = threading.Lock()
+
+        def worker():
+            for _ in range(20):
+                a = Q._next_account()
+                with lock:
+                    picked.append(a["account"])
+
+        threads = [threading.Thread(target=worker) for _ in range(3)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        counts = {a["account"]: picked.count(a["account"]) for a in accs}
+        ok = len(picked) == 60 and all(v == 20 for v in counts.values())
+        _record("next_account_thread_safe_spread", ok, str(counts))
     finally:
         env.close()
 
@@ -1403,7 +1526,6 @@ def _md5_pre(p0, key, date, body, path):
 
 
 def test_native_signer_requests():
-    import qoder_cosy as qc
     s = Q._NativeSigner()
     acct = _fake_account()
     got = s.request(acct, {"endpoint": "https://gw.example",
@@ -1430,7 +1552,7 @@ def test_native_signer_requests():
     h2 = got2["headers"]
     p02, sig2 = h2["Authorization"][len("Bearer COSY."):].split(".")
     plain = json.dumps(body, ensure_ascii=False, separators=(",", ":"))
-    want_body = qc.encode_body(plain).decode()
+    want_body = Q.encode_body(plain).decode()
     path2 = "/api/v2/service/pro/sse/agent_chat_generation"
     ok = ok and got2["url"].endswith(
         path2 + "?FetchKeys=llm_model_result&AgentId=agent_common&Encode=1")
@@ -1621,6 +1743,12 @@ def main():
         test_unknown_model_404,
         test_bad_json_400,
         test_upstream_401_switch_account,
+        test_upstream_429_cools_account_and_switches,
+        test_upstream_429_all_cooling_returns_429,
+        test_upstream_503_retried_then_success,
+        test_upstream_retry_exhausted_502,
+        test_upstream_500_not_retried,
+        test_next_account_thread_safe_spread,
         test_upstream_error_frame_502,
         test_signer_failure_502,
         test_pool_capture_export_import,
