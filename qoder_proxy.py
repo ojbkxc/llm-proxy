@@ -14,18 +14,20 @@ qoder_proxy.py —— Qoder CN 官方模型通道的本地 API 代理（OpenAI /
        ?FetchKeys=llm_model_result&AgentId=agent_common&Encode=1
   GET  https://gateway.qoder.com.cn/algo/api/v2/model/list
   两者都要求 Authorization: Bearer COSY.<base64>.<sig> 一整套 Cosy-* 签名头，
-  且请求体要按 Encode=1 编码 —— 签名与编码实现在客户端的 Rust/WASM 模块
-  qoder_auth_wasm_bg.wasm 里，纯 Python 无法复刻（实测自造签名一律 403 Signature invalid）。
-  因此签名交给 sidecar qoder_sign.mjs（直接驱动同一个 WASM），本文件只做协议转换与账号管理。
+  且请求体要按 Encode=1 编码 —— 签名与编码已从客户端的 Rust/WASM 模块
+  qoder_auth_wasm_bg.wasm 逐字节还原，实现在同目录的 qoder_cosy.py（纯 Python）。
+  默认不需要 node；QODER_PROXY_SIGN_BACKEND=node 可切回 qoder_sign.mjs sidecar 对照。
 
 脱离桌面端：只读磁盘上的登录态文件，不启动、不连接 Qoder CN 进程；
-签名器是独立 node 子进程，客户端可以完全没打开。
+签名在进程内完成，客户端可以完全没打开。只有 --login 的设备码流程需要 node
+（PKCE 授权与轮询逻辑在客户端 bundle 里，暂未用 Python 复刻）。
   %APPDATA%\\com.qodercn.app.stable\\auth.v1.dat   Electron safeStorage（DPAPI + AES-256-GCM）
   ~\\.qoder-cn\\.auth\\machine_id                    机器 ID（签名要用）
   ~\\.qoder-cn\\umid-cache.json                      machine_token/machineType/machineCode
   ~\\.qoder-cn\\.cache\\endpoint-cache.json           网关/openapi host（自动发现）
 
 账号池（对齐 codearts_proxy.py 的用法）：
+  --login              浏览器设备码登录换 token 入池（本机可以完全没有 Qoder CN 客户端）
   --capture            从本机客户端解密登录态并入池
   --list / --remove    查看、移除池内账号
   --export / --import  凭证包跨机迁移（目标机不需要 Windows/DPAPI/客户端）
@@ -33,13 +35,17 @@ qoder_proxy.py —— Qoder CN 官方模型通道的本地 API 代理（OpenAI /
                       401/403 自动换号重试，续期链失效的账号标记 refresh_dead 不再反复尝试
 
 零第三方依赖（纯标准库）。只有 --capture 需要 cryptography 解 AES-256-GCM；
-用 --import 迁移动凭证时不需要任何依赖。
+用 --import 迁移动凭证时不需要任何依赖。日常代理与签名都不需要 node。
 
 用法:
+  python qoder_proxy.py                      # 启动代理（默认弹交互菜单，tty 时）
+  python qoder_proxy.py --serve              # 跳过菜单直接启动
+  python qoder_proxy.py --login              # 跳浏览器授权，拿不到客户端时用这个
+  python qoder_proxy.py --login --new-device # 强制生成新设备 ID（多账号隔离）
   python qoder_proxy.py --capture
   python qoder_proxy.py --models
+  python qoder_proxy.py --checkin            # 领今天的每日 Credits（多账号）
   python qoder_proxy.py --test-chat "hi"
-  python qoder_proxy.py                      # 启动代理，默认 http://127.0.0.1:8791
 """
 import argparse
 import base64
@@ -61,6 +67,9 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+import webbrowser
+
+import qoder_cosy as _cosy
 
 # ── 常量与路径 ────────────────────────────────────────────────────────────────
 PORT = int(os.environ.get("QODER_PROXY_PORT", "8791"))
@@ -81,6 +90,8 @@ BUSINESS_PRODUCT = os.environ.get("QODER_PROXY_BUSINESS_PRODUCT", "cli")
 HERE = os.path.dirname(os.path.abspath(__file__))
 SIGN_JS = os.environ.get("QODER_SIGN_JS", os.path.join(HERE, "qoder_sign.mjs"))
 NODE = os.environ.get("QODER_PROXY_NODE", "node")
+# auto（默认）：纯 Python 优先，异常才回落 node；py：只用纯 Python；node：只用 sidecar
+SIGN_BACKEND = (os.environ.get("QODER_PROXY_SIGN_BACKEND") or "auto").strip().lower()
 # 账号池默认放在仓库外：文件里是真 token，llm-proxy 是 git 工作区且没有 .gitignore，
 # 放在脚本旁边很容易被一次 git add . 提交出去。用 QODER_PROXY_ACCOUNTS 可覆盖。
 ACCOUNTS_FILE = os.environ.get("QODER_PROXY_ACCOUNTS") or os.path.join(
@@ -104,6 +115,9 @@ INFER_QUERY = "FetchKeys=llm_model_result&AgentId=agent_common&Encode=1"
 REFRESH_PATH = "/api/v1/deviceToken/refresh"
 USERINFO_PATH = "/api/v1/userinfo"
 ORG_TAGS_PATH = "/api/v1/organizations/{org}/tags"
+CAMPAIGNS_PATH = "/sash/api/v1/me/campaigns"
+MACHINE_OS = os.environ.get("QODER_PROXY_MACHINE_OS") or (
+    "x86_64_win32" if sys.platform == "win32" else "x86_64_" + sys.platform)
 
 DEFAULT_GATEWAY = "https://gateway.qoder.com.cn"
 DEFAULT_OPENAPI = "https://openapi.qoder.com.cn"
@@ -137,6 +151,12 @@ def _endpoint(kind):
 
 GATEWAY = os.environ.get("QODER_PROXY_GATEWAY") or _endpoint("infer")
 OPENAPI = os.environ.get("QODER_PROXY_OPENAPI") or _endpoint("openapi")
+
+# 设备码登录（--login）：站点授权页 base 取自 bundle 里 startDeviceFlow 的 site 参数
+# （CN 版是 https://qoder.cn，国际版是 https://qoder.com）；轮询走 openapi host。
+# 客户端 bundle 里的懒初始化会给出真 client_id，所以这里不需要硬编码。
+SITE = os.environ.get("QODER_PROXY_SITE") or "https://qoder.cn"
+LOGIN_TIMEOUT_SEC = int(os.environ.get("QODER_PROXY_LOGIN_TIMEOUT", "330"))
 
 LOG_FILE = os.environ.get("QODER_PROXY_LOG") or ""
 LOG_MAX_BYTES = int(os.environ.get("QODER_PROXY_LOG_MAX_MB", "5")) << 20
@@ -299,7 +319,7 @@ def _parse_exp(s):
 
 
 # ── openapi 明文 JSON（无需 Cosy 签名）───────────────────────────────────────
-def _openapi_json(method, path, body=None, token="", timeout=20):
+def _openapi_json(method, path, body=None, token="", timeout=20, headers=None):
     """打一次 openapi 请求，返回 (status, json_dict)。这几个端点只认 Bearer，不签名。"""
     url = OPENAPI + path
     data = json.dumps(body, ensure_ascii=False).encode("utf-8") if body is not None else None
@@ -308,6 +328,9 @@ def _openapi_json(method, path, body=None, token="", timeout=20):
     req.add_header("Accept", "application/json")
     if data is not None:
         req.add_header("Content-Type", "application/json")
+    for k, v in (headers or {}).items():
+        if v not in (None, ""):
+            req.add_header(str(k), str(v))
     if token:
         req.add_header("Authorization", "Bearer " + token)
     try:
@@ -326,18 +349,79 @@ def _openapi_json(method, path, body=None, token="", timeout=20):
 
 
 def _enrich_account(acct):
-    """补 uid / 组织信息（签名要用）；只存 id，不存邮箱姓名等 PII。"""
+    """补 uid / 组织信息（签名要用）；只存 id 和显示名，不存邮箱等 PII。"""
     tok = acct.get("token") or ""
     st, ui = _openapi_json("GET", USERINFO_PATH, token=tok)
     if st == 200 and isinstance(ui, dict):
         acct["uid"] = ui.get("id") or acct.get("uid") or ""
         acct["organizationId"] = ui.get("orgId") or ""
+        acct["displayName"] = (ui.get("displayName") or ui.get("name")
+                               or ui.get("nickName") or acct.get("displayName") or "")
         org = acct["organizationId"]
         if org:
             st2, tags = _openapi_json("GET", ORG_TAGS_PATH.format(org=org), token=tok)
             if st2 == 200 and isinstance(tags, dict):
                 acct["organizationTags"] = tags.get("tags") or tags.get("data") or []
     return acct
+
+
+# ── 每日 Credits 签到（单账号）──────────────────────────────────────────────
+def _cosy_device_headers(acct):
+    return {
+        "Cosy-Version": acct.get("cosyVersion") or "1.1.69",
+        "Cosy-ClientType": "5",
+        "Cosy-MachineOS": MACHINE_OS,
+        "Cosy-MachineId": acct.get("machineId") or "",
+        "Cosy-MachineToken": acct.get("machineToken") or acct.get("machineId") or "",
+        "Cosy-MachineType": str(acct.get("machineType") or "5"),
+        "Cosy-MachineCode": acct.get("machineCode") or "",
+    }
+
+
+def _campaign_id(campaign):
+    for k in ("id", "campaignId", "campaign_id"):
+        v = campaign.get(k)
+        if v not in (None, ""):
+            return str(v)
+    return ""
+
+
+def _checkin_account(acct):
+    """只给传入的这一个账号领今天的 campaign；没有可领项就是成功 no-op。"""
+    token = acct.get("token") or ""
+    headers = _cosy_device_headers(acct)
+    st, obj = _openapi_json("GET", CAMPAIGNS_PATH, token=token, headers=headers)
+    rep = {"status": st, "campaigns": 0, "claimable": False, "claimed": []}
+    if st != 200 or not isinstance(obj, dict):
+        rep["error"] = ((obj or {}).get("message") if isinstance(obj, dict) else "")
+        rep["error"] = rep["error"] or "HTTP %s" % st
+        return False, rep
+    cps = [c for c in (obj.get("campaigns") or []) if isinstance(c, dict)]
+    rep["campaigns"] = len(cps)
+    rep["claimable"] = bool(obj.get("claimable"))
+    if not rep["claimable"]:
+        rep["message"] = "当前没有可领取的活动（可能已领、未到窗口或活动已结束）"
+        return True, rep
+    target = next((c for c in cps if _campaign_id(c)), None)
+    if target is None:
+        rep["message"] = "claimable=true 但响应里没有 campaign id"
+        return False, rep
+    cid = _campaign_id(target)
+    path = "%s/%s/claim" % (CAMPAIGNS_PATH, urllib.parse.quote(cid, safe=""))
+    cst, cobj = _openapi_json("POST", path, body={}, token=token, headers=headers)
+    item = {"id": cid, "status": cst}
+    if isinstance(cobj, dict):
+        for k in ("message", "code", "success"):
+            if k in cobj:
+                item[k] = cobj[k]
+    rep["claimed"].append(item)
+    st2, obj2 = _openapi_json("GET", CAMPAIGNS_PATH, token=token, headers=headers)
+    rep["after"] = {"status": st2,
+                    "claimable": bool(obj2.get("claimable")) if isinstance(obj2, dict) else None}
+    ok = cst in (200, 201, 204)
+    if not ok:
+        rep["error"] = item.get("message") or "claim HTTP %s" % cst
+    return ok, rep
 
 
 # ── 账号池 ────────────────────────────────────────────────────────────────────
@@ -348,7 +432,12 @@ _last_sweep = [0.0]
 
 
 def _label_of(a):
-    return a.get("account") or ("uid-" + (a.get("uid") or "")[:8])
+    uid_part = "uid-" + (a.get("uid") or "")[:8]
+    name = a.get("displayName") or ""
+    base = a.get("account") or uid_part
+    if name and base == uid_part:
+        return "%s (%s)" % (name, uid_part)
+    return base
 
 
 def _load_pool_locked():
@@ -438,6 +527,8 @@ def _capture_current():
         "expiresAt": data.get("expiresAt") or "",
         "refreshTokenExpiresAt": data.get("refreshTokenExpiresAt") or "",
         "uid": user.get("id") or "",
+        "displayName": (user.get("displayName") or user.get("name")
+                        or user.get("nickName") or ""),
         "exp": _parse_exp(data.get("expiresAt")),
         "organizationId": "",
         "organizationTags": [],
@@ -456,6 +547,162 @@ def _capture_current():
     acct["account"] = "uid-" + (acct.get("uid") or "")[:8]
     acct["session_seed"] = acct["account"]
     return acct
+
+
+# ── 设备码登录（--login：浏览器授权换 token，不需要装客户端）──────────────────
+class LoginError(Exception):
+    pass
+
+
+def _device_login_argv(machine, site=None, client_id=None):
+    """组 sidecar 的一次性 --login 命令行。
+
+    没有客户端登录态时 machine 参数直接省略（sidecar 自己生成 uuid），这样
+    全新机器 / 纯 Linux 容器也能 --login。
+    """
+    argv = [NODE, SIGN_JS, "--login", "--site", site or SITE, "--openapi", OPENAPI]
+    if machine.get("machineId"):
+        argv += ["--machine-id", machine["machineId"]]
+    if machine.get("machineToken"):
+        argv += ["--machine-token", machine["machineToken"]]
+    if client_id:
+        argv += ["--client-id", client_id]
+    return argv
+
+
+def _account_from_device_token(dev, machine=None):
+    """设备码轮询回来的 JSON → 池内账号 dict。
+
+    上游给的是 snake_case，客户端自己归一化成 camelCase，两种都要吃下；
+    只存显示名和 id，不存邮箱等 PII。
+    """
+    if not isinstance(dev, dict):
+        return None
+    token = dev.get("token") or dev.get("device_token") or ""
+    if not token:
+        return None
+    profile = dev.get("profile") if isinstance(dev.get("profile"), dict) else {}
+    expires = dev.get("expires_at") or dev.get("expiresAt") or ""
+    exp = _parse_exp(expires)
+    if exp is None:
+        exp = _parse_exp(dev.get("expireTimeS"))
+    if exp is None and dev.get("expires_in") is not None:
+        try:
+            exp = time.time() + float(dev["expires_in"])
+        except Exception:
+            exp = None
+    acct = {
+        "token": token,
+        "refreshToken": (dev.get("refresh_token") or dev.get("device_refresh_token")
+                         or dev.get("refreshToken") or ""),
+        "expiresAt": expires,
+        "refreshTokenExpiresAt": (dev.get("refresh_token_expires_at")
+                                  or dev.get("refreshTokenExpiresAt")
+                                  or dev.get("refreshTokenExpireTimeS") or ""),
+        "uid": dev.get("user_id") or dev.get("uid") or profile.get("uid") or "",
+        "displayName": (profile.get("displayName") or profile.get("name")
+                        or profile.get("nickName") or ""),
+        "exp": exp,
+        "organizationId": "",
+        "organizationTags": [],
+        "dataPolicyAgreed": False,
+        "cosyVersion": os.environ.get("QODER_COSY_VERSION", "1.1.69"),
+        "captured_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "login": "device",
+    }
+    for k in ("machineId", "machineToken", "machineType", "machineCode"):
+        acct[k] = (machine or {}).get(k) or ""
+    if not acct["machineId"] and dev.get("machineIdUsed"):
+        acct["machineId"] = dev["machineIdUsed"]
+    return acct
+
+
+def _consume_login_lines(lines, on_auth_url=None, deadline=None):
+    """转 sidecar --login 的 JSON-lines：auth_url 一到就回调（要用户去点），拿到 token 返回。"""
+    for raw in lines:
+        if deadline and time.time() > deadline:
+            raise LoginError("等待授权超时")
+        try:
+            obj = json.loads(raw)
+        except Exception:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        if obj.get("ok") is False or obj.get("event") == "error":
+            raise LoginError(str(obj.get("error") or "签名器登录失败"))
+        if obj.get("event") == "auth_url":
+            url = obj.get("url") or ""
+            if url and on_auth_url:
+                on_auth_url(url)
+        elif obj.get("event") == "token":
+            return obj.get("data") or {}
+    raise LoginError("签名器没有返回 token（未授权、超时或 sidecar 已退出）")
+
+
+def _cmd_login(_args=None, popen=None, open_url=None, new_device=False):
+    """设备码登录：打印/打开授权链接 → sidecar 轮询 → token 入池。
+    new_device=True 时强制生成新设备 ID（不用本机的），用于多账号隔离。"""
+    site = getattr(_args, "site", None) or SITE
+    client_id = getattr(_args, "client_id", None)
+    machine = {} if new_device else _machine_identity()
+    spawn = popen or (lambda argv, **kw: subprocess.Popen(
+        argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        text=True, encoding="utf-8", bufsize=1, cwd=HERE))
+    opener = open_url or webbrowser.open
+    try:
+        proc = spawn(_device_login_argv(machine, site=site, client_id=client_id))
+    except Exception as e:
+        _print_err("启动签名器失败: %s" % e)
+        _print_err("--login 需要 node 和 qoder_sign.mjs"
+                   "（可用 QODER_PROXY_NODE / QODER_SIGN_JS 指定路径）")
+        return 1
+
+    def _show(url):
+        print("请在浏览器里完成授权（选择账号并确认，5 分钟内有效）:")
+        print("  %s" % url)
+        try:
+            opened = bool(opener(url))
+        except Exception as e:
+            _log("打开浏览器失败: %s" % e)
+            opened = False
+        print("  %s" % ("已尝试打开浏览器，等待授权…" if opened
+                        else "浏览器没有自动打开，请手动复制上面的链接"))
+        sys.stdout.flush()
+
+    try:
+        dev = _consume_login_lines(proc.stdout, on_auth_url=_show,
+                                   deadline=time.time() + LOGIN_TIMEOUT_SEC)
+    except LoginError as e:
+        _print_err("登录失败: %s" % e)
+        return 1
+    finally:
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+    acct = _account_from_device_token(dev, machine)
+    if not acct:
+        _print_err("授权结果里没有 token，请重新 --login")
+        return 1
+    try:
+        acct = _enrich_account(acct)       # 补 uid/组织标签（签名要用）；拿不到不影响登录
+    except Exception as e:
+        _log("补全账号信息失败: %s" % e)
+        _print_err("提示：没取到组织信息，如果上游报 403 请重新 --login")
+    label = _add_session_to_pool(acct)
+    print("已入池: %s" % label)
+    print("  token      %s" % _redact(acct["token"]))
+    print("  有效期至   %s" % (acct.get("expiresAt") or "unknown"))
+    print("  可续期     %s" % ("是" if acct.get("refreshToken") else "否"))
+    print("  机器 ID    %s" % (acct.get("machineId") or "-"))
+    print("  凭证文件   %s" % ACCOUNTS_FILE)
+    if not acct.get("machineToken"):
+        _print_err("提示：本机没有客户端的 machine_token，自动续期可能被拒；"
+                   "临期重新 --login 即可")
+    return 0
 
 
 def _pool_expired(a, now):
@@ -689,7 +936,131 @@ def _auth_of(acct):
     }
 
 
-_signer = _Signer()
+class _NativeSigner:
+    """纯 Python 签名器：qoder_cosy.py 复刻的 WASM 算法，不需要 node。"""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._cache = {}
+        self.last_info = None
+
+    @staticmethod
+    def _key(auth):
+        return (auth.get("uid") or "", auth.get("token") or "",
+                auth.get("machineId") or "",
+                auth.get("cosyVersion") or _cosy.COSY_VERSION,
+                auth.get("organizationId") or "",
+                tuple(auth.get("organizationTags") or []),
+                bool(auth.get("dataPolicyAgreed")))
+
+    def _ctx(self, auth):
+        key = self._key(auth)
+        with self._lock:
+            ctx = self._cache.get(key)
+            if ctx is None:
+                ctx = _cosy.CosyContext.from_account(auth)
+                self._cache = {key: ctx}   # 只留当前账号，池子轮换时不涨内存
+            return ctx
+
+    @staticmethod
+    def _build(ctx, params):
+        body = params.get("body")
+        if body is not None and not isinstance(body, (str, bytes)):
+            body = json.dumps(body, ensure_ascii=False, separators=(",", ":"))
+        endpoint = params.get("endpoint") or GATEWAY
+        if params.get("infer"):
+            if body is None:
+                raise SignerError("infer 请求需要 body")
+            r = ctx.prepare_infer_request(endpoint, body,
+                                          params["infer"].get("model"),
+                                          params["infer"].get("source") or "system")
+        else:
+            extra = params.get("extraHeaders")
+            if isinstance(extra, str):
+                extra = json.loads(extra)
+            r = ctx.prepare_request(endpoint, params.get("path") or "/",
+                                    (params.get("method") or "GET").upper(),
+                                    params.get("authType") or "auth", body, extra)
+        out = {"url": r["url"], "headers": r["headers"]}
+        if "body" in r:
+            out["body"] = r["body"]
+        return out
+
+    def request(self, acct, params, timeout=None):
+        return self._build(self._ctx(_auth_of(acct)), params)
+
+    def peek(self):
+        self.last_info = {"started": True, "backend": "python", "node": None,
+                          "cosyVersion": _cosy.COSY_VERSION, "wasmReady": True}
+        return self.last_info
+
+    def info(self):
+        return self.peek()
+
+    @staticmethod
+    def describe():
+        return "纯 Python（qoder_cosy.py，不需要 node）"
+
+
+class _AutoSigner:
+    """auto：纯 Python 优先，签名异常再回落 node sidecar。"""
+
+    def __init__(self, native=None, node=None, mode=None):
+        self.mode = mode or SIGN_BACKEND
+        self._native = native if native is not None else _NativeSigner()
+        self._node = node if node is not None else _Signer()
+        self.last_info = None
+
+    def request(self, acct, params, timeout=None):
+        if self.mode == "py":
+            return self._native.request(acct, params, timeout=timeout)
+        if self.mode == "node":
+            return self._node.request(acct, params, timeout=timeout)
+        try:
+            return self._native.request(acct, params, timeout=timeout)
+        except Exception as py_err:
+            try:
+                out = self._node.request(acct, params, timeout=timeout)
+            except Exception as node_err:
+                raise SignerError("纯 Python 签名失败(%s)；node 回落也失败(%s)"
+                                  % (py_err, node_err))
+            self.last_info = {"started": True, "backend": "node",
+                              "fallback_from": str(py_err)}
+            return out
+
+    def peek(self):
+        if self.mode == "node":
+            return self._node.peek()
+        info = dict(self._native.peek())
+        if self.mode == "auto":
+            info["fallback"] = "node"
+            if self.last_info and self.last_info.get("backend") == "node":
+                info.update(self.last_info)
+        return info
+
+    def info(self):
+        if self.mode == "node":
+            return self._node.info()
+        return self.peek()
+
+    def describe(self):
+        if self.mode == "node":
+            return "qoder_sign.mjs（node 子进程）"
+        if self.mode == "py":
+            return self._native.describe()
+        return "纯 Python 优先（qoder_cosy.py；node 仅回落）"
+
+
+def _make_signer(mode=None):
+    mode = (mode or SIGN_BACKEND)
+    if mode == "py":
+        return _NativeSigner()
+    if mode == "node":
+        return _Signer()
+    return _AutoSigner()
+
+
+_signer = _make_signer()
 
 
 # ── 上游 HTTP（按 host 维护 keep-alive 连接池）────────────────────────────────
@@ -824,6 +1195,8 @@ def _normalize_models(raw):
                 "price_factor": m.get("price_factor"),
                 "format": m.get("format") or "openai",
                 "scene": scene,
+                "thinking_config": m.get("thinking_config")
+                if isinstance(m.get("thinking_config"), dict) else None,
             })
     return out
 
@@ -883,6 +1256,141 @@ def _session_id(acct):
     return str(uuid.uuid5(uuid.NAMESPACE_URL, "qoder-proxy:" + seed))
 
 
+# 思考深度：与客户端一致的档位表与预算换算（bundle: Ujc 表 / s_() 分段）。
+EFFORT_BUDGETS = {"none": 0, "low": 1024, "medium": 8192, "high": 24576,
+                  "xhigh": 49152, "max": 65536}
+_EFFORT_ALIASES = {"disabled": "none", "off": "none", "minimal": "low"}
+
+
+def _effort_of_budget(n):
+    """预算 token → 档位（客户端 s_() 的分段）。"""
+    if n <= 0:
+        return "none"
+    if n <= 1024:
+        return "low"
+    if n <= 8192:
+        return "medium"
+    if n <= 24576:
+        return "high"
+    if n <= 49152:
+        return "xhigh"
+    return "max"
+
+
+def _norm_effort(v):
+    """档位字符串/数值 → 规范档位；无法识别的值返回 None。"""
+    if v is None or isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)):
+        return _effort_of_budget(v)
+    s = str(v).strip().lower()
+    s = _EFFORT_ALIASES.get(s, s)
+    return s if s in EFFORT_BUDGETS else None
+
+
+def _thinking_inputs(body):
+    """三协议入参 → (effort, budget, enable, preserve)，未提及项为 None。
+
+    覆盖 OpenAI 直发（reasoning_effort / thinking_budget / enable_thinking）、
+    Responses（reasoning.effort）、Anthropic 及兼容层（thinking.type 与 budget）。
+    """
+    effort = _norm_effort(body.get("reasoning_effort"))
+    budget = body.get("reasoning_budget_tokens")
+    if not isinstance(budget, (int, float)) or isinstance(budget, bool):
+        budget = body.get("thinking_budget")
+    budget = budget if isinstance(budget, (int, float)) and not isinstance(budget, bool) else None
+    enable = body.get("enable_thinking") if isinstance(body.get("enable_thinking"), bool) else None
+    preserve = body.get("preserve_thinking") \
+        if isinstance(body.get("preserve_thinking"), bool) else None
+    r = body.get("reasoning")
+    if isinstance(r, dict):
+        if effort is None:
+            effort = _norm_effort(r.get("effort"))
+        if enable is None and isinstance(r.get("enabled"), bool):
+            enable = r["enabled"]
+        rb = r.get("budgetTokens", r.get("budget_tokens"))
+        if budget is None and isinstance(rb, (int, float)) and not isinstance(rb, bool):
+            budget = rb
+    t = body.get("thinking")
+    if isinstance(t, dict):
+        typ = str(t.get("type") or "").strip().lower()
+        if enable is None and typ in ("enabled", "disabled", "off"):
+            enable = typ == "enabled"
+        tb = t.get("budget_tokens", t.get("budgetTokens"))
+        if budget is None and isinstance(tb, (int, float)) and not isinstance(tb, bool):
+            budget = tb
+    if effort is None and budget is not None:
+        effort = _effort_of_budget(budget)
+    if effort is None and enable is False:
+        effort = "none"
+    return effort, budget, enable, preserve
+
+
+def _allowed_efforts(model):
+    """模型声明的档位：thinking_config.enabled.efforts + disabled → none。
+
+    返回 None 表示清单没给信息（不校验，原样透传）。
+    """
+    tc = (model or {}).get("thinking_config")
+    if not isinstance(tc, dict):
+        return None
+    allowed = []
+    en = tc.get("enabled")
+    effs = en.get("efforts") if isinstance(en, dict) else None
+    if isinstance(effs, dict):
+        for k in effs:
+            e = _norm_effort(k)
+            if e and e != "none" and e not in allowed:
+                allowed.append(e)
+    d = tc.get("disabled")
+    if "disabled" in tc and d is not None and d is not False and "none" not in allowed:
+        allowed.append("none")
+    allowed.sort(key=lambda e: EFFORT_BUDGETS[e])
+    return allowed
+
+
+def _clamp_effort(effort, allowed):
+    """按预算距离取最接近的声明档位（同距取小）；无可用档位返回 None。"""
+    cands = [a for a in allowed if a != "none"] if effort != "none" else list(allowed)
+    if not cands:
+        return None
+    return min(cands, key=lambda a: (abs(EFFORT_BUDGETS[a] - EFFORT_BUDGETS[effort]),
+                                     EFFORT_BUDGETS[a]))
+
+
+def _thinking_upstream(oa, model):
+    """思考深度入参 → 上游 (reasoningEffort, parameters 增量)。
+
+    档位不在模型声明的集合内时按预算距离就近调整（与客户端档位表一致）；
+    预算只在显式给出正数且与最终档位同一来源时上送，关思考时清掉。
+    """
+    effort, budget, enable, preserve = _thinking_inputs(oa)
+    if effort is None and budget is None and enable is None and preserve is None:
+        return None, None
+    allowed = _allowed_efforts(model)
+    if effort is not None and allowed is not None and effort not in allowed:
+        clamped = _clamp_effort(effort, allowed)
+        _log("思考档位 %s 不在模型 %s 声明的 %s 内，调整为 %s"
+             % (effort, model.get("key"), allowed, clamped))
+        if clamped is None:
+            return None, None
+        effort, budget = clamped, None
+    params = {}
+    if effort is not None:
+        params["reasoning_effort"] = effort
+        if effort == "none":
+            enable, budget = False, None
+        else:
+            enable = True
+    if enable is not None:
+        params["enable_thinking"] = enable
+    if budget is not None and budget > 0:
+        params["reasoning_budget_tokens"] = int(budget)
+    if preserve is not None:
+        params["preserve_thinking"] = preserve
+    return effort, params
+
+
 def _build_infer_payload(oa, model, acct):
     mid = str(uuid.uuid4())
     payload = {
@@ -900,6 +1408,14 @@ def _build_infer_payload(oa, model, acct):
               "presence_penalty", "frequency_penalty", "seed", "response_format"):
         if oa.get(k) is not None:
             payload[k] = oa[k]
+    think_effort, think_params = _thinking_upstream(oa, model)
+    if think_effort:
+        payload["reasoningEffort"] = think_effort
+    if think_params:
+        base = oa.get("parameters")
+        merged = dict(base) if isinstance(base, dict) else {}
+        merged.update(think_params)
+        payload["parameters"] = merged
     if payload["model_config"].get("key") in (None, "auto", ""):
         payload["model_config"]["key"] = DEFAULT_MODEL
     return payload
@@ -1136,6 +1652,8 @@ def convert_responses_to_openai(body):
     tc = _tool_choice_to_openai(body.get("tool_choice"), "responses")
     if tc is not None:
         oa["tool_choice"] = tc
+    if isinstance(body.get("reasoning"), dict):
+        oa["reasoning"] = body["reasoning"]
     return oa
 
 
@@ -1200,6 +1718,8 @@ def convert_anthropic_to_openai(body):
     tc = _tool_choice_to_openai(body.get("tool_choice"), "anthropic")
     if tc is not None:
         oa["tool_choice"] = tc
+    if isinstance(body.get("thinking"), dict):
+        oa["thinking"] = body["thinking"]
     return oa
 
 
@@ -1756,7 +2276,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             out["error"] = "账号池为空，请先 --capture 或 --import"
         si = _signer.peek()
         out["signer"] = {"started": bool(si.get("started") or si.get("wasmReady")),
-                         "node": si.get("node"), "cosyVersion": si.get("cosyVersion"),
+                         "backend": si.get("backend"), "node": si.get("node"),
+                         "cosyVersion": si.get("cosyVersion"),
                          "bundle": bool(si.get("bundle")), "error": si.get("error")}
         out["models"] = len(_models["list"])
         return self._json(200, out)
@@ -1774,7 +2295,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                  "vision": m["vision"],
                  "metadata": {"display_name": m["name"], "source": m["source"],
                               "format": m["format"], "price_factor": m["price_factor"],
-                              "enabled": m["enabled"], "scene": m["scene"]}}
+                              "enabled": m["enabled"], "scene": m["scene"],
+                              "thinking_config": m["thinking_config"]}}
                 for m in cached["list"]]
         return self._json(200, {"object": "list", "data": data})
 
@@ -2095,10 +2617,18 @@ def _cmd_check(_args=None):
                                             "有" if r["has_refresh"] else "无",
                                             " [续期链已失效]" if r["refresh_dead"] else ""))
     info = _signer.info()
-    print("签名器   node=%s cosy=%s wasm=%s bundle=%s%s"
-          % (info.get("node"), info.get("cosyVersion"), info.get("wasmReady"),
-             bool(info.get("bundle")),
-             "" if not info.get("error") else " 错误: %s" % info.get("error")))
+    if info.get("backend") == "node" or info.get("node"):
+        print("签名器   node=%s cosy=%s wasm=%s bundle=%s%s"
+              % (info.get("node"), info.get("cosyVersion"), info.get("wasmReady"),
+                 bool(info.get("bundle")),
+                 "" if not info.get("error") else " 错误: %s" % info.get("error")))
+    else:
+        backend = "纯 Python" if not info.get("fallback") else "纯 Python 优先"
+        print("签名器   %s cosy=%s%s"
+              % (backend, info.get("cosyVersion"),
+                 "" if not info.get("error") else " 错误: %s" % info.get("error")))
+    print("登录     站点=%s 设备码登录=%s"
+          % (SITE, "可用" if info.get("deviceInit") else "需 node 侧支持"))
     if not isinstance(info.get("error"), str) and info.get("wasmReady"):
         try:
             cached = _fetch_models()
@@ -2106,6 +2636,35 @@ def _cmd_check(_args=None):
         except Exception as e:
             print("模型     清单拉取失败: %s" % e)
     return 0
+
+
+def _cmd_checkin(_args=None):
+    with _pool_lock:
+        accs = list(_load_pool_locked())
+    if not accs:
+        _print_err("账号池为空：先运行 --capture / --login / --import")
+        return 1
+    all_ok = True
+    for acct in accs:
+        ok, rep = _checkin_account(acct)
+        print("账号     %s" % _label_of(acct))
+        print("活动     HTTP %s campaigns=%d claimable=%s"
+              % (rep["status"], rep["campaigns"], rep["claimable"]))
+        for x in rep["claimed"]:
+            print("领取     %s → HTTP %s%s"
+                  % (x["id"], x.get("status"),
+                     (" " + str(x["message"])) if x.get("message") else ""))
+        if rep.get("after"):
+            print("领取后   HTTP %s claimable=%s"
+                  % (rep["after"]["status"], rep["after"]["claimable"]))
+        if rep.get("message"):
+            print("结果     %s" % rep["message"])
+        if not ok:
+            _print_err("签到失败: %s" % (rep.get("error") or rep.get("message")))
+            all_ok = False
+        if len(accs) > 1:
+            print("-" * 40)
+    return 0 if all_ok else 1
 
 
 def _cmd_test_chat(text="hi", model_name=None):
@@ -2147,6 +2706,109 @@ def _cmd_test_chat(text="hi", model_name=None):
     return 0
 
 
+def _interactive_menu():
+    """交互式主菜单：启动前选择动作。返回 action 字符串。
+    仅在 stdin 是 tty 时弹出；非交互直接返回 'serve'。"""
+    if not sys.stdin.isatty():
+        return 'serve'
+    while True:
+        with _pool_lock:
+            accs = list(_load_pool_locked())
+        now = time.time()
+        print("\n" + "=" * 56)
+        print("  Qoder CN 官方模型本地代理")
+        print("=" * 56)
+        print("  账号池: %d 个账号" % len(accs))
+        for a in accs:
+            exp = a.get("exp") or 0
+            tag = "[过期]" if exp and exp < now else "[有效]"
+            print("    %s %s %s" % (_label_of(a), tag, (a.get("expiresAt") or "")[:19]))
+        print("-" * 56)
+        if sys.platform == "win32":
+            print("  0 启动代理")
+            print("  1 浏览器设备码登录（加入账号池，可连续登多个）")
+            print("  2 浏览器设备码登录（新设备 ID，最大隔离）")
+            print("  3 抓取本机 Qoder CN 客户端登录态")
+            print("  4 领取今天的每日 Credits（多账号）")
+            print("  5 查看账号池详情")
+            print("  6 移除账号")
+            print("  7 导出账号池（跨电脑迁移）")
+            print("  8 导入账号池")
+            print("  9 退出")
+        else:
+            print("  0 启动代理")
+            print("  1 浏览器设备码登录（加入账号池，可连续登多个）")
+            print("  2 浏览器设备码登录（新设备 ID，最大隔离）")
+            print("  3 领取今天的每日 Credits（多账号）")
+            print("  4 查看账号池详情")
+            print("  5 移除账号")
+            print("  6 导出账号池（跨电脑迁移）")
+            print("  7 导入账号池")
+            print("  8 退出")
+        print("-" * 56)
+        try:
+            choice = input("请选择: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return 'quit'
+        if choice == "0" or choice == "":
+            return 'serve'
+        if choice == "1":
+            return 'login'
+        if choice == "2":
+            return 'login_new'
+        if sys.platform == "win32":
+            if choice == "3":
+                return 'capture'
+            if choice == "4":
+                _cmd_checkin()
+                continue
+            if choice == "5":
+                _cmd_list()
+                continue
+            if choice == "6":
+                label = input("要移除的账号标签: ").strip()
+                if label:
+                    _cmd_remove(label)
+                continue
+            if choice == "7":
+                path = input("导出路径: ").strip()
+                if path:
+                    _cmd_export(path)
+                continue
+            if choice == "8":
+                path = input("导入文件路径: ").strip()
+                if path:
+                    _cmd_import(path)
+                continue
+            if choice == "9":
+                return 'quit'
+        else:
+            if choice == "3":
+                _cmd_checkin()
+                continue
+            if choice == "4":
+                _cmd_list()
+                continue
+            if choice == "5":
+                label = input("要移除的账号标签: ").strip()
+                if label:
+                    _cmd_remove(label)
+                continue
+            if choice == "6":
+                path = input("导出路径: ").strip()
+                if path:
+                    _cmd_export(path)
+                continue
+            if choice == "7":
+                path = input("导入文件路径: ").strip()
+                if path:
+                    _cmd_import(path)
+                continue
+            if choice == "8":
+                return 'quit'
+
+
 def _serve():
     try:
         server = QuietServer(("0.0.0.0", PORT), Handler)
@@ -2159,7 +2821,7 @@ def _serve():
     print("  Anthropic   POST /v1/messages、/v1/messages/count_tokens")
     print("  健康        GET /health")
     print("  上游        %s%s" % (GATEWAY, INFER_PATH))
-    print("  签名        qoder_sign.mjs（node 子进程，不需要开客户端）")
+    print("  签名        %s" % _signer.describe())
     if API_KEY:
         print("  API Key     已启用（QODER_PROXY_API_KEY）")
     else:
@@ -2167,7 +2829,7 @@ def _serve():
     with _pool_lock:
         n = len(_load_pool_locked())
     if not n:
-        print("  警告        账号池为空，先运行: python qoder_proxy.py --capture")
+        print("  警告        账号池为空，先运行: python qoder_proxy.py --login 或 --capture")
     _log("启动 port=%d accounts=%d" % (PORT, n))
     try:
         server.serve_forever()
@@ -2181,17 +2843,27 @@ def main():
     p = argparse.ArgumentParser(
         description="Qoder CN 官方模型本地代理（OpenAI / Responses / Anthropic 三协议）")
     p.add_argument("--capture", action="store_true", help="从本机 Qoder CN 客户端提取登录态入池")
+    p.add_argument("--login", action="store_true",
+                   help="浏览器设备码登录换 token 入池（不需要装 Qoder CN 客户端）")
+    p.add_argument("--new-device", action="store_true",
+                   help="配合 --login：强制生成新设备 ID（不用本机的），用于多账号隔离")
+    p.add_argument("--site", help="设备码授权页 base（默认 https://qoder.cn，等价 QODER_PROXY_SITE）")
+    p.add_argument("--client-id", help="覆盖设备码登录的 client_id（默认取自客户端 bundle）")
     p.add_argument("--list", action="store_true", help="列出池内账号（脱敏）")
     p.add_argument("--remove", metavar="ACCOUNT", help="移除池内账号")
     p.add_argument("--export", metavar="FILE", help="导出凭证包（跨机迁移）")
     p.add_argument("--import", dest="import_", metavar="FILE", help="导入凭证包")
     p.add_argument("--models", action="store_true", help="打印上游模型清单")
     p.add_argument("--check", action="store_true", help="检查账号池/签名器/连通性")
+    p.add_argument("--checkin", action="store_true",
+                   help="领取今天的每日 Credits（多账号，10:00 后窗口内）")
     p.add_argument("--test-chat", metavar="TEXT", nargs="?", const="hi",
                    help="走完整链路发一条测试消息（默认 hi）")
     p.add_argument("--port", type=int, help="覆盖监听端口")
     p.add_argument("--api-key", help="覆盖 API Key（等价于 QODER_PROXY_API_KEY）")
     p.add_argument("--log", help="日志文件路径（默认关闭）")
+    p.add_argument("--menu", action="store_true", help="启动前弹交互菜单（默认 tty 时自动弹）")
+    p.add_argument("--serve", action="store_true", help="跳过菜单直接启动代理")
     args = p.parse_args()
     if args.port:
         PORT = args.port
@@ -2199,10 +2871,13 @@ def main():
         API_KEY = args.api_key
     if args.log:
         LOG_FILE = args.log
-    for name, fn in (("capture", _cmd_capture), ("list", _cmd_list), ("check", _cmd_check),
-                     ("models", _cmd_models)):
+    for name, fn in (("capture", _cmd_capture),
+                     ("list", _cmd_list), ("check", _cmd_check),
+                     ("checkin", _cmd_checkin), ("models", _cmd_models)):
         if getattr(args, name):
             return fn(args)
+    if args.login:
+        return _cmd_login(args, new_device=getattr(args, 'new_device', False))
     if args.remove:
         return _cmd_remove(args.remove)
     if args.export:
@@ -2211,6 +2886,20 @@ def main():
         return _cmd_import(args.import_)
     if args.test_chat is not None:
         return _cmd_test_chat(args.test_chat)
+    # 无子命令：--serve 直接启动；否则弹交互菜单
+    if not args.serve:
+        action = _interactive_menu()
+        if action == 'quit':
+            return 0
+        if action == 'login':
+            _cmd_login(args)
+            return main()
+        if action == 'login_new':
+            _cmd_login(args, new_device=True)
+            return main()
+        if action == 'capture':
+            _cmd_capture(args)
+            return main()
     return _serve()
 
 

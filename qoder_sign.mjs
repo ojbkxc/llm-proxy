@@ -14,6 +14,8 @@
 //
 // 单独运行（调试）：
 //   node qoder_sign.mjs --selftest
+//   node qoder_sign.mjs --login --site https://qoder.cn --openapi https://openapi.qoder.com.cn
+//   node qoder_sign.mjs --print-client-id
 
 import crypto from "node:crypto";
 import fs from "node:fs";
@@ -53,10 +55,33 @@ function findBundle() {
 // 同时删掉文件尾部的 CLI 入口调用，避免 import 时真的把 CLI 跑起来。
 const DN_NEEDLE = "(A,e)=>{for(var t in e)gTA(A,t,{get:e[t],enumerable:!0})}";
 const ENTRY_NEEDLES = ["fx(),vsr(", "vsr(async()=>"];
+// 插桩内容变了必须让旧的 patched 缓存失效，否则 --login 永远加载没有新导出的旧副本。
+const PATCH_REV = "2";
+
+// 设备码登录：bundle 里那段是 `var ...,Jli=S(()=>{...,Lli=1e3,Epc=3e5,hpc=3,
+// Ipc=/(127\.0\.0\.1|localhost|::1)[:\s]+(\d+)/,Bpc=_$d("…"),Qpc=_$d("…")})`。
+// 混淆变量名每个版本都会变，所以用语义锚点（localhost 代理探测正则 + 1s/5min 常量）定位，
+// 再把懒初始化包装函数导出成 __qoderDeviceInit —— 不调用它，client_id 就是字符串 "undefined"。
+const DEVICE_ANCHOR = "|localhost|::1";
+
+function findDeviceInitName(src) {
+  for (let i = src.indexOf(DEVICE_ANCHOR); i >= 0; i = src.indexOf(DEVICE_ANCHOR, i + 1)) {
+    const j = src.lastIndexOf("=S(()=>{", i);
+    if (j < 0 || i - j > 400) continue;
+    const body = src.slice(j, i + 400);
+    if (!/3e5/.test(body) || !/1e3/.test(body)) continue;
+    let s = j;
+    while (s > 0 && /[A-Za-z0-9_$]/.test(src[s - 1])) s--;
+    const name = src.slice(s, j);
+    if (name) return { name, at: i };
+  }
+  return null;
+}
 
 function patchedPath(bundle) {
   const st = fs.statSync(bundle);
-  const tag = crypto.createHash("sha1").update(`${bundle}|${st.size}|${st.mtimeMs}`).digest("hex").slice(0, 16);
+  const tag = crypto.createHash("sha1")
+    .update(`${bundle}|${st.size}|${st.mtimeMs}|${PATCH_REV}`).digest("hex").slice(0, 16);
   const dir = process.env.QODER_PROXY_CACHE
     || path.join(os.homedir(), ".qoder-cn-proxy", "cache");
   fs.mkdirSync(dir, { recursive: true });
@@ -77,6 +102,11 @@ function patchedPath(bundle) {
     throw new Error("bundle 结构变化：CLI 入口切割点落在表达式中间，需要更新 ENTRY_NEEDLES");
   }
   src = head + "\nexport const __qoderSignerStripped = true;\n";
+  const dev = findDeviceInitName(src);
+  if (dev) {
+    // 只加导出，不改原逻辑；签名路径找不到也不影响（--login 会给出明确报错）
+    src += `export const __qoderDeviceInit = () => ${dev.name}();\n`;
+  }
   const tmp = out + ".tmp";
   fs.writeFileSync(tmp, src);
   fs.renameSync(tmp, out);
@@ -84,11 +114,13 @@ function patchedPath(bundle) {
 }
 
 // ── 加载 WASM 签名器 ────────────────────────────────────────────────────────
+let MOD = null;       // patched bundle 的 ESM 命名空间（含我们注入的 __qoderDeviceInit）
 let MODS = null;      // 插桩后记录到的模块导出表
 let GLUE = null;      // wasm-bindgen 直接导出（QoderContext / generate_runtime_auth_fields ...）
 let HELP = null;      // 高层助手（createContext / headersMapToRecord ...）
 let CTX = null;       // 已签名的当前 QoderContext
 let ctxKey = "";
+let WASM_READY = false;
 
 function pick(...names) {
   for (const m of MODS || []) if (names.every((n) => n in m.getters)) return m.exports;
@@ -100,18 +132,26 @@ function exported(name) {
   return undefined;
 }
 
-async function init() {
-  if (MODS) return;
+async function loadModule() {
+  if (MOD) return MOD;
   const bundle = findBundle();
   const mod = await import(pathToFileURL(patchedPath(bundle)).href);
   if (!globalThis.__QMODS?.length) throw new Error("插桩失败：__QMODS 为空");
+  MOD = mod;
   MODS = globalThis.__QMODS;
+  return mod;
+}
+
+async function init() {
+  await loadModule();
+  if (WASM_READY) return;
   GLUE = pick("QoderContext", "generate_runtime_auth_fields");
   HELP = pick("prepareWasmAuthenticatedRequest", "createContext");
   if (!GLUE || !HELP) throw new Error("未找到 Qoder WASM 签名模块（客户端版本可能已变化）");
   const boot = await HELP.initWasm();
   GLUE = boot && boot.QoderContext ? boot : GLUE;
   MODS.__version = exported("COSY_VERSION") || exported("CLI_VERSION") || "1.1.69";
+  WASM_READY = true;
 }
 
 // 登录态来自 auth.v1.dat（由 qoder_proxy.py 解密后传入）：
@@ -169,9 +209,76 @@ function info() {
   return {
     bundle, error: err,
     cosyVersion: MODS?.__version || null,
-    wasmReady: !!MODS,
+    wasmReady: WASM_READY,
+    deviceInit: !!(MOD && MOD.__qoderDeviceInit),
     node: process.version,
   };
+}
+
+// ── 设备码登录（--login）────────────────────────────────────────────────────
+// 直接复用客户端自己的 startDeviceFlow(openapi, site, machineId, isProd, signal, machineToken)：
+// PKCE(S256) + /device/selectAccounts 授权页 + 1s 轮询 /api/v1/deviceToken/poll（404=还没授权，5min 超时）。
+// 这条通道不需要 WASM，所以只 loadModule()，不 init()。
+function argValue(name, dflt) {
+  const i = process.argv.indexOf(name);
+  if (i < 0) return dflt;
+  const v = process.argv[i + 1];
+  return v && !v.startsWith("--") ? v : dflt;
+}
+
+async function openDeviceFlow() {
+  await loadModule();
+  const start = exported("startDeviceFlow");
+  if (typeof start !== "function") {
+    throw new Error("未找到 startDeviceFlow（客户端版本可能已变化）");
+  }
+  if (typeof MOD.__qoderDeviceInit !== "function") {
+    throw new Error("bundle 结构变化：未定位到设备码登录的懒初始化函数（client_id 拿不到）");
+  }
+  MOD.__qoderDeviceInit();          // 跑一次 esbuild 懒初始化，Bpc/Qpc 才有真值
+  const site = argValue("--site", "https://qoder.cn");
+  const openapi = argValue("--openapi", "https://openapi.qoder.com.cn");
+  const machineId = argValue("--machine-id") || crypto.randomUUID();
+  const machineToken = argValue("--machine-token") || "";
+  const isProd = !["0", "false", "no"].includes(String(argValue("--prod", "1")));
+  const ac = new AbortController();
+  process.on("SIGINT", () => { try { ac.abort(); } catch {} });
+  const flow = await start(openapi, site, machineId, isProd, ac.signal, machineToken);
+  if (!flow || !flow.authUrl) throw new Error("startDeviceFlow 没有返回 authUrl");
+  const cid = argValue("--client-id");
+  if (cid) {
+    // 调试用：强制换 client_id（默认值就取自 bundle 里的真常量，正常不需要覆盖）
+    const u = new URL(flow.authUrl);
+    u.searchParams.set("client_id", cid);
+    flow.authUrl = u.toString();
+  }
+  if (/[?&]client_id=(undefined|null)(&|$)/.test(flow.authUrl)) {
+    throw new Error("authUrl 里 client_id 未解析：懒初始化没生效，需要更新 qoder_sign.mjs 的定位锚点");
+  }
+  return flow;
+}
+
+async function deviceLogin() {
+  const { authUrl, pollForCompletion } = await openDeviceFlow();
+  reply({ ok: true, event: "auth_url", url: authUrl });
+  const beat = setInterval(() => reply({ ok: true, event: "waiting" }), 5000);
+  let dev;
+  try {
+    dev = await pollForCompletion();
+  } finally {
+    clearInterval(beat);
+  }
+  if (!dev || !dev.token) throw new Error("轮询结束但没拿到 token");
+  reply({ ok: true, event: "token", data: dev });
+  process.exit(0);
+}
+
+async function printClientId() {
+  const { authUrl } = await openDeviceFlow();
+  const u = new URL(authUrl);
+  console.log("site        %s", u.origin);
+  console.log("client_id   %s", u.searchParams.get("client_id"));
+  console.log("authUrl     %s", authUrl);
 }
 
 // ── JSON-lines RPC ──────────────────────────────────────────────────────────
@@ -202,7 +309,8 @@ async function handleLine(line) {
 async function selftest() {
   await init();
   console.log("info:", JSON.stringify(info()));
-  const authFile = path.join(HERE, "qoder_proxy_accounts.json");
+  const authFile = process.env.QODER_PROXY_ACCOUNTS
+    || path.join(os.homedir(), ".qoder-cn-proxy", "accounts.json");
   if (!fs.existsSync(authFile)) { console.log("no pool file; 只验证签名器加载"); return; }
   const pool = JSON.parse(fs.readFileSync(authFile, "utf8"));
   const acct = (pool.accounts || [])[0];
@@ -219,6 +327,21 @@ async function selftest() {
 
 if (process.argv.includes("--selftest")) {
   await selftest();
+} else if (process.argv.includes("--login")) {
+  try {
+    await deviceLogin();
+  } catch (e) {
+    reply({ ok: false, event: "error", error: String(e?.message || e),
+            detail: String(e?.stack || "").split("\n").slice(0, 3).join(" | ") });
+    process.exit(1);
+  }
+} else if (process.argv.includes("--print-client-id")) {
+  try {
+    await printClientId();
+  } catch (e) {
+    console.error("print-client-id 失败: %s", String(e?.message || e));
+    process.exit(1);
+  }
 } else {
   let buf = "";
   process.stdin.setEncoding("utf8");
