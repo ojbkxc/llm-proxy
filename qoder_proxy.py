@@ -34,6 +34,8 @@ qoder_proxy.py —— Qoder CN 官方模型通道的本地 API 代理（OpenAI /
   --export / --import  凭证包跨机迁移（目标机不需要 Windows/DPAPI/客户端）
   运行时              token 临期自动续期（POST openapi /api/v1/deviceToken/refresh，无需签名），
                       401/403 自动换号重试，续期链失效的账号标记 refresh_dead 不再反复尝试
+  运行时·签到          每日 Credits 自动领（默认 11:30，逐个账号；没领到按 30 分钟重试，最多 4 次。
+                      QODER_PROXY_CHECKIN_AT 改时间，QODER_PROXY_CHECKIN=0 关掉，--checkin 手动来一发）
 
 零第三方依赖（纯标准库）。只有 --capture 需要 cryptography 解 AES-256-GCM；
 用 --import 迁移动凭证时不需要任何依赖。日常代理与签名都不需要 node。
@@ -86,6 +88,17 @@ RETRY_MAX = 2                   # 连接失败 / 502/503/504 的额外重试次�
 RETRY_BACKOFF_SEC = 0.5         # 退避基数，指数增长
 SWEEP_SEC = 30                  # 账号池临期巡检最小间隔
 
+# 每日 Credits 自动签到（活动窗口每天 10:00 后开放，越晚越稳，所以默认 11:30）
+CHECKIN_ENABLED = (os.environ.get("QODER_PROXY_CHECKIN", "1").strip().lower()
+                   not in ("0", "off", "false", "no"))
+CHECKIN_AT = (os.environ.get("QODER_PROXY_CHECKIN_AT") or "11:30").strip()
+CHECKIN_RETRY_SEC = int(os.environ.get("QODER_PROXY_CHECKIN_RETRY_SEC", "1800"))
+CHECKIN_MAX_ATTEMPTS = int(os.environ.get("QODER_PROXY_CHECKIN_TRIES", "4"))
+# 状态单独放一个文件（不含 token）：池文件由续期写，混在一起会把"池 md5 变了=续期了"
+# 这条判据弄脏；而且进程重启后要知道"今天签过没"，不能只靠内存。
+CHECKIN_STATE_FILE = os.environ.get("QODER_PROXY_CHECKIN_STATE") or os.path.join(
+    os.path.expanduser("~"), ".qoder-cn-proxy", "checkin_state.json")
+
 SCENE = os.environ.get("QODER_PROXY_SCENE", "chat")
 DEFAULT_MODEL = os.environ.get("QODER_PROXY_MODEL", "auto")
 BUSINESS_TYPE = os.environ.get("QODER_PROXY_BUSINESS_TYPE", "agent")
@@ -134,6 +147,7 @@ REFRESH_PATH = "/api/v1/deviceToken/refresh"
 USERINFO_PATH = "/api/v1/userinfo"
 ORG_TAGS_PATH = "/api/v1/organizations/{org}/tags"
 CAMPAIGNS_PATH = "/sash/api/v1/me/campaigns"
+USAGE_PATH = "/sash/api/v2/me/usage"
 MACHINE_OS = os.environ.get("QODER_PROXY_MACHINE_OS") or (
     "x86_64_win32" if sys.platform == "win32" else "x86_64_" + sys.platform)
 
@@ -385,9 +399,12 @@ def _enrich_account(acct):
 
 # ── 每日 Credits 签到（单账号）──────────────────────────────────────────────
 def _cosy_device_headers(acct):
+    # Cosy-ClientType 必须是 10（桌面端）：实测 5 时 /me/campaigns 恒返回
+    # showCampaign=false、campaigns=[]，签到一分领不到；10 才有活动列表。
+    # 推理链路仍用 5（见 _base_headers），只有签到走桌面端身份。
     return {
         "Cosy-Version": acct.get("cosyVersion") or "1.1.69",
-        "Cosy-ClientType": "5",
+        "Cosy-ClientType": "10",
         "Cosy-MachineOS": MACHINE_OS,
         "Cosy-MachineId": acct.get("machineId") or "",
         "Cosy-MachineToken": acct.get("machineToken") or acct.get("machineId") or "",
@@ -404,12 +421,52 @@ def _campaign_id(campaign):
     return ""
 
 
+def _is_credits_benefit(campaign):
+    """这一项是不是"每天 100 Credits"那种真奖励（用于判断今天的份到没到位）。"""
+    return (campaign.get("actionType") == "CLAIM_BENEFIT"
+            and ((campaign.get("benefit") or {}).get("kind") or "").upper() == "CREDITS")
+
+
+def _claimable_campaigns(cps):
+    """真正要领的那几项：actionType=CLAIM_BENEFIT 且 claimStatus=CLAIMABLE。
+    顶层 claimable 只是"有没有份"的总开关，不区分是哪个活动；已领过的项
+    claimStatus 会变成 CLAIMED，所以按项筛才不会把 VIEW_DETAILS 当成奖励去 POST。"""
+    return [c for c in cps
+            if _campaign_id(c) and c.get("actionType") == "CLAIM_BENEFIT"
+            and c.get("claimStatus") == "CLAIMABLE"]
+
+
+def _credits_secured(cps):
+    """今天的 Credits 是否已经在手上（不管是这一轮领的还是客户端/上一轮领的）。"""
+    return any(_is_credits_benefit(c) and c.get("claimStatus") == "CLAIMED" for c in cps)
+
+
+CLAIM_RECEIPT_KEYS = ("grantId", "claimedAt", "grantedAt", "replayed", "status")
+
+
+def _add_on_total(acct):
+    """额度桶里的 addOnQuota.total——发放回执只证明服务端说给了，这个才证明真到手。
+    实测每成功领一次它 +100（客户端日志里 100→200→300）。读不到就 None，不影响签到结论。"""
+    try:
+        st, obj = _openapi_json("GET", USAGE_PATH, token=acct.get("token") or "",
+                                headers=_cosy_device_headers(acct))
+    except Exception:
+        return None
+    if st != 200 or not isinstance(obj, dict):
+        return None
+    q = obj.get("qoderUsage") if isinstance(obj.get("qoderUsage"), dict) else obj
+    total = (q.get("addOnQuota") or {}).get("total")
+    return total if isinstance(total, int) else None
+
+
 def _checkin_account(acct):
-    """只给传入的这一个账号领今天的 campaign；没有可领项就是成功 no-op。"""
+    """只给传入的这一个账号领今天的 Credits campaign；没有可领项就是成功 no-op。
+    claim 的响应就是发放回执（grantId/claimedAt/grantedAt），重复 POST 返回 replayed=true
+    不再二次发放，所以整条链路可以随便重试。"""
     token = acct.get("token") or ""
     headers = _cosy_device_headers(acct)
     st, obj = _openapi_json("GET", CAMPAIGNS_PATH, token=token, headers=headers)
-    rep = {"status": st, "campaigns": 0, "claimable": False, "claimed": []}
+    rep = {"status": st, "campaigns": 0, "claimable": False, "claimed": [], "secured": False}
     if st != 200 or not isinstance(obj, dict):
         rep["error"] = ((obj or {}).get("message") if isinstance(obj, dict) else "")
         rep["error"] = rep["error"] or "HTTP %s" % st
@@ -417,28 +474,44 @@ def _checkin_account(acct):
     cps = [c for c in (obj.get("campaigns") or []) if isinstance(c, dict)]
     rep["campaigns"] = len(cps)
     rep["claimable"] = bool(obj.get("claimable"))
-    if not rep["claimable"]:
-        rep["message"] = "当前没有可领取的活动（可能已领、未到窗口或活动已结束）"
+    rep["secured"] = _credits_secured(cps)
+    targets = _claimable_campaigns(cps)
+    if not targets:
+        rep["message"] = ("今天的 Credits 已在手上（之前领过）" if rep["secured"]
+                          else "当前没有可领取的活动（未到窗口或活动已结束）")
         return True, rep
-    target = next((c for c in cps if _campaign_id(c)), None)
-    if target is None:
-        rep["message"] = "claimable=true 但响应里没有 campaign id"
-        return False, rep
-    cid = _campaign_id(target)
-    path = "%s/%s/claim" % (CAMPAIGNS_PATH, urllib.parse.quote(cid, safe=""))
-    cst, cobj = _openapi_json("POST", path, body={}, token=token, headers=headers)
-    item = {"id": cid, "status": cst}
-    if isinstance(cobj, dict):
-        for k in ("message", "code", "success"):
-            if k in cobj:
-                item[k] = cobj[k]
-    rep["claimed"].append(item)
+    for c in targets:
+        cid = _campaign_id(c)
+        benefit = c.get("benefit") or {}
+        path = "%s/%s/claim" % (CAMPAIGNS_PATH, urllib.parse.quote(cid, safe=""))
+        cst, cobj = _openapi_json("POST", path, body={}, token=token, headers=headers)
+        item = {"id": cid, "status": cst, "key": c.get("campaignKey"),
+                "kind": benefit.get("kind"), "amount": benefit.get("amount")}
+        if isinstance(cobj, dict):
+            for k in CLAIM_RECEIPT_KEYS:
+                if k in cobj:
+                    item[k] = cobj[k]
+            for k in ("message", "code", "success"):
+                if k in cobj:
+                    item[k] = cobj[k]
+            rb = cobj.get("benefit")
+            if isinstance(rb, dict):
+                item["kind"] = rb.get("kind") or item["kind"]
+                item["amount"] = rb.get("amount") if rb.get("amount") is not None else item["amount"]
+        rep["claimed"].append(item)
     st2, obj2 = _openapi_json("GET", CAMPAIGNS_PATH, token=token, headers=headers)
+    cps2 = [c for c in ((obj2 or {}).get("campaigns") or []) if isinstance(c, dict)] \
+        if st2 == 200 else []
     rep["after"] = {"status": st2,
                     "claimable": bool(obj2.get("claimable")) if isinstance(obj2, dict) else None}
-    ok = cst in (200, 201, 204)
+    if cps2:
+        rep["secured"] = _credits_secured(cps2)
+    if rep["claimed"]:
+        rep["addOnTotal"] = _add_on_total(acct)
+    ok = all(i["status"] in (200, 201, 204) for i in rep["claimed"])
     if not ok:
-        rep["error"] = item.get("message") or "claim HTTP %s" % cst
+        bad = next(i for i in rep["claimed"] if i["status"] not in (200, 201, 204))
+        rep["error"] = bad.get("message") or "claim HTTP %s" % bad["status"]
     return ok, rep
 
 
@@ -3018,6 +3091,11 @@ def _cmd_check(_args=None):
                  "" if not info.get("error") else " 错误: %s" % info.get("error")))
     print("登录     站点=%s 设备码登录=%s"
           % (SITE, "可用" if info.get("deviceInit") else "需 node 侧支持"))
+    st = _read_checkin_state()
+    print("签到     %s 计划=%s 今天=%s attempts=%s 已到位=%s/%s 上次=%s"
+          % ("开" if CHECKIN_ENABLED else "关（QODER_PROXY_CHECKIN=0）", CHECKIN_AT,
+             st.get("date"), st.get("attempts"), st.get("secured_accounts"),
+             st.get("pool_accounts"), st.get("last_at")))
     if not isinstance(info.get("error"), str) and info.get("wasmReady"):
         try:
             cached = _fetch_models()
@@ -3034,26 +3112,164 @@ def _cmd_checkin(_args=None):
         _print_err("账号池为空：先运行 --capture / --login / --import")
         return 1
     all_ok = True
+    secured = 0
     for acct in accs:
         ok, rep = _checkin_account(acct)
         print("账号     %s" % _label_of(acct))
-        print("活动     HTTP %s campaigns=%d claimable=%s"
-              % (rep["status"], rep["campaigns"], rep["claimable"]))
+        print("活动     HTTP %s campaigns=%d claimable=%s 今天的份=%s"
+              % (rep["status"], rep["campaigns"], rep["claimable"],
+                 "已到位" if rep.get("secured") else "没到位"))
         for x in rep["claimed"]:
-            print("领取     %s → HTTP %s%s"
-                  % (x["id"], x.get("status"),
-                     (" " + str(x["message"])) if x.get("message") else ""))
+            print("领取     %s %s %s → HTTP %s%s grant=%s 发放=%s%s"
+                  % (x.get("key") or x["id"], x.get("kind") or "",
+                     ("%s" % x["amount"]) if x.get("amount") is not None else "",
+                     x.get("status"),
+                     (" " + str(x["message"])) if x.get("message") else "",
+                     str(x.get("grantId") or "-")[:8], x.get("grantedAt") or x.get("claimedAt") or "-",
+                     "（重复请求，服务端 replayed，不再二次发放）" if x.get("replayed") else ""))
         if rep.get("after"):
             print("领取后   HTTP %s claimable=%s"
                   % (rep["after"]["status"], rep["after"]["claimable"]))
+        if "addOnTotal" in rep:
+            print("额度     addOnQuota.total=%s（领到后，每领一次 +100）" % rep["addOnTotal"])
         if rep.get("message"):
             print("结果     %s" % rep["message"])
+        if rep.get("secured"):
+            secured += 1
         if not ok:
             _print_err("签到失败: %s" % (rep.get("error") or rep.get("message")))
             all_ok = False
         if len(accs) > 1:
             print("-" * 40)
-    return 0 if all_ok else 1
+    print("合计     今天的 Credits 已到位 %d/%d 个号" % (secured, len(accs)))
+    return 0 if (all_ok and secured == len(accs)) else 1
+
+
+def _checkin_round(reason):
+    """给池里每个号各跑一次当日 Credits 签到。
+    返回 (今天的份已到位的号数, 池内号数, 是否全部调用成功)。
+    "已到位"= 这个号今天的 CREDITS 活动是 CLAIMED（这一轮领的、或客户端/上一轮领的都算），
+    只有全部到位才算今天不用再来；单号异常只记日志并继续下一个。"""
+    with _pool_lock:
+        accs = list(_load_pool_locked())
+    total = len(accs)
+    if not accs:
+        _log("签到跳过(%s): 账号池为空" % reason)
+        return 0, 0, True
+    secured, newgot, all_ok = 0, 0, True
+    for acct in accs:
+        label = _label_of(acct)
+        try:
+            ok, rep = _checkin_account(acct)
+        except Exception as e:
+            _log("签到异常 %s: %r" % (label, e))
+            all_ok = False
+            continue
+        claimed = [c for c in (rep.get("claimed") or []) if c.get("status") in (200, 201, 204)]
+        fresh = [c for c in claimed if not c.get("replayed")]
+        credits = sum(int(c.get("amount") or 0)
+                      for c in fresh if (c.get("kind") or "").upper() == "CREDITS")
+        if fresh:
+            newgot += 1
+            _log("签到成功 %s campaign=%s credits=%d 发放时间=%s 额度总额=%s"
+                 % (label, ",".join(str(c["id"])[:8] for c in fresh), credits,
+                    fresh[0].get("grantedAt") or fresh[0].get("claimedAt") or "-",
+                    rep.get("addOnTotal")))
+        if rep.get("secured"):
+            secured += 1
+        elif ok:
+            _log("签到无份 %s: %s" % (label, rep.get("message") or ""))
+        if not ok:
+            all_ok = False
+            _log("签到失败 %s HTTP %s: %s"
+                 % (label, rep.get("status"), rep.get("error") or ""))
+    _log("签到小结(%s): 已到位 %d/%d，本轮新领 %d" % (reason, secured, total, newgot))
+    return secured, total, all_ok
+
+
+def _read_checkin_state():
+    try:
+        with open(CHECKIN_STATE_FILE, encoding="utf-8") as f:
+            st = json.load(f)
+        return st if isinstance(st, dict) else {}
+    except Exception:
+        return {}
+
+
+def _write_checkin_state(st):
+    d = os.path.dirname(CHECKIN_STATE_FILE)
+    if d:
+        try:
+            os.makedirs(d, exist_ok=True)
+        except OSError:
+            pass
+    tmp = CHECKIN_STATE_FILE + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(st, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+        os.replace(tmp, CHECKIN_STATE_FILE)
+    except OSError as e:
+        _print_err("签到状态写盘失败: %s" % e)
+
+
+def _today_at(hhmm, base=None):
+    """今天 hhmm（本地时区）的 epoch；hhmm 非法则退回 11:30。"""
+    try:
+        hh, mm = hhmm.split(":")
+        hh, mm = int(hh), int(mm)
+        if not (0 <= hh < 24 and 0 <= mm < 60):
+            raise ValueError
+    except Exception:
+        hh, mm = 11, 30
+    lt = time.localtime(base if base is not None else time.time())
+    return time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, hh, mm, 0, 0, 0, -1))
+
+
+def _checkin_plan(now, st, today, due):
+    """纯函数：今天该不该跑一轮、下次几点醒来。返回 ("run"|"wait", 秒)。
+    抽出来只为能单测那四个边界（未到点 / 到点没成 / 已完成 / 次数用完），
+    不然要验证就得真的睡满一天。"""
+    if now < due:
+        return "wait", due - now                      # 未到今天的点
+    if st.get("date") != today:
+        st = {"date": today, "attempts": 0, "done": False}
+    if st.get("done") or st.get("attempts", 0) >= CHECKIN_MAX_ATTEMPTS:
+        return "wait", due + 86400 - now              # 今天收工（或放弃），等明天
+    return "run", 0
+
+
+def _checkin_loop():
+    """睡到点 → 跑一轮 → 每个号的今天的份都到位就记 done，否则按 RETRY_SEC 再试，次数用完等明天。
+    重启安全：今天的 attempts/done 存状态文件，宕机/重拉都会补跑或跳过，不重复不遗漏。"""
+    while True:
+        now = time.time()
+        today = time.strftime("%Y-%m-%d", time.localtime(now))
+        st = _read_checkin_state()
+        action, wait = _checkin_plan(now, st, today, _today_at(CHECKIN_AT, now))
+        if action == "run":
+            secured, total, all_ok = _checkin_round("定时")
+            done = secured >= total
+            st = {"date": today,
+                  "attempts": st.get("attempts", 0) + 1,
+                  "done": done,                       # 全部号今天的 Credits 都在手上才算今天完
+                  "secured_accounts": secured,
+                  "pool_accounts": total,
+                  "last_at": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(now)),
+                  "last_all_ok": all_ok}
+            _write_checkin_state(st)
+            _log("签到轮次 done=%s attempts=%d 已到位=%d/%d 全 OK=%s"
+                 % (done, st["attempts"], secured, total, all_ok))
+            wait = 60 if done else CHECKIN_RETRY_SEC
+        time.sleep(max(30.0, min(wait, 3600.0)))   # 分片睡：改点/排障不用等一整天
+
+
+def _start_checkin_thread():
+    if not CHECKIN_ENABLED:
+        return None
+    t = threading.Thread(target=_checkin_loop, name="checkin", daemon=True)
+    t.start()
+    return t
 
 
 def _cmd_test_chat(text="hi", model_name=None):
@@ -3220,6 +3436,15 @@ def _serve():
     if not n:
         print("  警告        账号池为空，先运行: python qoder_proxy.py --login 或 --capture")
     _log("启动 port=%d accounts=%d" % (PORT, n))
+    if CHECKIN_ENABLED:
+        print("  签到        每日 %s 自动领 Credits（今天没领成会重试 %d 次，间隔 %ds）"
+              % (CHECKIN_AT, CHECKIN_MAX_ATTEMPTS, CHECKIN_RETRY_SEC))
+        _start_checkin_thread()
+        _log("签到线程启动 at=%s tries=%d retry=%ds state=%s 现状=%s"
+             % (CHECKIN_AT, CHECKIN_MAX_ATTEMPTS, CHECKIN_RETRY_SEC, CHECKIN_STATE_FILE,
+                json.dumps(_read_checkin_state(), ensure_ascii=False)))
+    else:
+        print("  签到        已关闭（QODER_PROXY_CHECKIN=0）")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

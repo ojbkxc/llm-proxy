@@ -239,10 +239,22 @@ python qoder_proxy.py --checkin
 ```
 
 - **多账号**：遍历池中所有账号，逐个领取今天的 campaign。
-- 先 `GET /sash/api/v1/me/campaigns`（Bearer + Cosy 设备头，无签名）；`claimable=false`
-  直接返回 0（已领/未到窗口都是 no-op，可安全重复执行）。
-- 有可领项时 `POST /sash/api/v1/me/campaigns/{id}/claim`（body `{}`），随后再查一次确认状态。
-- 活动每天 **10:00（北京）** 开新窗口、错过不补，每笔 30 天有效。
+- `GET /sash/api/v1/me/campaigns`（Bearer + Cosy 设备头，无签名）。
+  **`Cosy-ClientType` 必须是 10（桌面端）**：5 时服务端把活动列表清空（`showCampaign=false`、
+  `campaigns=[]`），领不到任何东西；`Cosy-Version` / `Cosy-MachineOS` 不参与这个门槛。
+- 逐项看 `actionType == "CLAIM_BENEFIT"` 且 `claimStatus == "CLAIMABLE"` 才领；已领过的项
+  会变 `CLAIMED`，所以重复执行是安全 no-op（顶层 `claimable` 只是总开关，不区分是哪个活动）。
+- 每项 `POST /sash/api/v1/me/campaigns/{campaignId}/claim`（body `{}`），领完再查一次确认状态。
+  响应就是发放回执（`grantId`/`claimedAt`/`grantedAt`）；重复 POST 返回 `replayed=true` 不会二次发放，
+  所以整条链路可随便重试。当日额度是 `benefit.kind=CREDITS, amount=100`，30 天有效。
+- **到账物证**：`/sash/api/v2/me/usage` 的 `qoderUsage.addOnQuota.total` 每成功领一次 +100
+  （客户端日志实测 100→200→300）。有领取动作时 `--checkin` 会打印 `额度 addOnQuota.total=N`，
+  定时轮次的日志也会带 `额度总额=N`，隔一天再比对就是硬证据。
+- **自动签到**：`--serve` 会起一个 `checkin` 线程，默认每天 11:30（`QODER_PROXY_CHECKIN_AT` 可改）
+  逐号领取；池里全部账号当天的份都到位才记 `done`，否则每 1800s 重试、最多 4 次后等明天。
+  进度写在 `~/.qoder-cn-proxy/checkin_state.json`（独立于账号池），重启会跳过已完成的天。
+  `QODER_PROXY_CHECKIN=0` 关闭。
+- 活动窗口 **10:00 → 次日 09:59（北京）**，错过不补（`startAt/endAt` 实测正是这个区间）。
 - Windows 计划任务示例（每天 10:05，用 `pythonw.exe` 可避免弹控制台）：
 
 ```bat

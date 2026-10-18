@@ -91,7 +91,11 @@ MAX_BODY_BYTES = 8 << 20
 #   （会打死客户端的链）；客户端没跑时代理是唯一续期者，临期自动接管该链（收编进池）。
 #   即"谁活着，链归谁"。
 REFRESH_ENDPOINT = "https://sts.cn-north-4.myhuaweicloud.com/v1/oauth2/tokens"
-REFRESH_AHEAD_SEC = 3600          # 临期 1h 内触发续期（CAS 凭证 2h 有效，对齐客户端提前 1h 续）
+REFRESH_AHEAD_SEC = 5400          # 临期 90min 内触发续期（CAS 凭证 2h 有效）。续期是请求驱动的，
+#                                  阈值只是"留出多少缓冲去顶住下一次请求"，所以往前提。
+#                                  不要设到 >=7200：新签发的 CAS 剩余寿命正好 ~2h，
+#                                  那样每个请求都会判定临期 → 反复 rotation（旧 refresh_token 已作废，
+#                                  并发时会撞出 STS5.1806 "the refresh token has been used"）。
 CLIENT_ID = os.environ.get("CODEARTS_PROXY_CLIENT_ID", "codearts-agent")  # = env.uriScheme
 CLIENT_PROC_NAME = "codearts-agent.exe"   # CodeArts Agent 客户端进程名（进程感知接管的判断依据）
 

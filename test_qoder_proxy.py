@@ -9,6 +9,7 @@ test_qoder_proxy.py — qoder_proxy.py 离线测试套件（不触网、不碰�
   3. 账号池：入池/去重/导出导入/移除、401 换号、429 冷却换号、5xx 退避重试、并发取号均匀、
      临期自动续期
   4. 边界：API Key 鉴权、body 超限 413、未知模型 404、上游错误帧 502
+  5. 自动签到：到点计算、调度四边界、状态文件往返、单号异常隔离、开关与线程
 
 运行：python test_qoder_proxy.py
 约束：纯标准库，全部假数据（dt-fake / fake-uid…），不连真实网关、不读真实 auth.v1.dat。
@@ -1627,19 +1628,38 @@ def test_http_native_signer_e2e():
         env.close()
 
 
+def _camp(cid, key, action, status, kind=None, amount=None):
+    """按服务端真实字段拼一个 campaign 项（camelCase，id 是 campaignId）。"""
+    c = {"campaignId": cid, "campaignKey": key, "actionType": action,
+         "claimStatus": status, "startAt": 1792288800, "endAt": 1792375140}
+    if kind:
+        c["benefit"] = {"kind": kind, "amount": amount,
+                        "validity": {"mode": "RELATIVE_DAYS", "days": 30}}
+    return c
+
+
 def test_checkin_claim_flow():
     acct = _fake_account()
     calls = []
 
     def fake(method, path, body=None, token="", timeout=20, headers=None):
         calls.append((method, path, body, dict(headers or {}), token))
+        if path == Q.USAGE_PATH:
+            return 200, {"displayMode": "qoder",
+                         "qoderUsage": {"addOnQuota": {"total": 300, "remaining": 154}}}
         if method == "GET":
-            first = sum(1 for c in calls if c[0] == "GET") == 1
-            return 200, ({"campaigns": [{"id": "c1", "title": "daily 100"}],
-                          "claimable": True, "showCampaign": True}
+            first = sum(1 for c in calls
+                        if c[0] == "GET" and c[1] == Q.CAMPAIGNS_PATH) == 1
+            return 200, ({"campaigns": [
+                            _camp("c1", "act-20261013-582", "CLAIM_BENEFIT",
+                                  "CLAIMABLE", "CREDITS", 100),
+                            _camp("c2", "act-20260901-922", "VIEW_DETAILS", "CLAIMED")],
+                          "claimable": True, "showCampaign": True,
+                          "campaignUrl": "https://openapi.qoder.com.cn/growth-page/activity-iframe"}
                          if first else {"campaigns": [], "claimable": False,
                                         "showCampaign": False})
-        return 200, {"success": True}
+        return 200, {"success": True, "grantId": "g-1",
+                     "grantedAt": "2026-10-18T04:35:59Z", "replayed": False}
 
     orig = Q._openapi_json
     try:
@@ -1648,16 +1668,75 @@ def test_checkin_claim_flow():
     finally:
         Q._openapi_json = orig
     gets = [c for c in calls if c[0] == "GET"]
+    cgets = [c for c in gets if c[1] == Q.CAMPAIGNS_PATH]
     posts = [c for c in calls if c[0] == "POST"]
-    good = (ok and len(gets) == 2 and len(posts) == 1
+    good = (ok and len(cgets) == 2 and len(posts) == 1
+            and [c[1] for c in gets if c[1] == Q.USAGE_PATH] == [Q.USAGE_PATH]
+            and rep["addOnTotal"] == 300
             and posts[0][1] == Q.CAMPAIGNS_PATH + "/c1/claim"
             and posts[0][2] == {}
             and posts[0][3].get("Cosy-MachineId") == acct["machineId"]
             and posts[0][3].get("Cosy-Version") == acct["cosyVersion"]
+            and posts[0][3].get("Cosy-ClientType") == "10"
             and posts[0][4] == acct["token"]
             and rep["claimed"][0]["status"] == 200
+            and rep["claimed"][0]["kind"] == "CREDITS"
+            and rep["claimed"][0]["amount"] == 100
+            and rep["claimed"][0]["grantId"] == "g-1"
             and rep["after"]["claimable"] is False)
-    _record("checkin_claim_flow", good, str(rep["claimed"])[:100])
+    _record("checkin_claim_flow", good,
+            "calls=%d addOn=%r receipt=%s" % (len(calls), rep.get("addOnTotal"),
+                                              str(rep["claimed"])[:90]))
+
+
+def test_checkin_skips_non_claimable_items():
+    """顶层 claimable=true 但每项都已 CLAIMED：不 POST，no-op 成功。"""
+    acct = _fake_account()
+    calls = []
+
+    def fake(method, path, body=None, token="", timeout=20, headers=None):
+        calls.append((method, path))
+        return 200, {"campaigns": [
+            _camp("c1", "act-20261013-582", "CLAIM_BENEFIT", "CLAIMED", "CREDITS", 100),
+            _camp("c2", "act-20260901-922", "VIEW_DETAILS", "CLAIMED")],
+            "claimable": True, "showCampaign": True}
+
+    orig = Q._openapi_json
+    try:
+        Q._openapi_json = fake
+        ok, rep = Q._checkin_account(acct)
+    finally:
+        Q._openapi_json = orig
+    _record("checkin_skips_non_claimable_items",
+            ok and len(calls) == 1 and calls[0][0] == "GET"
+            and rep["campaigns"] == 2 and not rep["claimed"]
+            and bool(rep.get("message")), str(rep.get("message")))
+
+
+def test_checkin_claims_every_benefit_item():
+    """同一天多项可领（Credits + 兑换码）要全领，不能只 POST 第一项。"""
+    acct = _fake_account()
+    posts = []
+
+    def fake(method, path, body=None, token="", timeout=20, headers=None):
+        if method == "POST":
+            posts.append(path)
+            return 200, {"success": True}
+        return 200, {"campaigns": [
+            _camp("c1", "act-20261013-582", "CLAIM_BENEFIT", "CLAIMABLE", "CREDITS", 100),
+            _camp("c2", "act-20260928-620", "CLAIM_BENEFIT", "CLAIMABLE",
+                  "REDEMPTION_CODE", 1)],
+            "claimable": True, "showCampaign": True}
+
+    orig = Q._openapi_json
+    try:
+        Q._openapi_json = fake
+        ok, rep = Q._checkin_account(acct)
+    finally:
+        Q._openapi_json = orig
+    _record("checkin_claims_every_benefit_item",
+            ok and len(rep["claimed"]) == 2 and len(posts) == 2
+            and posts[1].endswith("/c2/claim"), str(posts))
 
 
 def test_checkin_not_claimable():
@@ -1698,23 +1777,131 @@ def test_checkin_http_error():
 
 
 def test_checkin_cli_all_accounts():
+    """每个号今天的份都到位 → rc=0 并打"已到位 2/2"；一个都没到位 → rc=1（没领到就是失败）。"""
     env = _Env(accounts=[_fake_account("uid-ck0001"), _fake_account("uid-ck0002")])
     try:
+        holder = {"campaigns": [_camp("c1", "act-20261013-582", "CLAIM_BENEFIT",
+                                      "CLAIMED", "CREDITS", 100)]}
         calls = []
 
         def fake(method, path, body=None, token="", timeout=20, headers=None):
             calls.append((method, path, token))
-            return 200, {"campaigns": [], "claimable": False}
+            return 200, {"campaigns": list(holder["campaigns"]), "claimable": False}
 
         env.patch_openapi(fake)
         rc, out = _stdout_of(Q._cmd_checkin)
         ok = (rc == 0 and len(calls) == 2 and all(c[0] == "GET" for c in calls)
               and "uid-ck0001" in out and "uid-ck0002" in out
-              and out.count("claimable=False") == 2)
-        _record("checkin_cli_all_accounts", ok,
-                "calls=%d" % len(calls))
+              and out.count("claimable=False") == 2 and "已到位 2/2" in out)
+        holder["campaigns"] = []                     # 今天什么都还没到位
+        rc2, out2 = _stdout_of(Q._cmd_checkin)
+        ok = ok and rc2 == 1 and "已到位 0/2" in out2
+        _record("checkin_cli_all_accounts", ok, "rc=%d rc2=%d" % (rc, rc2))
     finally:
         env.close()
+
+
+def test_checkin_today_at():
+    """到点计算：合法 HH:MM、非法退回、00:00 边界。"""
+    base = time.mktime((2026, 10, 18, 8, 0, 0, 0, 0, -1))
+    want = time.mktime((2026, 10, 18, 11, 30, 0, 0, 0, -1))
+    ok = (Q._today_at("11:30", base) == want
+          and Q._today_at("25:99", base) == want          # 非法 → 退回 11:30
+          and Q._today_at("", base) == want
+          and Q._today_at("00:00", base) == time.mktime((2026, 10, 18, 0, 0, 0, 0, 0, -1))
+          and Q._today_at("23:59", base) == time.mktime((2026, 10, 18, 23, 59, 0, 0, 0, -1)))
+    _record("checkin_today_at", ok, "got=%r" % Q._today_at("11:30", base))
+
+
+def test_checkin_plan_boundaries():
+    """调度四个边界：未到点 / 到点没成 / 今天已完成 / 重试次数用完。"""
+    due, day = 2000.0, "D"
+    p1 = Q._checkin_plan(1000.0, {"date": day, "attempts": 0}, day, due)
+    p2 = Q._checkin_plan(due, {"date": day, "attempts": 1, "done": False}, day, due)
+    p3 = Q._checkin_plan(due + 10, {"date": day, "done": True}, day, due)
+    p4 = Q._checkin_plan(due + 10, {"date": day, "attempts": Q.CHECKIN_MAX_ATTEMPTS}, day, due)
+    p5 = Q._checkin_plan(due + 10, {"date": "昨天", "done": True,
+                                    "attempts": 99}, day, due)     # 跨天必须重置并重跑
+    ok = (p1[0] == "wait" and p1[1] == 1000
+          and p2[0] == "run"
+          and p3[0] == "wait" and p3[1] == due + 86400 - (due + 10)
+          and p4[0] == "wait"
+          and p5[0] == "run")
+    _record("checkin_plan_boundaries", ok, "%r %r %r %r %r" % (p1, p2, p3, p4, p5))
+
+
+def test_checkin_state_roundtrip():
+    """状态文件读写：缺文件=空、写后可读、坏 json 不炸（返回空 = 今天会重跑而不是崩线程）。"""
+    tmpdir = tempfile.mkdtemp(prefix="qp-checkin-state-")
+    saved = Q.CHECKIN_STATE_FILE
+    try:
+        Q.CHECKIN_STATE_FILE = os.path.join(tmpdir, "nope", "state.json")   # 目录都不存在
+        empty = Q._read_checkin_state()
+        Q._write_checkin_state({"date": "2026-10-18", "attempts": 2, "done": True})
+        st = Q._read_checkin_state()
+        with open(Q.CHECKIN_STATE_FILE, "w", encoding="utf-8") as f:
+            f.write("{ 坏文件")
+        bad = Q._read_checkin_state()
+        ok = (empty == {} and st.get("attempts") == 2 and st.get("done") is True
+              and bad == {})
+    finally:
+        Q.CHECKIN_STATE_FILE = saved
+    _record("checkin_state_roundtrip", ok, "st=%r bad=%r" % (st, bad))
+
+
+def test_checkin_round_isolates_bad_account():
+    """一轮里：新领到 1 个 → secured=1、total=3；单号抛异常和 HTTP 失败都不能带崩整轮。"""
+    accs = [_fake_account("uid-cd0001"), _fake_account("uid-cd0002"), _fake_account("uid-cd0003")]
+
+    def stub(acct):
+        lab = acct["account"]
+        if lab.endswith("0002"):          # 本轮真领到（有发放回执、非 replayed）
+            return True, {"status": 200, "campaigns": 1, "secured": True,
+                          "claimed": [{"id": "c1", "status": 200, "kind": "CREDITS",
+                                       "amount": 100, "grantId": "g1",
+                                       "grantedAt": "2026-10-18T04:35:59Z"}]}
+        if lab.endswith("0003"):
+            raise RuntimeError("模拟单号炸")
+        return False, {"status": 500, "campaigns": 0, "claimed": [],
+                       "secured": False, "error": "HTTP 500"}
+
+    tmpdir = tempfile.mkdtemp(prefix="qp-checkin-round-")
+    fp = os.path.join(tmpdir, "accounts.json")
+    with open(fp, "w", encoding="utf-8") as f:
+        json.dump({"version": 1, "accounts": accs}, f, ensure_ascii=False)
+    saved_acc, saved_ca = Q.ACCOUNTS_FILE, Q._checkin_account
+    Q.ACCOUNTS_FILE = fp
+    Q._checkin_account = stub
+    try:
+        Q._pool.update({"accounts": [], "mtime": 0.0})
+        secured, total, all_ok = Q._checkin_round("测试")
+        ok = secured == 1 and total == 3 and all_ok is False
+    finally:
+        Q._checkin_account = saved_ca
+        Q.ACCOUNTS_FILE = saved_acc
+        Q._pool.update({"accounts": [], "mtime": 0.0})
+    _record("checkin_round_isolates_bad_account", ok,
+            "secured=%d total=%d all_ok=%r" % (secured, total, all_ok))
+
+
+def test_checkin_disabled_env():
+    """关掉开关时不起线程（QODER_PROXY_CHECKIN=0）；开着时是个 daemon 线程。
+    状态文件也指到临时目录，否则线程会往真 ~/.qoder-cn-proxy/checkin_state.json 写一笔。"""
+    saved_en, saved_round = Q.CHECKIN_ENABLED, Q._checkin_round
+    saved_state = Q.CHECKIN_STATE_FILE
+    t2 = None
+    try:
+        Q.CHECKIN_STATE_FILE = os.path.join(tempfile.mkdtemp(prefix="qp-thread-"), "state.json")
+        Q.CHECKIN_ENABLED = False
+        ok = Q._start_checkin_thread() is None
+        Q.CHECKIN_ENABLED = True
+        Q._checkin_round = lambda reason: (0, 0, True)   # 不发真请求，只验线程起得来
+        t2 = Q._start_checkin_thread()
+        ok = ok and t2 is not None and t2.daemon and t2.name == "checkin"
+    finally:
+        Q.CHECKIN_ENABLED, Q._checkin_round = saved_en, saved_round
+        Q.CHECKIN_STATE_FILE = saved_state
+    _record("checkin_disabled_env", ok, "thread=%r" % (t2,))
 
 
 def main():
@@ -1786,9 +1973,16 @@ def main():
         test_http_native_signer_e2e,
         # 每日签到
         test_checkin_claim_flow,
+        test_checkin_skips_non_claimable_items,
+        test_checkin_claims_every_benefit_item,
         test_checkin_not_claimable,
         test_checkin_http_error,
         test_checkin_cli_all_accounts,
+        test_checkin_today_at,
+        test_checkin_plan_boundaries,
+        test_checkin_state_roundtrip,
+        test_checkin_round_isolates_bad_account,
+        test_checkin_disabled_env,
     ]
     for fn in tests:
         try:
