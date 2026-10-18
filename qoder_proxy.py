@@ -75,6 +75,9 @@ import webbrowser
 from email.utils import parsedate
 
 # ── 常量与路径 ────────────────────────────────────────────────────────────────
+
+import llm_proxy_core as C
+
 PORT = int(os.environ.get("QODER_PROXY_PORT", "8791"))
 API_KEY = os.environ.get("QODER_PROXY_API_KEY") or ""      # 空 = 不鉴权
 MAX_BODY_BYTES = 8 << 20                                    # 请求体上限，防 OOM
@@ -219,17 +222,8 @@ def _print_err(msg):
     sys.stderr.flush()
 
 
-def _rand():
-    return secrets.token_hex(12)
-
-
-def _merge_tool_name(cur, frag):
-    """上游可能把工具名分片下发（"get_" + "time"），也可能整名重发；两种都要拼对。"""
-    if not frag:
-        return cur
-    if not cur:
-        return frag
-    return cur if frag == cur else cur + frag
+new_id = _rand = C.new_id
+merge_tool_name = _merge_tool_name = C.merge_tool_name
 
 
 def _redact(v, keep=3):
@@ -520,6 +514,10 @@ _pool = {"accounts": [], "mtime": 0.0}
 _pool_lock = threading.RLock()
 _rr = 0
 _last_sweep = [0.0]
+_sweep_lock = threading.Lock()      # "判间隔 + 记下这次扫了" 必须同锁：ThreadingHTTPServer 一请求一线程，
+#                                    分开写会让两个线程都以为自己该扫，同一批号被并发刷两遍
+_refreshing = set()                 # 正在续期的账号标签（refresh_token 是一次性轮换，双刷必有一败）
+_refreshing_lock = threading.Lock()
 
 
 def _label_of(a):
@@ -547,13 +545,25 @@ def _load_pool_locked():
     return _pool["accounts"]
 
 
+def _chmod_secret(path):
+    """凭证文件收成 0600。Windows 没有 POSIX 权限位，失败就跳过。"""
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
 def _save_pool_locked():
+    """写盘（tmp + replace）。池里是真 token：tmp 直接以 0600 创建，
+    否则默认 umask 会让每次自动续期都把文件从 600 降成 644——公网机上等于任何本机用户可读。"""
     payload = {"version": 1, "accounts": _pool["accounts"]}
     tmp = ACCOUNTS_FILE + ".tmp"
     os.makedirs(os.path.dirname(os.path.abspath(ACCOUNTS_FILE)), exist_ok=True)
-    with open(tmp, "w", encoding="utf-8") as f:
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
     os.replace(tmp, ACCOUNTS_FILE)
+    _chmod_secret(ACCOUNTS_FILE)
     try:
         _pool["mtime"] = os.path.getmtime(ACCOUNTS_FILE)
     except Exception:
@@ -834,7 +844,7 @@ def _next_account():
 
 
 # ── token 续期 ────────────────────────────────────────────────────────────────
-def _refresh_account(acct, force=False):
+def _refresh_account_once(acct, force=False):
     """POST /api/v1/deviceToken/refresh（无签名）。成功写回池；401/403 判定续期链已死。"""
     rt = acct.get("refreshToken")
     if not rt:
@@ -880,9 +890,10 @@ def _refresh_account(acct, force=False):
 def _sweep_due():
     """临期账号集中续期（每 SWEEP_SEC 秒最多一次），健康账号只做时间比较不花开销。"""
     now = time.time()
-    if now - _last_sweep[0] < SWEEP_SEC:
-        return
-    _last_sweep[0] = now
+    with _sweep_lock:
+        if now - _last_sweep[0] < SWEEP_SEC:
+            return
+        _last_sweep[0] = now
     with _pool_lock:
         accs = list(_load_pool_locked())
     for a in accs:
@@ -894,6 +905,21 @@ def _sweep_due():
             continue
         if a.get("exp") and a["exp"] - now < REFRESH_AHEAD_SEC:
             _refresh_account(a)
+
+
+def _refresh_account(acct, force=False):
+    """按账号标签单飞的续期入口：`_read_session` 选中路上的号和 sweep 巡到的同一个号
+    可能同时想刷，而 refresh_token 用一次就作废——败方会被判成"链已死"。同一标签只放一个进去。"""
+    label = _label_of(acct)
+    with _refreshing_lock:
+        if label in _refreshing:
+            return acct
+        _refreshing.add(label)
+    try:
+        return _refresh_account_once(acct, force)
+    finally:
+        with _refreshing_lock:
+            _refreshing.discard(label)
 
 
 def _read_session():
@@ -1892,613 +1918,22 @@ def _iter_upstream(resp):
             yield inner
 
 
-def aggregate_sse(frames, model_name):
-    """内层 chunk 序列 → 非流式 chat.completion（上游只吐 SSE，stream=false 也得自己拼）。"""
-    chunks = []
-    for f in frames:
-        if isinstance(f, (str, bytes)):
-            try:
-                f = json.loads(f)
-            except Exception:
-                continue
-        if isinstance(f, dict):
-            chunks.append(f)
-    text, reasoning, usage, finish = [], [], None, None
-    tools = {}
-    cid, created = "chatcmpl-" + _rand(), int(time.time())
-    model = model_name
-    for c in chunks:
-        cid = c.get("id") or cid
-        created = c.get("created") or created
-        model = c.get("model") or model
-        if c.get("usage"):
-            usage = c["usage"]
-        for ch in c.get("choices") or []:
-            if ch.get("finish_reason"):
-                finish = ch["finish_reason"]
-            d = ch.get("delta") or {}
-            if d.get("content"):
-                text.append(d["content"])
-            if d.get("reasoning_content"):
-                reasoning.append(d["reasoning_content"])
-            for tc in d.get("tool_calls") or []:
-                slot = tools.setdefault(tc.get("index") or 0,
-                                        {"id": "", "name": "", "args": ""})
-                if tc.get("id"):
-                    slot["id"] = tc["id"]
-                fn = tc.get("function") or {}
-                slot["name"] = _merge_tool_name(slot["name"], fn.get("name"))
-                if fn.get("arguments"):
-                    slot["args"] += fn["arguments"]
-    message = {"role": "assistant", "content": "".join(text) or None}
-    if reasoning:
-        message["reasoning_content"] = "".join(reasoning)
-    if tools:
-        message["tool_calls"] = [{
-            "id": s["id"] or ("call_" + _rand()), "type": "function",
-            "function": {"name": s["name"], "arguments": s["args"] or "{}"},
-        } for _, s in sorted(tools.items())]
-    return {
-        "id": cid, "object": "chat.completion", "created": created, "model": model,
-        "choices": [{"index": 0, "message": message, "finish_reason": finish or "stop"}],
-        "usage": usage or {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
-    }
-
-
-def _error_of(obj):
-    """chunk/响应里的错误 → dict；没有错误返回 None。"""
-    if isinstance(obj, dict) and obj.get("error"):
-        err = obj["error"]
-        if isinstance(err, str):
-            return {"message": err}
-        return err or {}
-    return None
-
-
-# ── 协议转换：外部请求 → 内部 OpenAI messages ────────────────────────────────
-def _tools_to_openai(tools):
-    out = []
-    for t in tools or []:
-        if not isinstance(t, dict):
-            continue
-        if t.get("function"):
-            out.append({"type": "function", "function": t["function"]})
-        elif t.get("name"):
-            out.append({"type": "function", "function": {
-                "name": t.get("name"),
-                "description": t.get("description") or "",
-                "parameters": t.get("parameters") or t.get("input_schema") or {"type": "object"},
-            }})
-    return out
-
-
-def _tool_choice_to_openai(choice, protocol):
-    if choice is None:
-        return None
-    if isinstance(choice, str):
-        if protocol == "anthropic":
-            return {"any": "required", "auto": "auto", "none": "none"}.get(choice, "auto")
-        return choice
-    if not isinstance(choice, dict):
-        return None
-    if choice.get("type") == "function" and choice.get("function"):
-        return choice
-    if choice.get("type") == "function" and choice.get("name"):
-        return {"type": "function", "function": {"name": choice["name"]}}
-    if choice.get("type") == "tool" and choice.get("name"):
-        return {"type": "function", "function": {"name": choice["name"]}}
-    return choice
-
-
-def convert_responses_to_openai(body):
-    """Responses API 请求 → OpenAI Chat Completions 请求。"""
-    oa = {}
-    for src, dst in (("model", "model"), ("max_output_tokens", "max_tokens"),
-                     ("stream", "stream"), ("temperature", "temperature"),
-                     ("top_p", "top_p"), ("top_logprobs", "top_logprobs"),
-                     ("stop", "stop"), ("seed", "seed")):
-        if body.get(src) is not None:
-            oa[dst] = body[src]
-    if oa.get("stream") is None:
-        oa["stream"] = False
-    msgs = []
-    if isinstance(body.get("instructions"), str) and body["instructions"]:
-        msgs.append({"role": "system", "content": body["instructions"]})
-    inp = body.get("input")
-    if isinstance(inp, str) and inp:
-        msgs.append({"role": "user", "content": inp})
-    elif isinstance(inp, list):
-        for item in inp:
-            if not isinstance(item, dict):
-                continue
-            t = item.get("type")
-            if t == "message":
-                role = "assistant" if item.get("role") == "assistant" else "user"
-                c = item.get("content")
-                text = ""
-                if isinstance(c, str):
-                    text = c
-                elif isinstance(c, list):
-                    for part in c:
-                        if not isinstance(part, dict):
-                            continue
-                        if part.get("type") in ("input_text", "output_text", "text"):
-                            text += part.get("text") or ""
-                        elif part.get("type") in ("input_image", "image", "image_url"):
-                            text += "[图片输入暂不支持]"
-                if text:
-                    msgs.append({"role": role, "content": text})
-            elif t == "function_call":
-                tc = {"id": item.get("call_id", ""), "type": "function",
-                      "function": {"name": item.get("name", ""),
-                                   "arguments": item.get("arguments") or "{}"}}
-                if msgs and msgs[-1].get("role") == "assistant" and msgs[-1].get("tool_calls") is None:
-                    msgs[-1]["tool_calls"] = [tc]
-                else:
-                    msgs.append({"role": "assistant", "content": None, "tool_calls": [tc]})
-            elif t == "function_call_output":
-                o = item.get("output")
-                msgs.append({"role": "tool", "tool_call_id": item.get("call_id", ""),
-                             "content": o if isinstance(o, str)
-                             else json.dumps(o, ensure_ascii=False)})
-    oa["messages"] = msgs or [{"role": "user", "content": ""}]
-    tools = _tools_to_openai(body.get("tools"))
-    if tools:
-        oa["tools"] = tools
-    tc = _tool_choice_to_openai(body.get("tool_choice"), "responses")
-    if tc is not None:
-        oa["tool_choice"] = tc
-    if isinstance(body.get("reasoning"), dict):
-        oa["reasoning"] = body["reasoning"]
-    return oa
-
-
-def convert_anthropic_to_openai(body):
-    """Anthropic Messages 请求 → OpenAI Chat Completions 请求。"""
-    oa = {}
-    for src, dst in (("model", "model"), ("max_tokens", "max_tokens"), ("stream", "stream"),
-                     ("temperature", "temperature"), ("top_p", "top_p"), ("stop_sequences", "stop")):
-        if body.get(src) is not None:
-            oa[dst] = body[src]
-    msgs = []
-    sys_ = body.get("system")
-    if isinstance(sys_, str) and sys_:
-        msgs.append({"role": "system", "content": sys_})
-    elif isinstance(sys_, list):
-        text = "\n".join(p.get("text", "") for p in sys_
-                         if isinstance(p, dict) and p.get("type") == "text")
-        if text.strip():
-            msgs.append({"role": "system", "content": text.strip()})
-    for msg in body.get("messages") or []:
-        if not isinstance(msg, dict):
-            continue
-        role, c = msg.get("role"), msg.get("content")
-        if isinstance(c, str):
-            msgs.append({"role": role, "content": c})
-            continue
-        if not isinstance(c, list):
-            continue
-        if role == "assistant":
-            texts, calls = [], []
-            for part in c:
-                if not isinstance(part, dict):
-                    continue
-                if part.get("type") == "text":
-                    texts.append(part.get("text") or "")
-                elif part.get("type") == "tool_use":
-                    calls.append({"id": part.get("id", ""), "type": "function",
-                                  "function": {"name": part.get("name", ""),
-                                               "arguments": json.dumps(part.get("input") or {},
-                                                                       ensure_ascii=False)}})
-            am = {"role": "assistant", "content": "".join(texts) or None}
-            if calls:
-                am["tool_calls"] = calls
-            msgs.append(am)
-        else:
-            for part in c:
-                if isinstance(part, dict) and part.get("type") == "tool_result":
-                    rc = part.get("content")
-                    msgs.append({"role": "tool", "tool_call_id": part.get("tool_use_id", ""),
-                                 "content": rc if isinstance(rc, str)
-                                 else json.dumps(rc, ensure_ascii=False)})
-            texts = [p.get("text", "") for p in c
-                     if isinstance(p, dict) and p.get("type") == "text"]
-            if any(t.strip() for t in texts):
-                msgs.append({"role": "user", "content": "\n".join(texts)})
-            if any(isinstance(p, dict) and p.get("type") == "image" for p in c):
-                msgs.append({"role": "user", "content": "[图片输入暂不支持]"})
-    oa["messages"] = msgs or [{"role": "user", "content": ""}]
-    tools = _tools_to_openai(body.get("tools"))
-    if tools:
-        oa["tools"] = tools
-    tc = _tool_choice_to_openai(body.get("tool_choice"), "anthropic")
-    if tc is not None:
-        oa["tool_choice"] = tc
-    if isinstance(body.get("thinking"), dict):
-        oa["thinking"] = body["thinking"]
-    return oa
-
-
-def parse_anthropic_text(body):
-    """Anthropic 请求里的全部文本（count_tokens 估算用）。"""
-    texts = []
-    sys_ = body.get("system")
-    if isinstance(sys_, str):
-        texts.append(sys_)
-    elif isinstance(sys_, list):
-        for p in sys_:
-            if isinstance(p, dict) and p.get("type") == "text":
-                texts.append(p.get("text", ""))
-    for msg in body.get("messages") or []:
-        c = msg.get("content") if isinstance(msg, dict) else None
-        if isinstance(c, str):
-            texts.append(c)
-        elif isinstance(c, list):
-            for p in c:
-                if isinstance(p, dict):
-                    if p.get("type") == "text":
-                        texts.append(p.get("text", ""))
-                    elif p.get("type") in ("tool_use", "tool_result"):
-                        texts.append(json.dumps(p, ensure_ascii=False))
-    return texts
-
-
-def _finish_to_anthropic(finish):
-    return {"stop": "end_turn", "tool_calls": "tool_use", "length": "max_tokens"}.get(
-        finish, finish or "end_turn")
-
-
-def convert_openai_to_responses(openai_obj, req_model):
-    """OpenAI chat.completion → Responses API 响应。"""
-    choice = (openai_obj.get("choices") or [{}])[0]
-    message = choice.get("message") or {}
-    usage = openai_obj.get("usage") or {}
-    output = []
-    if message.get("reasoning_content"):
-        output.append({"type": "reasoning", "id": "rs_" + _rand(),
-                       "summary": [{"type": "summary_text", "text": message["reasoning_content"]}]})
-    if message.get("content"):
-        output.append({"type": "message", "id": "msg_" + _rand(), "role": "assistant",
-                       "status": "completed",
-                       "content": [{"type": "output_text", "text": message["content"],
-                                    "annotations": []}]})
-    for tc in message.get("tool_calls") or []:
-        fn = tc.get("function") or {}
-        output.append({"type": "function_call", "id": "fc_" + _rand(),
-                       "call_id": tc.get("id", ""), "name": fn.get("name", ""),
-                       "arguments": fn.get("arguments") or "{}", "status": "completed"})
-    incomplete = choice.get("finish_reason") == "length"
-    text = "".join(seg.get("text", "") for item in output if item.get("type") == "message"
-                   for seg in (item.get("content") or []) if seg.get("type") == "output_text")
-    return {
-        "id": "resp_" + _rand(), "object": "response", "created_at": int(time.time()),
-        "status": "incomplete" if incomplete else "completed",
-        "model": req_model, "output": output, "output_text": text,
-        "usage": {"input_tokens": usage.get("prompt_tokens", 0),
-                  "output_tokens": usage.get("completion_tokens", 0),
-                  "total_tokens": usage.get("total_tokens", 0),
-                  "output_tokens_details": {"reasoning_tokens": (
-                      (usage.get("completion_tokens_details") or {}).get("reasoning_tokens", 0))}},
-        "error": None,
-        "incomplete_details": {"reason": "max_output_tokens"} if incomplete else None,
-    }
-
-
-def convert_openai_to_anthropic(openai_obj, req_model):
-    """OpenAI chat.completion → Anthropic Messages 响应。"""
-    choice = (openai_obj.get("choices") or [{}])[0]
-    message = choice.get("message") or {}
-    usage = openai_obj.get("usage") or {}
-    content = []
-    if message.get("reasoning_content"):
-        content.append({"type": "thinking", "thinking": message["reasoning_content"]})
-    if message.get("content"):
-        content.append({"type": "text", "text": message["content"]})
-    for tc in message.get("tool_calls") or []:
-        fn = tc.get("function") or {}
-        try:
-            inp = json.loads(fn.get("arguments") or "{}")
-        except Exception:
-            inp = {}
-        content.append({"type": "tool_use", "id": tc.get("id") or ("toolu_" + _rand()),
-                        "name": fn.get("name", ""), "input": inp})
-    return {
-        "id": "msg_" + _rand(), "type": "message", "role": "assistant",
-        "model": req_model, "content": content or [{"type": "text", "text": ""}],
-        "stop_reason": _finish_to_anthropic(choice.get("finish_reason")),
-        "stop_sequence": None,
-        "usage": {"input_tokens": usage.get("prompt_tokens", 0),
-                  "output_tokens": usage.get("completion_tokens", 0)},
-    }
-
-
-# ── 流式状态机：内部 chat chunk → Responses / Anthropic SSE ─────────────────
-class _ResponsesStreamState:
-    """内部 chat chunk → Responses 协议事件序列。"""
-
-    def __init__(self, model: str):
-        self.model = model
-        self.resp_id = "resp_" + _rand()
-        self.created = int(time.time())
-        self.started = False
-        self.finished = False
-        self.finish_reason = None
-        self.text = ""
-        self.reasoning = ""
-        self.tool_name = ""
-        self.tool_id = ""
-        self.tool_args = ""
-        self.usage = None
-        self.text_item_id = "msg_" + _rand()
-        self.reason_item_id = "rs_" + _rand()
-        self.reason_opened = False
-        self.text_opened = False
-        self.reason_index = None
-        self.text_index = None
-        self.next_index = 0
-
-    def _head_events(self):
-        """response.created + response.in_progress（OpenAI 官方序列的开头两帧）。"""
-        resp = {"id": self.resp_id, "object": "response", "created_at": self.created,
-                "status": "in_progress", "model": self.model, "output": []}
-        return [("response.created", json.dumps({"type": "response.created", "response": resp},
-                                                ensure_ascii=False)),
-                ("response.in_progress", json.dumps({"type": "response.in_progress", "response": resp},
-                                                    ensure_ascii=False))]
-
-    def feed(self, chunk: dict):
-        out = []
-        choice = (chunk.get("choices") or [{}])[0]
-        if chunk.get("usage"):
-            self.usage = chunk["usage"]
-        if choice.get("finish_reason"):
-            self.finish_reason = choice["finish_reason"]
-        delta = choice.get("delta") or {}
-
-        if not self.started:
-            self.started = True
-            out.extend(self._head_events())
-
-        rc = delta.get("reasoning_content")
-        if rc:
-            self.reasoning += rc
-            if not self.reason_opened:
-                self.reason_opened = True
-                self.reason_index = self.next_index
-                self.next_index += 1
-                out.append(("response.output_item.added", json.dumps({
-                    "type": "response.output_item.added", "output_index": self.reason_index,
-                    "item": {"type": "reasoning", "id": self.reason_item_id, "summary": []},
-                }, ensure_ascii=False)))
-                out.append(("response.reasoning_summary_part.added", json.dumps({
-                    "type": "response.reasoning_summary_part.added", "item_id": self.reason_item_id,
-                    "output_index": self.reason_index, "summary_index": 0,
-                    "part": {"type": "summary_text", "text": ""},
-                }, ensure_ascii=False)))
-            out.append(("response.reasoning_summary_text.delta", json.dumps({
-                "type": "response.reasoning_summary_text.delta", "item_id": self.reason_item_id,
-                "output_index": self.reason_index, "summary_index": 0, "delta": rc,
-            }, ensure_ascii=False)))
-
-        content = delta.get("content")
-        if content:
-            self.text += content
-            if not self.text_opened:
-                self.text_opened = True
-                self.text_index = self.next_index
-                self.next_index += 1
-                out.append(("response.output_item.added", json.dumps({
-                    "type": "response.output_item.added", "output_index": self.text_index,
-                    "item": {"type": "message", "id": self.text_item_id, "role": "assistant",
-                             "status": "in_progress", "content": []},
-                }, ensure_ascii=False)))
-                out.append(("response.content_part.added", json.dumps({
-                    "type": "response.content_part.added", "item_id": self.text_item_id,
-                    "output_index": self.text_index, "content_index": 0,
-                    "part": {"type": "output_text", "text": "", "annotations": []},
-                }, ensure_ascii=False)))
-            out.append(("response.output_text.delta", json.dumps({
-                "type": "response.output_text.delta", "item_id": self.text_item_id,
-                "output_index": self.text_index, "content_index": 0, "delta": content,
-            }, ensure_ascii=False)))
-
-        for tc in delta.get("tool_calls") or []:
-            fn = tc.get("function") or {}
-            if tc.get("id"):
-                self.tool_id = tc["id"]
-            self.tool_name = _merge_tool_name(self.tool_name, fn.get("name"))
-            if fn.get("arguments"):
-                self.tool_args += fn["arguments"]
-        return out
-
-    def finish(self):
-        if self.finished:
-            return []
-        self.finished = True
-        out = []
-        if not self.started:
-            out.extend(self._head_events())
-        if self.reason_opened:
-            out.append(("response.reasoning_summary_text.done", json.dumps({
-                "type": "response.reasoning_summary_text.done", "item_id": self.reason_item_id,
-                "output_index": self.reason_index, "summary_index": 0, "text": self.reasoning,
-            }, ensure_ascii=False)))
-            out.append(("response.output_item.done", json.dumps({
-                "type": "response.output_item.done", "output_index": self.reason_index,
-                "item": {"type": "reasoning", "id": self.reason_item_id,
-                         "summary": [{"type": "summary_text", "text": self.reasoning}]},
-            }, ensure_ascii=False)))
-        if self.text_opened:
-            out.append(("response.output_text.done", json.dumps({
-                "type": "response.output_text.done", "item_id": self.text_item_id,
-                "output_index": self.text_index, "content_index": 0, "text": self.text,
-            }, ensure_ascii=False)))
-            out.append(("response.content_part.done", json.dumps({
-                "type": "response.content_part.done", "item_id": self.text_item_id,
-                "output_index": self.text_index, "content_index": 0,
-                "part": {"type": "output_text", "text": self.text, "annotations": []},
-            }, ensure_ascii=False)))
-            out.append(("response.output_item.done", json.dumps({
-                "type": "response.output_item.done", "output_index": self.text_index,
-                "item": {"type": "message", "id": self.text_item_id, "role": "assistant",
-                         "status": "completed",
-                         "content": [{"type": "output_text", "text": self.text, "annotations": []}]},
-            }, ensure_ascii=False)))
-        items = []
-        if self.reasoning:
-            items.append({"type": "reasoning", "id": self.reason_item_id,
-                          "summary": [{"type": "summary_text", "text": self.reasoning}]})
-        if self.text:
-            items.append({"type": "message", "id": self.text_item_id, "role": "assistant",
-                          "status": "completed",
-                          "content": [{"type": "output_text", "text": self.text, "annotations": []}]})
-        if self.tool_name:
-            items.append({"type": "function_call", "id": "fc_" + _rand(), "call_id": self.tool_id,
-                          "name": self.tool_name, "arguments": self.tool_args, "status": "completed"})
-        if not items:
-            items.append({"type": "message", "id": self.text_item_id, "role": "assistant",
-                          "status": "completed",
-                          "content": [{"type": "output_text", "text": "", "annotations": []}]})
-        usage = self.usage or {}
-        out.append(("response.completed", json.dumps({
-            "type": "response.completed",
-            "response": {"id": self.resp_id, "object": "response", "created_at": self.created,
-                         "status": "completed" if self.finish_reason != "length" else "incomplete",
-                         "model": self.model, "output": items,
-                         "usage": {"input_tokens": usage.get("prompt_tokens", 0),
-                                   "output_tokens": usage.get("completion_tokens", 0),
-                                   "total_tokens": usage.get("total_tokens", 0)},
-                         "error": None,
-                         "incomplete_details": {"reason": "max_output_tokens"}
-                         if self.finish_reason == "length" else None},
-        }, ensure_ascii=False)))
-        return out
-
-
-class _AnthropicStreamState:
-    """内部 chat chunk → Anthropic Messages SSE 事件序列。
-
-    tool_use 的 name/arguments 在上游是分片到达的（如 "get_" + "time"），
-    content_block_start 又必须带完整 name，所以工具块先缓冲、finish() 时整块吐出。
-    """
-
-    def __init__(self, model: str):
-        self.model = model
-        self.msg_id = "msg_" + _rand()
-        self.started = False
-        self.finished = False
-        self.thinking_block = False
-        self.text_block = False
-        self.block_index = 0
-        self.text = ""
-        self.thinking = ""
-        self.tool_blocks = {}      # 上游 index → {index, id, name, args}
-        self.usage = None
-
-    def _start(self, out):
-        if self.started:
-            return
-        self.started = True
-        out.append(("message_start", json.dumps({
-            "type": "message_start",
-            "message": {"id": self.msg_id, "type": "message", "role": "assistant", "content": [],
-                        "model": self.model, "stop_reason": None, "stop_sequence": None,
-                        "usage": {"input_tokens": 0, "output_tokens": 0}},
-        }, ensure_ascii=False)))
-
-    def _stop_block(self, out):
-        if self.thinking_block or self.text_block:
-            out.append(("content_block_stop", json.dumps(
-                {"type": "content_block_stop", "index": self.block_index - 1},
-                ensure_ascii=False)))
-            self.thinking_block = False
-            self.text_block = False
-
-    def feed(self, chunk: dict):
-        out = []
-        self._start(out)
-        choice = (chunk.get("choices") or [{}])[0]
-        if chunk.get("usage"):
-            self.usage = chunk["usage"]
-        delta = choice.get("delta") or {}
-        rc = delta.get("reasoning_content")
-        if rc:
-            if not self.thinking_block:
-                self._stop_block(out)
-                self.thinking_block = True
-                self.block_index += 1
-                out.append(("content_block_start", json.dumps({
-                    "type": "content_block_start", "index": self.block_index - 1,
-                    "content_block": {"type": "thinking", "thinking": ""},
-                }, ensure_ascii=False)))
-            self.thinking += rc
-            out.append(("content_block_delta", json.dumps({
-                "type": "content_block_delta", "index": self.block_index - 1,
-                "delta": {"type": "thinking_delta", "thinking": rc},
-            }, ensure_ascii=False)))
-        content = delta.get("content")
-        if content:
-            if not self.text_block:
-                self._stop_block(out)
-                self.text_block = True
-                self.block_index += 1
-                out.append(("content_block_start", json.dumps({
-                    "type": "content_block_start", "index": self.block_index - 1,
-                    "content_block": {"type": "text", "text": ""},
-                }, ensure_ascii=False)))
-            self.text += content
-            out.append(("content_block_delta", json.dumps({
-                "type": "content_block_delta", "index": self.block_index - 1,
-                "delta": {"type": "text_delta", "text": content},
-            }, ensure_ascii=False)))
-        for i, tc in enumerate(delta.get("tool_calls") or []):
-            fn = tc.get("function") or {}
-            key = tc.get("index", i)
-            blk = self.tool_blocks.get(key)
-            if blk is None:
-                blk = {"index": len(self.tool_blocks), "id": tc.get("id") or "",
-                       "name": fn.get("name") or "", "args": ""}
-                self.tool_blocks[key] = blk
-            elif tc.get("id"):
-                blk["id"] = tc["id"]
-            blk["name"] = _merge_tool_name(blk["name"], fn.get("name"))
-            if fn.get("arguments"):
-                blk["args"] += fn["arguments"]
-        return out
-
-    def finish(self):
-        if self.finished:
-            return []
-        self.finished = True
-        out = []
-        self._start(out)
-        self._stop_block(out)
-        for blk in sorted(self.tool_blocks.values()):
-            index = self.block_index + 1
-            self.block_index = index
-            out.append(("content_block_start", json.dumps({
-                "type": "content_block_start", "index": index - 1,
-                "content_block": {"type": "tool_use",
-                                  "id": blk["id"] or ("toolu_" + _rand()),
-                                  "name": blk["name"], "input": {}},
-            }, ensure_ascii=False)))
-            if blk["args"]:
-                out.append(("content_block_delta", json.dumps({
-                    "type": "content_block_delta", "index": index - 1,
-                    "delta": {"type": "input_json_delta", "partial_json": blk["args"]},
-                }, ensure_ascii=False)))
-            out.append(("content_block_stop", json.dumps(
-                {"type": "content_block_stop", "index": index - 1}, ensure_ascii=False)))
-        usage = self.usage or {}
-        stop_reason = "tool_use" if self.tool_blocks else "end_turn"
-        out.append(("message_delta", json.dumps({
-            "type": "message_delta",
-            "delta": {"stop_reason": stop_reason, "stop_sequence": None},
-            "usage": {"input_tokens": usage.get("prompt_tokens", 0),
-                      "output_tokens": usage.get("completion_tokens", 0)},
-        }, ensure_ascii=False)))
-        out.append(("message_stop", json.dumps({"type": "message_stop"}, ensure_ascii=False)))
-        return out
+# ── 协议层：与 codearts_proxy.py 共用 llm_proxy_core，不再各写一份 ──────────────
+# 保留原有函数名，是为了让既有调用点和 test_qoder_proxy.py 的用例继续按老名字打。
+# aggregate_sse 取"恒返回 dict"那个入口：_complete() 直接 merged["choices"][0]，不能给它 None。
+aggregate_sse = C.aggregate_sse
+convert_anthropic_to_openai = C.anthropic_to_openai
+convert_openai_to_anthropic = C.openai_to_anthropic
+convert_openai_to_responses = C.openai_to_responses
+convert_responses_to_openai = C.responses_to_openai
+error_of = _error_of = C.error_of
+finish_to_anthropic = _finish_to_anthropic = C.finish_to_anthropic
+merge_tool_name = _merge_tool_name = C.merge_tool_name
+parse_anthropic_text = C.anthropic_text
+tools_to_openai = _tools_to_openai = C.tools_to_openai
+tool_choice_to_openai = _tool_choice_to_openai = C.tool_choice_to_openai
+AnthropicStreamState = _AnthropicStreamState = C.AnthropicStreamState
+ResponsesStreamState = _ResponsesStreamState = C.ResponsesStreamState
 
 
 # ── HTTP Handler ─────────────────────────────────────────────────────────────

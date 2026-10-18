@@ -78,7 +78,14 @@ python codearts_proxy.py
 
 ### 登录态自动续期
 
-securitytoken 是临时凭证（≈2h），临期 1 小时自动调 STS OAuth 端点续期（DPoP ES256 签名），refresh_token 有效期 ≈24 天，期间无需人工干预。续期后新凭证写回池文件，代理自洽管理。
+securitytoken 是临时凭证（≈2h），临期 90 分钟内自动调 STS OAuth 端点续期（DPoP ES256 签名），refresh_token 有效期 ≈30 天，期间无需人工干预。续期后新凭证写回池文件，代理自洽管理。
+
+续期有两条互不依赖的触发路径：
+
+- **请求路径**：`_read_session` 取到临期的号就地续一次，按 `ot_session_id` 单飞（`refresh_token` 一次性，并发双刷会让败方被判死）。
+- **后台线程 `renew`**：每 60 秒（`CODEARTS_PROXY_RENEW_SWEEP_SEC`）扫**整池**。没有它，夜里零流量 → CAS 到点饿死，30 天的链只能干等；`CODEARTS_PROXY_RENEW=0` 关掉。
+
+**失败分类**：只有 refresh 链真作废才判死并写进池文件的 `refresh_dead`——`STS5.1806`、"the refresh token has been used"、"kid not found"、"refresh code has expired"。其余（超时、TLS 抖动、上游 5xx、DPoP 头被拒）**不写池、不判死**，按 60 秒（网络类）/ 600 秒（其它）退避后重试。误判一次的代价是烧掉一条 30 天的链，只能重新扫码。池文件同样以 `0o600` 落盘。
 
 > **已知限制**：续期不回写客户端 `state.vscdb`，refresh_token 轮换后客户端当前 session 失效（池账号不受影响）。`CLIENT_ID` 默认 `codearts-agent`，可用 `CODEARTS_PROXY_CLIENT_ID` 覆盖。
 
@@ -90,13 +97,15 @@ securitytoken 是临时凭证（≈2h），临期 1 小时自动调 STS OAuth �
 | `CODEARTS_PROXY_API_KEY` | (空) | API Key 鉴权（空=不鉴权，支持 `Authorization: Bearer` 和 `X-Api-Key`） |
 | `CODEARTS_PROXY_CLIENT_ID` | codearts-agent | STS OAuth client_id |
 | `CODEARTS_PROXY_ACCOUNTS_FILE` | 脚本同目录 | 池文件路径（网盘共享用） |
+| `CODEARTS_PROXY_RENEW` | 1 | `=0` 关掉后台续期巡检线程 |
+| `CODEARTS_PROXY_RENEW_SWEEP_SEC` | 60 | 后台扫整池的间隔（秒） |
 
 请求体上限 8MB（防 OOM，对齐 trae_proxy）。
 
 ### 测试
 
 ```bash
-python test_codearts_proxy.py        # 9 项离线测试（不触网）
+python test_codearts_proxy.py        # 15 项离线测试（全 mock，池路径 import 时就搬进临时目录）
 ```
 
 ### 平台支持
@@ -298,13 +307,18 @@ Local State.os_crypt.encrypted_key → DPAPI → 32B AES key
 池文件里是真 token，所以默认路径放在
 仓库外（`~/.qoder-cn-proxy/accounts.json`，可用 `QODER_PROXY_ACCOUNTS` 覆盖）。仓库根已加
 `.gitignore` 挡住 `*_accounts.json` / `*-pack.json`，但 `git add -f` 仍能强推出去——别这么干，
-也别把池文件贴到公开渠道（见「最小部署：两个文件」关于同目录副本的说明）。
+也别把池文件贴到公开渠道（见「最小部署：三件套」关于同目录副本的说明）。
 
 **自动续期**：token 临期 1 天内（`QODER_PROXY_REFRESH_AHEAD`，默认 86400）或请求前扫到期，
 自动调 `POST openapi.qoder.com.cn/api/v1/deviceToken/refresh`（body 带 `refresh_token` /
 `machine_id` / `machine_token`，**不需要 Authorization**），并采纳轮换后的新
 `device_token` + `refresh_token` 写回池文件。access token 约 30 天、refresh token 约 1 年，
 期间无需人工干预；续期链彻底失效（400/401/403）时把账号标记 `refresh_dead`，不再反复重试。
+
+**并发安全**：`refresh_token` 用一次就作废，所以两处都要锁住。整池巡检 `_sweep_due`（最小间隔 30 秒）
+把"判断该不该扫"和"记下这次扫了"放进同一把 `_sweep_lock`；单个账号的续期再套一层按账号标签的单飞锁
+`_refresh_account` —— 请求路径选中路上的号、和 sweep 巡到同一个号，两件事会在同一瞬间一起发生。
+池文件（真 token）每次续期回写都以 `0o600` 落盘，不会因为一次自动续期就变成任何本机用户可读。
 
 **脱客户端运行**：客户端进程不需要开着，签名是纯 Python、只用磁盘上已落盘的登录态，不读安装目录。
 拿不到客户端登录态（换了机器、没装客户端）就用 `--login` 走浏览器设备码授权——**只有这条需要
@@ -323,10 +337,12 @@ python qoder_proxy.py --check             # 网关/账号池/签名器/模型 �
 python qoder_proxy.py --test-chat "hi"    # 一次最小真实对话（手工验证请用无害占位内容）
 ```
 
-### 最小部署：两个文件
+### 最小部署：三件套
 
-`qoder_proxy.py` + `qoder_accounts.json` 放进服务器同一目录即可跑，不需要 `qoder_cosy.py`
-（签名已内联进代理）、不需要 Node、不需要装客户端。账号池路径按优先级解析：
+`qoder_proxy.py` + `llm_proxy_core/` + `qoder_accounts.json` 放进服务器同一目录即可跑，不需要 `qoder_cosy.py`
+（签名已内联进代理）、不需要 Node、不需要装客户端。`llm_proxy_core/` 是 OpenAI / Responses / Anthropic
+三种协议的转换与流式状态机，`codearts_proxy.py` 用的是同一份，**部署时必须整个目录一起拷过去**，
+漏了会在启动瞬间 `ModuleNotFoundError`（这两个代理谁单独搬都得带上它）。账号池路径按优先级解析：
 
 1. `QODER_PROXY_ACCOUNTS` 显式指定；
 2. `~/.qoder-cn-proxy/accounts.json` 存在就用它（本机日常走这条，行为不变）；
@@ -340,6 +356,7 @@ python qoder_proxy.py --test-chat "hi"    # 一次最小真实对话（手工验
 ```bash
 # 服务器侧
 scp qoder_proxy.py qoder_accounts.json user@host:/opt/qoder-proxy/
+scp -r llm_proxy_core user@host:/opt/qoder-proxy/     # 协议层，两个代理共用
 cd /opt/qoder-proxy && chmod 600 qoder_accounts.json
 QODER_PROXY_API_KEY=$(openssl rand -hex 16) python3 qoder_proxy.py --serve
 ```
@@ -435,18 +452,25 @@ pip install cryptography
 
 ```
 llm-proxy/
+├── llm_proxy_core/            # 协议层（两个代理共用）：请求/响应转换 + SSE 流式状态机
+│   ├── ids.py                 #   随机 id
+│   ├── frames.py              #   SSE 帧聚合、错误帧识别、分片工具名拼接
+│   ├── convert.py             #   Responses/Anthropic → OpenAI 请求
+│   ├── outbound.py            #   OpenAI → Responses/Anthropic 响应
+│   └── streams.py             #   Responses/Anthropic 流式状态机
 ├── codearts_proxy.py          # 华为 CodeArts Agent 代理（多账号 + 自动续期）
 ├── codearts-proxy.md          # codearts_proxy 设计文档（逆向细节）
-├── test_codearts_proxy.py     # codearts_proxy 测试套件（9 项）
+├── test_codearts_proxy.py     # codearts_proxy 测试套件（15 项）
 
 ├── trae_proxy.py              # 字节 TRAE SOLO CN 代理
 ├── test_trae_proxy.py         # trae_proxy 测试套件
 ├── trae_login.py              # TRAE 登录辅助
 
-├── qoder_proxy.py             # 阿里 Qoder CN 代理（Cosy 签名 + 账号池 + 自动续期；单文件即跑）
+├── qoder_proxy.py             # 阿里 Qoder CN 代理（Cosy 签名 + 账号池 + 自动续期）
 ├── qoder_accounts.json        # 账号池副本（真 token；.gitignore 已挡住，勿提交/勿外传）
 ├── qoder_sign.mjs             # Node 签名 sidecar（仅 --login 设备码 / 签名回落需要）
-├── test_qoder_proxy.py        # qoder_proxy 离线测试（全 mock，不触网）
+├── test_qoder_proxy.py        # qoder_proxy 离线测试（81 项，全 mock，不触网、不写真状态文件）
+├── test_core_protocols.py     # 协议层契约测试（同一份用例打两个后端 + 防分叉守卫，21 项）
 ├── test_qoder_cosy.py         # Cosy 签名向量测试（测的是 qoder_proxy 里的内联实现）
 ├── .reverse/                  # Qoder CN 逆向笔记（协议/签名/凭证）
 ├── proxy.py                   # ws-proxy 合规层（账号拦截/脱敏/审计）
@@ -455,3 +479,10 @@ llm-proxy/
 ├── config.example.json        # trae_proxy 配置模板
 └── AGENTS.md                  # 项目操作守则
 ```
+
+协议层只有 `llm_proxy_core/` 一份实现，两个代理按老函数名做别名绑定（`aggregate_sse`、
+`convert_*`、`_*StreamState`）。后端差异只保留在**参数**上：qoder 的上游只吃字符串 content，
+所以图片走 `image_policy="placeholder"`；snap-access 支持多模态，所以 codearts 用
+`image_policy="preserve"`。`test_core_protocols.py` 里有三条守卫盯着这件事——别名必须指向 core
+的同一个对象、协议层不许在代理本地重新 `def`、只有转换 wrapper 能删协议键。任何人想把某个函数
+复制回代理里改一份，那三条会直接红。

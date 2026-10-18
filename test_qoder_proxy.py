@@ -17,6 +17,7 @@ test_qoder_proxy.py — qoder_proxy.py 离线测试套件（不触网、不碰�
 import http.server as _srv
 import base64
 import hashlib
+import inspect
 import io
 import json
 import os
@@ -33,12 +34,21 @@ import qoder_proxy as Q
 TEST_KEY = "testkey123"
 MAX_BODY = Q.MAX_BODY_BYTES
 
+# 测试进程不许碰真东西：这两个路径在 import 时就按环境变量定死了，测试里再怎么打桩，
+# 也总有活下来的 daemon 线程在 teardown 之后按"还原了的"全局再跑一轮 ——
+# 那一轮拿的是真账号池、打的是真上游、写的就是真签到状态。
+# 真凭据 + 真状态双保险：没显式指定就一律搬进只有本进程看得见的临时目录。
+if not os.environ.get("QODER_PROXY_ACCOUNTS"):
+    Q.ACCOUNTS_FILE = os.path.join(tempfile.mkdtemp(prefix="qp-sandbox-"), "accounts.json")
+if not os.environ.get("QODER_PROXY_CHECKIN_STATE"):
+    Q.CHECKIN_STATE_FILE = os.path.join(tempfile.mkdtemp(prefix="qp-sandbox-"), "checkin_state.json")
+
 _results = []
 
 
 def _record(name, ok, detail=""):
     _results.append((name, ok, detail))
-    print("[%s] %s%s" % ("PASS" if ok else "FAIL", name, (" - " + detail) if detail else ""))
+    print("[%s] %s%s" % ("PASS" if ok else "FAIL", name, (" - " + str(detail)[:300]) if detail else ""))
 
 
 def _stdout_of(fn):
@@ -276,8 +286,11 @@ class _Env:
         self.sleeps = []       # 记录退避第几次，测试不真等
         self._saved = {k: getattr(Q, k) for k in
                        ("ACCOUNTS_FILE", "GATEWAY", "OPENAPI", "API_KEY", "_signer",
-                        "_backoff_sleep")}
+                        "_backoff_sleep", "CHECKIN_STATE_FILE")}
+        # 签到状态路径在 import 时按环境变量定死，不一起搬进临时目录的话，
+        # 在服务器上跑测试会把真那轮的账（今天领没领到）写成测试池的 0/0。
         Q.ACCOUNTS_FILE = self.accounts_file
+        Q.CHECKIN_STATE_FILE = os.path.join(self.tmpdir, "checkin_state.json")
         Q.GATEWAY = self.upstream.base
         Q.OPENAPI = self.upstream.base
         Q._signer = self.signer
@@ -1051,6 +1064,115 @@ def test_auto_refresh():
         Q._read_session()
         ok2 = dead.get("refresh_dead") is True and len(calls2) <= n_before + 1
         _record("refresh_dead_marked", ok2, "calls=%d" % len(calls2))
+    finally:
+        env.close()
+
+
+def test_refresh_single_flight_per_account():
+    """同一个号的 rotation 同时只允许一次：refresh_token 用一次即作废，
+    并发双刷必有一败，败方会被判成"续期链已死"。"""
+    acct = _fake_account("uid-race01", exp=time.time() + 60)
+    env = _Env(accounts=[acct])
+    lock = threading.Lock()
+    live = []
+    peak = [0]
+    done = []
+
+    def fake_openapi(method, path, body=None, token="", timeout=20):
+        with lock:
+            live.append(1)
+            peak[0] = max(peak[0], len(live))
+        time.sleep(0.2)                     # 把并发窗口拉宽，让没有单飞锁时一定撞车
+        with lock:
+            live.pop()
+            done.append(path)
+        return 200, {"device_token": "dt-raced", "refresh_token": "drt-raced",
+                     "expires_at": "2099-01-02T00:00:00Z"}
+
+    try:
+        env.patch_openapi(fake_openapi)
+        ts = [threading.Thread(target=Q._refresh_account, args=(dict(acct),)) for _ in range(8)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join()
+        ok = peak[0] == 1 and len(done) == 1
+        _record("refresh_single_flight_per_account", ok, "峰值并发=%d 实际刷新=%d" % (peak[0], len(done)))
+    finally:
+        env.close()
+
+
+def test_sweep_guard_is_atomic():
+    """"距上次巡检够久了没" 的判断和 "记一下这次扫了" 必须在同一把锁里。
+    用 _SlowList 把"读旧值"这一步放大成 50ms，让没加锁的写法一定被撞出多次全池枚举。"""
+    accts = [_fake_account("uid-sw%d" % i, exp=time.time() + 60) for i in range(3)]
+    env = _Env(accounts=accts)
+    seen = []
+    refreshes = []
+    orig_cool, orig_sweep_state = Q._acct_cooling, Q._last_sweep
+
+    class _SlowList(list):
+        def __getitem__(self, i):
+            v = list.__getitem__(self, i)
+            time.sleep(0.05)
+            return v
+
+    def counting(a, now):
+        seen.append(a.get("account"))
+        return orig_cool(a, now)
+
+    def fake_openapi(method, path, body=None, token="", timeout=20):
+        refreshes.append(path)
+        return 200, {"device_token": "dt-swept", "refresh_token": "drt-swept",
+                     "expires_at": "2099-01-02T00:00:00Z"}
+
+    try:
+        Q._acct_cooling = counting
+        env.patch_openapi(fake_openapi)
+        Q._last_sweep = _SlowList([0.0])
+        ts = [threading.Thread(target=Q._sweep_due) for _ in range(4)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join()
+        ok = len(seen) == 3 and len(refreshes) == 3
+        _record("sweep_guard_is_atomic", ok, "枚举=%d 刷新=%d" % (len(seen), len(refreshes)))
+    finally:
+        Q._acct_cooling = orig_cool
+        Q._last_sweep = orig_sweep_state
+        env.close()
+
+
+def test_env_isolates_checkin_state_file():
+    """两层保险都得在：`_Env` 把状态搬进自己的临时目录，import 时又把默认路径换成进程私有沙箱。
+    漏一层的代价不是断言失败，而是真那份"今天领到几个号"的账被写成测试池的 0/0。"""
+    user_default = os.path.join(os.path.expanduser("~"), ".qoder-cn-proxy", "checkin_state.json")
+    before = open(user_default, encoding="utf-8").read() if os.path.exists(user_default) else None
+    env = _Env()
+    try:
+        inside = os.path.dirname(Q.CHECKIN_STATE_FILE) == env.tmpdir
+        sandboxed = Q.CHECKIN_STATE_FILE != user_default
+        Q._write_checkin_state({"date": "2099-01-01", "attempts": 1, "done": True})
+        after = open(user_default, encoding="utf-8").read() if os.path.exists(user_default) else None
+        _record("env_isolates_checkin_state_file", inside and sandboxed and after == before,
+                "_Env=%s 沙箱=%s 真文件(%s)未变=%s" % (inside, sandboxed, user_default, after == before))
+    finally:
+        env.close()
+
+
+def test_pool_write_keeps_file_secret():
+    """自动续期写回的池必须还是 0600：真 token 不能因为默认 umask 每次续期就变 644。"""
+    env = _Env(accounts=[_fake_account("uid-mode01")])
+    try:
+        with Q._pool_lock:
+            Q._save_pool_locked()
+        if os.name == "posix":
+            mode = oct(os.stat(env.accounts_file).st_mode & 0o777)
+            _record("pool_write_keeps_file_secret", mode == "0o600", "mode=%s" % mode)
+        else:
+            src = inspect.getsource(Q._save_pool_locked)
+            _record("pool_write_keeps_file_secret", "0o600" in src and "os.open" in src,
+                    "Windows 没有 POSIX 权限位，改为源码核对 0o600/os.open")
     finally:
         env.close()
 
@@ -1886,9 +2008,8 @@ def test_checkin_round_isolates_bad_account():
 
 def test_checkin_disabled_env():
     """关掉开关时不起线程（QODER_PROXY_CHECKIN=0）；开着时是个 daemon 线程。
-    状态文件也指到临时目录，否则线程会往真 ~/.qoder-cn-proxy/checkin_state.json 写一笔。"""
-    saved_en, saved_round = Q.CHECKIN_ENABLED, Q._checkin_round
-    saved_state = Q.CHECKIN_STATE_FILE
+    轮次桩和状态路径在 teardown 时**故意不还原**：线程睡底 30s，本测试跑完它还活着。"""
+    saved_en = Q.CHECKIN_ENABLED
     t2 = None
     try:
         Q.CHECKIN_STATE_FILE = os.path.join(tempfile.mkdtemp(prefix="qp-thread-"), "state.json")
@@ -1898,9 +2019,10 @@ def test_checkin_disabled_env():
         Q._checkin_round = lambda reason: (0, 0, True)   # 不发真请求，只验线程起得来
         t2 = Q._start_checkin_thread()
         ok = ok and t2 is not None and t2.daemon and t2.name == "checkin"
+        # teardown 故意不还原 `_checkin_round` 和状态路径：线程睡底 30s，本测试跑完它还在。
+        # 还原 = 把真轮次函数 + 真状态文件交还给一个孤儿线程，它会拿真账号池打真上游领 Credits。
     finally:
-        Q.CHECKIN_ENABLED, Q._checkin_round = saved_en, saved_round
-        Q.CHECKIN_STATE_FILE = saved_state
+        Q.CHECKIN_ENABLED = saved_en
     _record("checkin_disabled_env", ok, "thread=%r" % (t2,))
 
 
@@ -1983,6 +2105,10 @@ def main():
         test_checkin_state_roundtrip,
         test_checkin_round_isolates_bad_account,
         test_checkin_disabled_env,
+        test_refresh_single_flight_per_account,
+        test_sweep_guard_is_atomic,
+        test_env_isolates_checkin_state_file,
+        test_pool_write_keeps_file_secret,
     ]
     for fn in tests:
         try:
