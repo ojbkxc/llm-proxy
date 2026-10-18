@@ -264,6 +264,76 @@ def test_responses_stream_has_both_head_and_part_done():
     _record("responses_stream_has_both_head_and_part_done", ok, evs[:3] + evs[-3:])
 
 
+def test_responses_input_shapes_are_never_silently_dropped():
+    """真 bug：`input` 项不带 `type`（SDK 简写）、或 input 直接是一串 content part、
+    或项是裸字符串，旧实现整项跳过 → 上游收到空 prompt 却仍回 200，客户端看到"模型答非所问"。
+    """
+    cases = [
+        ([{"role": "user", "content": "几点"}], "无 type 的 message"),
+        ([{"type": "input_text", "text": "几点"}], "裸 content part 数组"),
+        (["几点"], "裸字符串项"),
+        ([{"role": "user", "text": "几点"}], "无 type 只有 text"),
+    ]
+    bad = []
+    for inp, label in cases:
+        m = C.responses_to_openai({"model": "x", "input": inp})["messages"]
+        if not (len(m) == 1 and m[0]["role"] == "user" and "几点" in m[0]["content"]):
+            bad.append("%s→%s" % (label, m))
+    _record("responses_input_shapes_are_never_silently_dropped", not bad, bad)
+
+
+def test_responses_input_keeps_system_role():
+    """旧实现把非 assistant 一律折成 user，system 指令降级成用户发言，指令就失效了。"""
+    m = C.responses_to_openai({"model": "x", "input": [
+        {"type": "message", "role": "system", "content": "只回答：收到"},
+        {"type": "message", "role": "user", "content": "你好"}]})["messages"]
+    _record("responses_input_keeps_system_role",
+            [x["role"] for x in m] == ["system", "user"], [x["role"] for x in m])
+
+
+def test_responses_stream_emits_function_call_events():
+    """真 bug：流式下工具调用只累加不发事件，客户端收不到 function_call_arguments.*，
+    参数只能在 response.completed 里捞一份（codex-cli 一类客户端直接看不到工具调用）。
+    """
+    st = C.ResponsesStreamState("m")
+    evs = []
+    evs += st.feed(_chunk(tool_calls=[{"index": 0, "id": "c1",
+                                       "function": {"name": "get_", "arguments": ""}}]))
+    evs += st.feed(_chunk(tool_calls=[{"index": 0, "function": {"name": "time",
+                                                                "arguments": "{\"ci"}}]))
+    evs += st.feed(_chunk(tool_calls=[{"index": 0, "function": {"arguments": "ty\":\"京\"}"}}]))
+    evs += st.feed(_chunk(finish_reason="tool_calls"))
+    evs += st.finish()
+    names = [e for e, _ in evs]
+    deltas = [json.loads(d)["delta"] for e, d in evs if e == "response.function_call_arguments.delta"]
+    done = [json.loads(d) for e, d in evs if e == "response.function_call_arguments.done"]
+    added = [json.loads(d)["item"] for e, d in evs if e == "response.output_item.added"]
+    item = [i for i in json.loads([d for e, d in evs if e == "response.completed"][0])
+            ["response"]["output"] if i["type"] == "function_call"]
+    ok = ("response.output_item.added" in names and len(deltas) == 2
+          and done and done[0]["arguments"] == '{"city":"京"}'
+          and "response.output_item.done" in names
+          and item and item[0]["name"] == "get_time" and item[0]["call_id"] == "c1"
+          and any(a.get("type") == "function_call" for a in added))
+    _record("responses_stream_emits_function_call_events", ok,
+            "deltas=%s completed=%s" % (deltas, item[0] if item else None))
+
+
+def test_responses_stream_two_tools_get_separate_items():
+    """两个并发 tool_use 必须是两个 item、两个 output_index，不能挤成一条。"""
+    st = C.ResponsesStreamState("m")
+    evs = list(st.feed(_chunk(tool_calls=[{"index": 0, "id": "a", "function": {"name": "f1", "arguments": "{}"}}])))
+    evs += st.feed(_chunk(tool_calls=[{"index": 1, "id": "b", "function": {"name": "f2", "arguments": "{\"x\":1}"}}]))
+    evs += st.finish()
+    done = [json.loads(d)["item"] for e, d in evs if e == "response.output_item.done"]
+    fc = [i for i in done if i.get("type") == "function_call"]
+    idx = sorted(json.loads(d)["output_index"] for e, d in evs
+                 if e == "response.function_call_arguments.delta")
+    _record("responses_stream_two_tools_get_separate_items",
+            [t["name"] for t in fc] == ["f1", "f2"] and len(set(idx)) == 2,
+            [t["name"] for t in fc] + [idx])
+
+
 def test_anthropic_stream_two_parallel_tool_calls_do_not_crash():
     """真 bug：旧实现 finish() 里 sorted(dict_values()) 比大小，两个并发 tool_use 必抛 TypeError。
 

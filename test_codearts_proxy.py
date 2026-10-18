@@ -35,6 +35,8 @@ if not os.environ.get("CODEARTS_PROXY_ACCOUNTS_FILE"):
 
 # ── 常量 ──────────────────────────────────────────────────────────────────
 TEST_KEY = "testkey123"
+NL2 = chr(10) * 2
+NL2B = NL2.encode()
 MAX_BODY = codearts_proxy.MAX_BODY_BYTES  # 8MB
 
 _results = []  # [(name, ok, detail)]
@@ -343,6 +345,280 @@ def _sandbox(accounts, raises=None):
             pass
 
 
+# ── 5. 请求体读法与错误路径（2026-10-18 公网端到端实测出来的洞） ──────────
+def _read_one_response(s, timeout=15):
+    """从已连接的 socket 上读**一个**完整 HTTP 响应（按 Content-Length 收），
+    返回 (status, body) 或 None 表示连接没有响应（超时/被关）。"""
+    s.settimeout(timeout)
+    buf = b""
+    while b"\r\n\r\n" not in buf:
+        d = s.recv(4096)
+        if not d:
+            return None
+        buf += d
+    head, body = buf.split(b"\r\n\r\n", 1)
+    try:
+        status = int(head.split(b" ")[1])
+    except (IndexError, ValueError):
+        return None
+    need = 0
+    for ln in head.split(b"\r\n"):
+        if ln.lower().startswith(b"content-length:"):
+            need = int(ln.split(b":")[1])
+    while len(body) < need:
+        d = s.recv(4096)
+        if not d:
+            break
+        body += d
+    return status, body
+
+
+def test_chunked_body_is_decoded():
+    """真 bug：只看 Content-Length，`Transfer-Encoding: chunked` 的请求体当成空 body → 400。"""
+    codearts_proxy.API_KEY = TEST_KEY
+    srv, port = _start_server()
+    try:
+        s = socket.create_connection(("127.0.0.1", port), timeout=15)
+        payload = json.dumps({"messages": [{"role": "user", "content": "hello world"}]}).encode()
+        cut = len(payload) // 2
+        head = ("POST /v1/messages/count_tokens HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                "Authorization: Bearer %s\r\nContent-Type: application/json\r\n"
+                "Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n" % TEST_KEY).encode()
+        frame = (b"%x\r\n%s\r\n" % (cut, payload[:cut])
+                 + b"%x\r\n%s\r\n" % (len(payload) - cut, payload[cut:]) + b"0\r\n\r\n")
+        s.sendall(head + frame)
+        got = _read_one_response(s)
+        s.close()
+        ok = got and got[0] == 200 and json.loads(got[1].decode()).get("input_tokens", 0) >= 1
+        _record("chunked_body_is_decoded", bool(ok), got and (got[0], got[1][:80]))
+    finally:
+        _stop_server(srv)
+
+
+def test_413_keeps_connection_reusable():
+    """真 bug：回 413 时不排空残留 body，同一条 keep-alive 连接上的下一发直接超时。"""
+    codearts_proxy.API_KEY = TEST_KEY
+    srv, port = _start_server()
+    try:
+        s = socket.create_connection(("127.0.0.1", port), timeout=25)
+        big = json.dumps({"model": "GLM-5.2",
+                          "messages": [{"role": "user", "content": "a" * (MAX_BODY + 4096)}]}).encode()
+        threading.Thread(target=s.sendall, args=(
+            (("POST /v1/chat/completions HTTP/1.1\r\nHost: h\r\nAuthorization: Bearer %s\r\n"
+              "Content-Type: application/json\r\nContent-Length: %d\r\n\r\n" % (TEST_KEY, len(big))).encode()
+             + big),), daemon=True).start()
+        first = _read_one_response(s)
+        small = json.dumps({"messages": [{"role": "user", "content": "hi"}]}).encode()
+        second = None
+        try:
+            s.sendall((("POST /v1/messages/count_tokens HTTP/1.1\r\nHost: h\r\n"
+                        "Authorization: Bearer %s\r\nContent-Type: application/json\r\n"
+                        "Content-Length: %d\r\n\r\n" % (TEST_KEY, len(small))).encode() + small))
+            second = _read_one_response(s, timeout=10)
+        except Exception as e:
+            second = ("异常", repr(e))
+        s.close()
+        ok = (first and first[0] == 413 and second and isinstance(second[0], int)
+              and second[0] == 200)
+        _record("413_keeps_connection_reusable", ok, "第1发=%s 第2发=%s" % (
+            first[0] if first else None, second[0] if isinstance(second, tuple) else second))
+    finally:
+        _stop_server(srv)
+
+
+def test_empty_content_is_400():
+    """空内容必须就地 400：放过去上游回的是夹在 200 里的错误帧，翻成 502 客户端只会重试。"""
+    codearts_proxy.API_KEY = TEST_KEY
+    srv, port = _start_server()
+    try:
+        base = "http://127.0.0.1:%d" % port
+        cases = [
+            (base + "/v1/chat/completions", {"model": "GLM-5.2", "messages": []}),
+            (base + "/v1/chat/completions", {"model": "GLM-5.2"}),
+            (base + "/v1/chat/completions", {"model": "GLM-5.2",
+                                             "messages": [{"role": "user", "content": "   "}]}),
+            (base + "/v1/responses", {"model": "GLM-5.2", "input": []}),
+            (base + "/v1/messages", {"model": "GLM-5.2", "max_tokens": 8, "messages": []}),
+        ]
+        bad = []
+        for url, payload in cases:
+            code, body = _post(url, json.dumps(payload).encode(),
+                               {"Authorization": "Bearer " + TEST_KEY,
+                                "Content-Type": "application/json"})
+            try:
+                err = json.loads(body.decode()).get("error", {})
+            except Exception:
+                err = {}
+            if code != 400 or err.get("code") != "empty_input" or err.get("type") != "invalid_request_error":
+                bad.append((url.rsplit("/", 1)[-1], code, err.get("code")))
+        _record("empty_content_is_400", not bad, bad)
+    finally:
+        _stop_server(srv)
+
+
+def test_upstream_client_error_maps_to_4xx():
+    """上游的 InferHub.…400 这类客户端错误不能包成 502（502 会让 SDK 无限重试）。"""
+    f = codearts_proxy._map_upstream_error_status
+    got = [f('{"error_code":"InferHub.001001009.400","error_msg":"x"}'),
+           f('{"error_code":"InferHub.001001009.429","error_msg":"tpm"}'),
+           f('{"error":"boom"}'), f(""), f('{"error_code":"InferHub.7"}')]
+    _record("upstream_client_error_maps_to_4xx", got == [400, 429, 502, 502, 502], got)
+
+
+def test_401_error_body_matches_sdk_shape():
+    """OpenAI/Anthropic 的 SDK 都读 error.type，缺了就退化成一句裸文案。"""
+    codearts_proxy.API_KEY = TEST_KEY
+    srv, port = _start_server()
+    try:
+        code, body = _get("http://127.0.0.1:%d/v1/models" % port)
+        err = json.loads(body.decode()).get("error", {}) if code in (401,) else {}
+        _record("401_error_body_matches_sdk_shape",
+                code == 401 and err.get("type") == "authentication_error"
+                and err.get("code") == "invalid_api_key", [code, sorted(err)])
+    finally:
+        _stop_server(srv)
+
+
+class _FakeStreamResp:
+    """假上游响应：只需要 read(n)/status/headers/close，够走 6a、6b 两条读法。"""
+
+    def __init__(self, body, status=200, ct="text/event-stream"):
+        self._buf, self._pos = body, 0
+        self.status = status
+        self.headers = {"Content-Type": ct}
+
+    def read(self, n=-1):
+        if n is None or n < 0:
+            out = self._buf[self._pos:]
+            self._pos = len(self._buf)
+        else:
+            out = self._buf[self._pos:self._pos + n]
+            self._pos += len(out)
+        return out
+
+    def close(self):
+        pass
+
+
+@contextlib.contextmanager
+def _fake_upstream(frames, ct="text/event-stream", status=200):
+    """把上游整条链路换成假数据：不签 HMAC、不连 STS、不触网。"""
+    A = codearts_proxy
+    if isinstance(frames, bytes):
+        body = frames
+    else:
+        body = "".join(("data: %s" + NL2 + NL2) % json.dumps(f, ensure_ascii=False)
+                       for f in frames).encode("utf-8") + b"data: [DONE]" + NL2B + NL2B
+    saved = (A._upstream_request, A._read_session, A.upstream_headers, A._print_err)
+    A._print_err = lambda *a, **k: None
+    A._read_session = lambda *a, **k: {"ak": "a", "sk": "s", "securitytoken": "t",
+                                       "exp": time.time() + 7200}
+    A.upstream_headers = lambda session: {"X-Sdk-Content-Sha256": "deadbeef"}
+    A._upstream_request = lambda payload, headers, timeout: (
+        _FakeStreamResp(body, status, ct), status)
+    try:
+        yield
+    finally:
+        A._upstream_request, A._read_session, A.upstream_headers, A._print_err = saved
+
+
+def test_stream_error_frame_becomes_failure_event():
+    """流中途的错误帧必须翻成本协议的失败事件。原先只认 token 硬限那一种，
+    其余错误被状态机当成普通 chunk → 客户端收到正文全空的 response.completed。"""
+    codearts_proxy.API_KEY = TEST_KEY
+    srv, port = _start_server()
+    base = "http://127.0.0.1:%d" % port
+    h = {"Authorization": "Bearer " + TEST_KEY, "Content-Type": "application/json"}
+    frames = [{"choices": [{"index": 0, "delta": {"content": "前半段"}}]},
+              {"error": {"code": "InferHub.001001009.429", "message": "tpm 超限"}}]
+    bad = []
+    try:
+        with _fake_upstream(frames):
+            code, body = _post(base + "/v1/responses", json.dumps(
+                {"model": "glm-5.3", "stream": True, "input": "你好"},
+                ensure_ascii=False).encode(), headers=h)
+            txt = body.decode("utf-8", "replace")
+            if code != 200 or "event: response.failed" not in txt:
+                bad.append("responses=%s %r" % (code, txt[-120:]))
+            if "event: response.completed" in txt:
+                bad.append("responses 仍发了空 completed")
+            if "\"tpm 超限\"" not in txt:
+                bad.append("responses 错误文案没透传")
+
+            code, body = _post(base + "/v1/messages", json.dumps(
+                {"model": "glm-5.3", "stream": True, "max_tokens": 64,
+                 "messages": [{"role": "user", "content": "你好"}]},
+                ensure_ascii=False).encode(), headers=h)
+            txt = body.decode("utf-8", "replace")
+            if code != 200 or "event: error" not in txt or "message_stop" in txt:
+                bad.append("anthropic=%s %r" % (code, txt[-120:]))
+
+            code, body = _post(base + "/v1/chat/completions", json.dumps(
+                {"model": "glm-5.3", "stream": True,
+                 "messages": [{"role": "user", "content": "你好"}]},
+                ensure_ascii=False).encode(), headers=h)
+            txt = body.decode("utf-8", "replace")
+            if code != 200 or '\"error\"' not in txt or "data: [DONE]" in txt:
+                bad.append("openai=%s %r" % (code, txt[-120:]))
+        _record("stream_error_frame_becomes_failure_event", not bad, bad or "三协议各自收到失败事件")
+    finally:
+        _stop_server(srv)
+
+
+def test_nonstream_sse_error_frame_maps_to_4xx():
+    """非流式：上游把错误夹在 200 的 SSE 帧里，聚合后不能一律包成 502。"""
+    codearts_proxy.API_KEY = TEST_KEY
+    srv, port = _start_server()
+    base = "http://127.0.0.1:%d" % port
+    h = {"Authorization": "Bearer " + TEST_KEY, "Content-Type": "application/json"}
+    try:
+        got = []
+        for err in [{"error_code": "InferHub.001001009.400", "error_msg": "参数不对"},
+                    {"error_code": "InferHub.001001009.429", "error_msg": "tpm"},
+                    {"error": {"message": "服务端炸了"}}]:
+            with _fake_upstream([err]):
+                code, body = _post(base + "/v1/chat/completions", json.dumps(
+                    {"model": "GLM-5.2", "messages": [{"role": "user", "content": "你好"}]},
+                    ensure_ascii=False).encode(), headers=h)
+            err = (json.loads(body.decode("utf-8")).get("error") or {}) if code < 500 else {}
+            got.append((code, err.get("type"), err.get("code"), err.get("message")))
+        want = [(400, "invalid_request_error", "InferHub.001001009.400", "参数不对"),
+                (429, "invalid_request_error", "InferHub.001001009.429", "tpm")]
+        _record("nonstream_sse_error_frame_maps_to_4xx",
+                got[:2] == want and got[2][0] == 502, got)
+    finally:
+        _stop_server(srv)
+
+
+def test_upstream_http_error_body_has_type_and_code():
+    """上游直接回 4xx/5xx（非流式常见）：错误体也要有 type/code，不能只有一句拼接文案。"""
+    codearts_proxy.API_KEY = TEST_KEY
+    srv, port = _start_server()
+    base = "http://127.0.0.1:%d" % port
+    h = {"Authorization": "Bearer " + TEST_KEY, "Content-Type": "application/json"}
+    body = json.dumps({"model": "glm-5.3", "stream": True,
+                       "messages": [{"role": "user", "content": "北京几点"}]},
+                      ensure_ascii=False).encode("utf-8")
+    try:
+        got = []
+        for st, detail in [(400, {"error_code": "InferHub.001001005.400",
+                                  "error_msg": "The request param is invalid"}),
+                           (429, {"error_code": "InferHub.001001009.429", "error_msg": "tpm"}),
+                           (503, {"error_code": "Internal.503", "error_msg": "上游忙"})]:
+            with _fake_upstream(json.dumps(detail).encode("utf-8"),
+                                ct="application/json", status=st):
+                code, rb = _post(base + "/v1/chat/completions", body, headers=h)
+            err = json.loads(rb.decode("utf-8")).get("error") or {}
+            got.append([code, err.get("type"), err.get("code"), err.get("message")])
+        want = [[400, "invalid_request_error", "InferHub.001001005.400",
+                 "The request param is invalid"],
+                [429, "invalid_request_error", "InferHub.001001009.429", "tpm"],
+                [503, "api_error", "Internal.503", "上游忙"]]
+        _record("upstream_http_error_body_has_type_and_code", got == want, got)
+    finally:
+        _stop_server(srv)
+
+
 def test_refresh_only_kills_real_dead_chains():
     """超时/TLS/5xx 都是抖动：一次抖动不该烧掉一条 30 天的 refresh 链。"""
     cases = [
@@ -448,6 +724,14 @@ def main():
         test_no_auth_health,
         test_body_oversize,
         test_count_tokens,
+        test_chunked_body_is_decoded,
+        test_413_keeps_connection_reusable,
+        test_empty_content_is_400,
+        test_upstream_client_error_maps_to_4xx,
+        test_401_error_body_matches_sdk_shape,
+        test_stream_error_frame_becomes_failure_event,
+        test_nonstream_sse_error_frame_maps_to_4xx,
+        test_upstream_http_error_body_has_type_and_code,
         test_refresh_only_kills_real_dead_chains,
         test_transient_failure_leaves_pool_file_untouched,
         test_backoff_suppresses_immediate_retry,

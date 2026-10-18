@@ -12,7 +12,11 @@ from .frames import merge_tool_name
 
 
 class ResponsesStreamState:
-    """chat chunk → Responses 协议事件序列（codex-cli 依赖 response.completed 等）。"""
+    """chat chunk → Responses 协议事件序列（codex-cli 依赖 response.completed 等）。
+
+    工具调用的 arguments 就地增量下发，`output_item.added` 里的 name 可能只是片段，
+    完整 name/arguments 以 `response.output_item.done` 和 `response.completed` 为准。
+    """
 
     def __init__(self, model):
         self.model = model
@@ -23,9 +27,7 @@ class ResponsesStreamState:
         self.finish_reason = None
         self.text = ""
         self.reasoning = ""
-        self.tool_name = ""
-        self.tool_id = ""
-        self.tool_args = ""
+        self.tools = {}           # 上游 index → {fc_id, call_id, name, args, opened, output_index}
         self.usage = None
         self.text_item_id = "msg_" + new_id()
         self.reason_item_id = "rs_" + new_id()
@@ -100,13 +102,33 @@ class ResponsesStreamState:
                 "output_index": self.text_index, "content_index": 0, "delta": content,
             }, ensure_ascii=False)))
 
-        for tc in delta.get("tool_calls") or []:
+        for i, tc in enumerate(delta.get("tool_calls") or []):
             fn = tc.get("function") or {}
-            if tc.get("id"):
-                self.tool_id = tc["id"]
-            self.tool_name = merge_tool_name(self.tool_name, fn.get("name"))
-            if fn.get("arguments"):
-                self.tool_args += fn["arguments"]
+            key = tc.get("index", i)
+            st = self.tools.get(key)
+            if st is None:
+                st = {"fc_id": "fc_" + new_id(), "call_id": tc.get("id") or "",
+                      "name": "", "args": "", "opened": False, "output_index": None}
+                self.tools[key] = st
+            elif tc.get("id"):
+                st["call_id"] = tc["id"]
+            st["name"] = merge_tool_name(st["name"], fn.get("name"))
+            argd = fn.get("arguments")
+            if argd and not st["opened"]:
+                st["opened"] = True
+                st["output_index"] = self.next_index
+                self.next_index += 1
+                out.append(("response.output_item.added", json.dumps({
+                    "type": "response.output_item.added", "output_index": st["output_index"],
+                    "item": {"type": "function_call", "id": st["fc_id"], "call_id": st["call_id"],
+                             "name": st["name"], "arguments": "", "status": "in_progress"},
+                }, ensure_ascii=False)))
+            if argd:
+                st["args"] += argd
+                out.append(("response.function_call_arguments.delta", json.dumps({
+                    "type": "response.function_call_arguments.delta", "item_id": st["fc_id"],
+                    "output_index": st["output_index"], "call_id": st["call_id"], "delta": argd,
+                }, ensure_ascii=False)))
         return out
 
     def finish(self):
@@ -157,10 +179,25 @@ class ResponsesStreamState:
                           "status": "completed",
                           "content": [{"type": "output_text", "text": self.text,
                                        "annotations": []}]})
-        if self.tool_name:
-            items.append({"type": "function_call", "id": "fc_" + new_id(),
-                          "call_id": self.tool_id, "name": self.tool_name,
-                          "arguments": self.tool_args, "status": "completed"})
+        for _, st in sorted(self.tools.items()):
+            if not st["opened"]:      # 参数一帧没到的工具调用也要出现在输出里
+                st["output_index"] = self.next_index
+                self.next_index += 1
+                out.append(("response.output_item.added", json.dumps({
+                    "type": "response.output_item.added", "output_index": st["output_index"],
+                    "item": {"type": "function_call", "id": st["fc_id"], "call_id": st["call_id"],
+                             "name": st["name"], "arguments": "", "status": "in_progress"},
+                }, ensure_ascii=False)))
+            out.append(("response.function_call_arguments.done", json.dumps({
+                "type": "response.function_call_arguments.done", "item_id": st["fc_id"],
+                "output_index": st["output_index"], "call_id": st["call_id"], "arguments": st["args"],
+            }, ensure_ascii=False)))
+            item = {"type": "function_call", "id": st["fc_id"], "call_id": st["call_id"],
+                    "name": st["name"], "arguments": st["args"], "status": "completed"}
+            out.append(("response.output_item.done", json.dumps({
+                "type": "response.output_item.done", "output_index": st["output_index"],
+                "item": item}, ensure_ascii=False)))
+            items.append(item)
         if not items:
             items.append({"type": "message", "id": self.text_item_id, "role": "assistant",
                           "status": "completed",

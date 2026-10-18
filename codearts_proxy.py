@@ -56,6 +56,7 @@ import http.client
 import http.server
 import json
 import os
+import re
 import secrets
 import shutil
 import sqlite3
@@ -1254,6 +1255,61 @@ def convert_responses_to_openai(body):
 _AnthropicStreamState = C.AnthropicStreamState
 _ResponsesStreamState = C.ResponsesStreamState
 
+# 413 之前愿意替客户端排空的余量：超限不多就把残留 body 读完，keep-alive 连接还能继续用；
+# 再大就直接关连接，不值得为一条废连接传几十 MB。
+DRAIN_EXTRA_BYTES = 32 << 20
+
+
+def _msg_has_content(m):
+    if not isinstance(m, dict):
+        return False
+    if m.get("tool_calls"):
+        return True
+    c = m.get("content")
+    if isinstance(c, str):
+        return bool(c.strip())
+    return bool(c)  # 多模态 parts 数组：非空即有内容
+
+
+def _has_useful_content(msgs):
+    return isinstance(msgs, list) and any(_msg_has_content(m) for m in msgs)
+
+
+def _upstream_error_fields(detail):
+    """上游错误体 → (error_code, error_msg)。上游有两种写法：
+    `{"error_code": "...", "error_msg": "..."}` 和 `{"error": {"code": ..., "message": ...}}`。
+    非流式的 4xx 透传要给出 SDK 认得的 type/code，不能只塞一句拼出来的文案。
+    """
+    text = detail or ""
+    code = msg = ""
+    try:
+        obj = json.loads(text)
+    except Exception:
+        obj = None
+    if isinstance(obj, dict):
+        err = obj.get("error") if isinstance(obj.get("error"), dict) else {}
+        code = str(err.get("code") or obj.get("error_code") or obj.get("errorCode") or "")
+        msg = str(err.get("message") or obj.get("error_msg") or obj.get("error_message") or "")
+    if not code:
+        m = re.search(r'"?(?:error[_-]?[cC]ode|code)"?\s*[:=]\s*"?([A-Za-z0-9_.\-]+)', text)
+        code = m.group(1) if m else ""
+    if not msg:
+        m = re.search(r'"?(?:error[_-]?[mM]sg|error_message|message)"?\s*[:=]\s*"([^"]{1,200})', text)
+        msg = m.group(1) if m else ""
+    return code, msg
+
+
+def _map_upstream_error_status(detail):
+    """上游把客户端错误夹在 200 的 SSE 错误帧里（error_code 形如 `InferHub.001001009.400`）。
+
+    这类必须如实回 4xx：包成 502 会让 SDK 当成服务端故障无限重试。
+    """
+    code, _ = _upstream_error_fields(detail)
+    tail = re.search(r"(\d{3})$", code or "")
+    if tail and 400 <= int(tail.group(1)) < 600:
+        return int(tail.group(1))
+    return 502
+
 
 # ── HTTP Handler ──────────────────────────────────────────────────────────
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -1271,22 +1327,75 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return True
         if secrets.compare_digest(self.headers.get("X-Api-Key", ""), API_KEY):
             return True
-        self._json(401, {"error": {"message": "无效或缺失 API Key"}})
+        self._json(401, {"error": {"message": "无效或缺失 API Key",
+                                   "type": "authentication_error", "code": "invalid_api_key"}})
         return False
 
     def _read_body(self):
-        """读请求体；超过 MAX_BODY_BYTES 回 413，返回 None。"""
+        """读请求体。返回 bytes，或 None 表示已经自己回过状态码了。
+
+        `Transfer-Encoding: chunked` 也要能读（curl `--data-binary @-`、部分 SDK 就这么发），
+        只看 Content-Length 会把整条请求当成空 body 报 400。
+        """
+        if "chunked" in (self.headers.get("Transfer-Encoding") or "").lower():
+            return self._read_chunked_body()
         length = int(self.headers.get("Content-Length") or 0)
         if length > MAX_BODY_BYTES:
-            self._json(413, {"error": {"message": "请求体过大（上限 %d MB）" % (MAX_BODY_BYTES >> 20)}})
+            self._reject_too_big(length)
             return None
         return self.rfile.read(length)
 
-    def _json(self, code: int, obj: dict):
+    def _read_chunked_body(self):
+        buf = bytearray()
+        while True:
+            line = self.rfile.readline(65536)
+            if not line:
+                break
+            try:
+                n = int(line.strip().split(b";")[0] or b"0", 16)
+            except ValueError:
+                return b""          # 坏帧：当成空 body，让上层报"无效 JSON"
+            if n == 0:
+                while True:         # 读掉 trailer（以空行结束）
+                    t = self.rfile.readline(65536)
+                    if t in (b"\r\n", b"\n", b""):
+                        break
+                break
+            if len(buf) + n > MAX_BODY_BYTES:
+                self._reject_too_big(len(buf) + n, chunked=True)
+                return None
+            buf += self.rfile.read(n)
+            self.rfile.read(2)      # 分块后的 CRLF
+        return bytes(buf)
+
+    def _reject_too_big(self, length, chunked=False):
+        """回 413。残留 body 不处理干净的话，会污染这条 keep-alive 连接上的下一个请求
+        （实测下一发直接超时），所以能排空就排空，太大就明确关连接。"""
+        msg = "请求体过大（上限 %d MB）" % (MAX_BODY_BYTES >> 20)
+        drain = not chunked and length <= MAX_BODY_BYTES + DRAIN_EXTRA_BYTES
+        _print_err("413 %s body=%d 字节（%s）" % (
+            self.path, length, "排空残留、连接复用" if drain else "过大不排空、关连接"))
+        if drain:
+            left, chunk = length, 1 << 16
+            while left > 0:
+                data = self.rfile.read(min(chunk, left))
+                if not data:
+                    break
+                left -= len(data)
+            self._json(413, {"error": {"message": msg, "type": "invalid_request_error",
+                                       "code": "request_too_large"}})
+            return
+        self._json(413, {"error": {"message": msg, "type": "invalid_request_error",
+                                   "code": "request_too_large"}}, close=True)
+
+    def _json(self, code: int, obj: dict, close: bool = False):
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        if close:
+            self.send_header("Connection", "close")
+            self.close_connection = True
         self.end_headers()
         self.wfile.write(body)
 
@@ -1368,7 +1477,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return
             req = json.loads(body.decode("utf-8"))
         except Exception:
-            return self._json(400, {"error": {"message": "无效 JSON 请求体"}})
+            return self._json(400, {"error": {"message": "无效 JSON 请求体",
+                                              "type": "invalid_request_error", "code": "invalid_json"}})
         total_chars = sum(len(t) for t in parse_anthropic_text(req))
         return self._json(200, {"input_tokens": max(1, total_chars // 3)})
 
@@ -1384,7 +1494,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return
             req_body = json.loads(body.decode("utf-8"))
         except Exception:
-            return self._json(400, {"error": {"message": "无效 JSON 请求体"}})
+            return self._json(400, {"error": {"message": "无效 JSON 请求体",
+                                              "type": "invalid_request_error", "code": "invalid_json"}})
 
         # 2) 协议请求转换 → OpenAI chat
         req_model_name = req_body.get("model") or ""   # 客户端请求的原始名（响应回填用）
@@ -1395,11 +1506,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
         else:
             req = dict(req_body)
 
+        # 2a) 内容为空就地挡掉：放过去上游回的是夹在 200 里的错误帧，翻成 502 之后
+        #     客户端只会当成服务端故障重试，看不出是自己没带 messages。
+        if not _has_useful_content(req.get("messages")):
+            return self._json(400, {"error": {
+                "message": "请求没有可用内容：messages/input/content 为空",
+                "type": "invalid_request_error", "code": "empty_input"}})
+
         # 3) 模型解析（别名 → 官方 id）
         model = req.get("model") or ""
         real = MODEL_ALIAS.get(model, model)
         if real not in MODELS:
-            return self._json(404, {"error": {"message": "模型 %s 不存在。可用: %s" % (model, ", ".join(sorted(MODELS)))}})
+            return self._json(404, {"error": {"message": "模型 %s 不存在。可用: %s" % (model, ", ".join(sorted(MODELS))),
+                                           "type": "invalid_request_error", "code": "model_not_found"}})
         req["model"] = real
         minfo = MODELS[real]
 
@@ -1450,9 +1569,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     # 上游 token 硬限错误（81027/81001 等）：转成更友好的 413 + 中文提示
                     if minfo.get("limit_err") and str(minfo["limit_err"]) in detail:
                         cap = minfo.get("max_tokens", "?")
-                        return self._json(413, {"error": {"message": "请求超出 %s 上游硬限（input+output ≤ %s tokens，错误码 %s）。请减少上下文或缩短 max_tokens。" % (real, cap, minfo["limit_err"]), "code": minfo["limit_err"]}})
+                        return self._json(413, {"error": {
+                            "message": "请求超出 %s 上游硬限（input+output ≤ %s tokens，错误码 %s）。请减少上下文或缩短 max_tokens。" % (real, cap, minfo["limit_err"]),
+                            "type": "invalid_request_error", "code": minfo["limit_err"]}})
                     _print_err("上游 %s %s: %s" % (st_code, real, detail[:200]))
-                    return self._json(st_code, {"error": {"message": "上游 %s: %s" % (st_code, detail)}})
+                    # SDK 只读 error.type / error.code：缺了就只能把整段上游 JSON 当文案看
+                    up_code, up_msg = _upstream_error_fields(detail)
+                    return self._json(st_code, {"error": {
+                        "message": up_msg or ("上游 %s: %s" % (st_code, detail)),
+                        "type": "invalid_request_error" if st_code < 500 else "api_error",
+                        "code": up_code or "upstream_error"}})
                 break
             except Exception as e:
                 return self._json(502, {"error": {"message": "上游连接失败: %s" % e}})
@@ -1500,17 +1626,31 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     obj = json.loads(data_text)
                 except Exception:
                     return
-                # 流式途中收到上游 token 硬限错误：提前结束流，写一条 error 事件给客户端
-                err_code = (obj.get("error") or {}).get("code") if isinstance(obj.get("error"), dict) else None
-                if err_code == minfo.get("limit_err") or (minfo.get("limit_err") and str(minfo["limit_err"]) in data_text and obj.get("error")):
-                    cap = minfo.get("max_tokens", "?")
-                    err_msg = "请求超出 %s 上游硬限（input+output ≤ %s tokens，错误码 %s）。请减少上下文或缩短 max_tokens。" % (real, cap, minfo["limit_err"])
+                # 流式途中的错误帧要翻成各协议自己的失败事件。原先只认 token 硬限那一种，
+                # 其余错误被状态机当成普通 chunk，客户端拿到的是正文全空的 response.completed。
+                err = obj.get("error") if isinstance(obj.get("error"), dict) else None
+                err_code = (err or {}).get("code") or obj.get("error_code") or ""
+                err_msg = (err or {}).get("message") or obj.get("error_msg") or obj.get("error_message") or ""
+                if err or err_code:
+                    over_limit = bool(minfo.get("limit_err")) and (
+                        str(err_code) == str(minfo["limit_err"]) or str(minfo["limit_err"]) in data_text)
+                    if over_limit:
+                        err_msg = ("请求超出 %s 上游硬限（input+output ≤ %s tokens，错误码 %s）。"
+                                   "请减少上下文或缩短 max_tokens。"
+                                   % (real, minfo.get("max_tokens", "?"), minfo["limit_err"]))
+                    err_type = "invalid_request_error" if over_limit else "api_error"
                     if protocol == "anthropic":
-                        _write_sse("error", json.dumps({"type": "error", "error": {"type": "invalid_request_error", "message": err_msg}}, ensure_ascii=False))
+                        _write_sse("error", json.dumps({"type": "error", "error": {
+                            "type": err_type, "message": err_msg or "上游返回错误"}}, ensure_ascii=False))
                     elif protocol == "responses":
-                        _write_sse("response.failed", json.dumps({"type": "response.failed", "response": {"id": "resp_" + _rand(), "status": "failed", "error": {"code": minfo["limit_err"], "message": err_msg}}}, ensure_ascii=False))
+                        _write_sse("response.failed", json.dumps({"type": "response.failed", "response": {
+                            "id": "resp_" + _rand(), "status": "failed",
+                            "error": {"code": err_code, "message": err_msg or "上游返回错误"}}},
+                            ensure_ascii=False))
                     else:
-                        _write_sse("", json.dumps({"error": {"message": err_msg, "code": minfo["limit_err"]}}, ensure_ascii=False))
+                        _write_sse("", json.dumps({"error": {"message": err_msg or "上游返回错误",
+                                                             "type": err_type, "code": err_code}},
+                                                  ensure_ascii=False))
                     final_sent = True
                     return
                 if st is not None:
@@ -1586,10 +1726,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 data = json.dumps(merged, ensure_ascii=False).encode("utf-8")
                 ct = "application/json"
             elif merged is not None:
-                # 上游在 SSE 里夹了错误帧（如 429 限流文本帧）：转成错误响应
+                # 上游在 SSE 里夹了错误帧（限流、参数校验等）。这类多数是客户端能改的，
+                # 一律包成 502 会让 SDK 当成服务端故障无限重试。
                 detail = json.dumps(merged["error"], ensure_ascii=False)[:400]
                 _print_err("上游 SSE 错误帧 %s %s: %s" % (resp.status, real, detail[:200]))
-                return self._json(502, {"error": {"message": "上游错误: %s" % detail}})
+                up_code, up_msg = _upstream_error_fields(detail)
+                return self._json(_map_upstream_error_status(detail),
+                                  {"error": {"message": up_msg or ("上游错误: %s" % detail),
+                                             "type": "invalid_request_error",
+                                             "code": up_code or "upstream_error"}})
 
         # 协议响应转换（openai 直通；responses/anthropic 转换后返回）
         if protocol == "responses":

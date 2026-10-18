@@ -70,6 +70,76 @@ def _tool_result_text(content):
     return json.dumps(content, ensure_ascii=False) if content else ""
 
 
+def _infer_item_type(item):
+    """猜 input 项的类型。
+
+    很多客户端（含官方 SDK 的简写用法）发的是 `{"role","content"}` 而不带 `type`，
+    整项丢弃会让上游收到空 prompt 却照样回 200，比报错更难查。
+    """
+    t = item.get("type")
+    if t in ("message", "function_call", "function_call_output", "reasoning"):
+        return t
+    if t in TEXT_PART_TYPES or t in ("input_image", "image", "image_url"):
+        return "part"
+    if "content" in item:
+        return "message"
+    if "output" in item and item.get("call_id"):
+        return "function_call_output"
+    if item.get("name") and "arguments" in item:
+        return "function_call"
+    if "text" in item:
+        return "part"
+    return None
+
+
+def responses_items_to_messages(inp):
+    """Responses 的 input 数组 → OpenAI messages（instructions 由调用方先行拼接）。"""
+    msgs = []
+    parts = []   # 连续的裸 content part（`input` 直接给一串 part）攒成一条 user 消息
+
+    def flush():
+        if parts:
+            text = _parts_text(parts)
+            if text:
+                msgs.append({"role": "user", "content": text})
+            del parts[:]
+
+    for item in inp:
+        if isinstance(item, str):
+            if item.strip():
+                parts.append({"type": "text", "text": item})
+            continue
+        if not isinstance(item, dict):
+            continue
+        t = _infer_item_type(item)
+        if t == "part":
+            parts.append(item if item.get("type") else dict(item, type="text"))
+            continue
+        flush()
+        if t == "message":
+            role = item.get("role") or "user"
+            if role not in ("user", "assistant", "system"):
+                role = "user"
+            c = item.get("content")
+            text = c if isinstance(c, str) else _parts_text(c if isinstance(c, list) else [])
+            if text:
+                msgs.append({"role": role, "content": text})
+        elif t == "function_call":
+            tc = {"id": item.get("call_id", ""), "type": "function",
+                  "function": {"name": item.get("name", ""),
+                               "arguments": item.get("arguments") or "{}"}}
+            last = msgs[-1] if msgs else {}
+            if last.get("role") == "assistant" and isinstance(last.get("tool_calls"), list):
+                last["tool_calls"].append(tc)
+            else:
+                msgs.append({"role": "assistant", "content": None, "tool_calls": [tc]})
+        elif t == "function_call_output":
+            msgs.append({"role": "tool", "tool_call_id": item.get("call_id", ""),
+                         "content": _tool_result_text(item.get("output"))})
+    flush()
+    return msgs
+
+
 def responses_to_openai(body):
     """/v1/responses 请求体 → OpenAI chat.completions 请求体。"""
     oa = {}
@@ -89,28 +159,7 @@ def responses_to_openai(body):
     if isinstance(inp, str) and inp:
         msgs.append({"role": "user", "content": inp})
     elif isinstance(inp, list):
-        for item in inp:
-            if not isinstance(item, dict):
-                continue
-            t = item.get("type")
-            if t == "message":
-                role = "assistant" if item.get("role") == "assistant" else "user"
-                c = item.get("content")
-                text = c if isinstance(c, str) else _parts_text(c or [])
-                if text:
-                    msgs.append({"role": role, "content": text})
-            elif t == "function_call":
-                tc = {"id": item.get("call_id", ""), "type": "function",
-                      "function": {"name": item.get("name", ""),
-                                   "arguments": item.get("arguments") or "{}"}}
-                last = msgs[-1] if msgs else {}
-                if last.get("role") == "assistant" and isinstance(last.get("tool_calls"), list):
-                    last["tool_calls"].append(tc)
-                else:
-                    msgs.append({"role": "assistant", "content": None, "tool_calls": [tc]})
-            elif t == "function_call_output":
-                msgs.append({"role": "tool", "tool_call_id": item.get("call_id", ""),
-                             "content": _tool_result_text(item.get("output"))})
+        msgs.extend(responses_items_to_messages(inp))
     oa["messages"] = msgs or [{"role": "user", "content": ""}]
 
     tools = tools_to_openai(body.get("tools"))
