@@ -8,6 +8,7 @@
 |---|---|---|---|---|---|
 | `codearts_proxy.py` | 华为 CodeArts Agent | 8788 | ✅ 池轮询 | ✅ DPoP+STS | ✅ Win 抓取 / 任意平台运行 |
 | `trae_proxy.py` | 字节 TRAE SOLO CN | 8790 | — | ✅ refresh | ✅ |
+| `qoder_proxy.py` | 阿里 Qoder CN | 8791 | ✅ 池轮询 | ✅ refresh | 需 Node + worker bundle；凭证 `--capture`（Win 客户端）或 `--login`（浏览器设备码，任意机器） |
 
 ---
 
@@ -77,7 +78,14 @@ python codearts_proxy.py
 
 ### 登录态自动续期
 
-securitytoken 是临时凭证（≈2h），临期 1 小时自动调 STS OAuth 端点续期（DPoP ES256 签名），refresh_token 有效期 ≈24 天，期间无需人工干预。续期后新凭证写回池文件，代理自洽管理。
+securitytoken 是临时凭证（≈2h），临期 90 分钟内自动调 STS OAuth 端点续期（DPoP ES256 签名），refresh_token 有效期 ≈30 天，期间无需人工干预。续期后新凭证写回池文件，代理自洽管理。
+
+续期有两条互不依赖的触发路径：
+
+- **请求路径**：`_read_session` 取到临期的号就地续一次，按 `ot_session_id` 单飞（`refresh_token` 一次性，并发双刷会让败方被判死）。
+- **后台线程 `renew`**：每 60 秒（`CODEARTS_PROXY_RENEW_SWEEP_SEC`）扫**整池**。没有它，夜里零流量 → CAS 到点饿死，30 天的链只能干等；`CODEARTS_PROXY_RENEW=0` 关掉。
+
+**失败分类**：只有 refresh 链真作废才判死并写进池文件的 `refresh_dead`——`STS5.1806`、"the refresh token has been used"、"kid not found"、"refresh code has expired"。其余（超时、TLS 抖动、上游 5xx、DPoP 头被拒）**不写池、不判死**，按 60 秒（网络类）/ 600 秒（其它）退避后重试。误判一次的代价是烧掉一条 30 天的链，只能重新扫码。池文件同样以 `0o600` 落盘。
 
 > **已知限制**：续期不回写客户端 `state.vscdb`，refresh_token 轮换后客户端当前 session 失效（池账号不受影响）。`CLIENT_ID` 默认 `codearts-agent`，可用 `CODEARTS_PROXY_CLIENT_ID` 覆盖。
 
@@ -89,13 +97,15 @@ securitytoken 是临时凭证（≈2h），临期 1 小时自动调 STS OAuth �
 | `CODEARTS_PROXY_API_KEY` | (空) | API Key 鉴权（空=不鉴权，支持 `Authorization: Bearer` 和 `X-Api-Key`） |
 | `CODEARTS_PROXY_CLIENT_ID` | codearts-agent | STS OAuth client_id |
 | `CODEARTS_PROXY_ACCOUNTS_FILE` | 脚本同目录 | 池文件路径（网盘共享用） |
+| `CODEARTS_PROXY_RENEW` | 1 | `=0` 关掉后台续期巡检线程 |
+| `CODEARTS_PROXY_RENEW_SWEEP_SEC` | 60 | 后台扫整池的间隔（秒） |
 
 请求体上限 8MB（防 OOM，对齐 trae_proxy）。
 
 ### 测试
 
 ```bash
-python test_codearts_proxy.py        # 9 项离线测试（不触网）
+python test_codearts_proxy.py        # 15 项离线测试（全 mock，池路径 import 时就搬进临时目录）
 ```
 
 ### 平台支持
@@ -159,6 +169,264 @@ python test_trae_proxy.py --integration         # 单元 + 集成测试
 
 ---
 
+## qoder_proxy.py — 阿里 Qoder CN
+
+把 Qoder CN（阿里 AI IDE）客户端的官方模型通道转成本地三协议兼容 API。
+
+**上游只用带 Cosy 签名的 `/algo` 通道**。签名与请求体编码原先在客户端的 `qoder_auth_wasm` 里，
+现已逐字节还原成 **纯 Python 并内联在 `qoder_proxy.py` 里**（自定义 base64 + 分块重排、AES-128-CBC、
+RSA-1024 PKCS#1 v1.5、MD5 签名原像），并用插桩 WASM 的确定性回放 + 网关真机请求验收。
+代理默认 **不需要 Node**：`QODER_PROXY_SIGN_BACKEND=auto` 优先纯 Python，异常才回落
+`qoder_sign.mjs` sidecar（`py` / `node` 可强制单一后端）。只有 `--login` 的设备码流程仍用 Node
+驱动客户端 bundle。整个运行过程不启动、不连接 Qoder CN 客户端进程。
+无签名的 OpenAI 兼容通道 `POST /model/v1/chat/completions` 实测**没有被网关路由**：
+所有 `/model/*` 变体都返回 ALB 503 HTML（**带真实 `device_token` 和不带鉴权完全一样**，
+2026-10-17 复测；`gateway.qoder.com.cn` 就是客户端 `kgi()` 在 CN prod 用的同一个 host，
+不是选错了域名），而 `/algo/*` 返回 403 `{"code":"101","message":"Signature invalid"}`——说明只有 `/algo` 到达了应用层。
+
+### 快速开始
+
+```bash
+# 方式一：本机装过 Qoder CN 并登录过（Windows）
+python qoder_proxy.py --capture    # DPAPI + AES-256-GCM 解客户端 auth.v1.dat，入池
+
+# 方式二：完全没有客户端 —— 跳浏览器授权（对齐 codearts_proxy.py 的 --login 用法）
+python qoder_proxy.py --login      # 打印 https://qoder.cn/device/selectAccounts?... 授权链接
+                                   # → 你在浏览器里确认 → 轮询拿 device_token → 自动入池
+                                   # 可连续登多个账号
+
+python qoder_proxy.py              # 启动代理（tty 时弹交互菜单，可重复登录/签到/启动）
+python qoder_proxy.py --serve      # 跳过菜单直接启动
+python qoder_proxy.py --check      # 脱客户端自检：网关/账号池/签名器/模型清单
+```
+
+签名/代理运行不需要 Node；`--login` 需要 Node + worker bundle，`--capture` 需要 `cryptography`。
+
+### 模型
+
+模型清单**运行时从签名端点** `GET /algo/api/v2/model/list` 拉取并缓存 1h（`--models` 直接打印），
+默认模型 `auto`。实测 14 个：
+
+| model key | 名称 | 上下文 | 推理 | 价格系数 |
+|---|---|---|---|---|
+| `auto` | Auto | 200000 | ✅ | 0.5 |
+| `qmodel_38max` | Qwen3.8-Max | 1000000 | ✅ | 0.2 |
+| `qfmodel` | Qwen3.8-Flash | 1000000 | ✅ | 0.0 |
+| `qmodel_latest` / `qmodel` / `q37fmodel` | Qwen3.7-Max / Plus / Flash | 1000000 | ✅ | 0.5 / 0.04 / 0.1 |
+| `dmodel` / `dfmodel` | DeepSeek-V4-Pro / Flash | 1000000 | ✅ / — | 0.5 / 0.1 |
+| `gmodel` / `gfmodel` / `gm51model` | GLM-5.3 / 5.3-Flash / 5.2 | 1000000 | ✅ | 0.8 / 0.1 / 0.6 |
+| `kmodel_latest` / `kmodel` | Kimi-K3 / K2.8-Preview | 1000000 | — / ✅ | 1.4 / 0.8 |
+| `mmodel` | MiniMax-M2.7 | 200000 | — | 0.2 |
+
+> 别名大小写不敏感；清单里没有的模型名直接 404 并列出可用 id。上下文取
+> `max_input_tokens` 与 `context_config` 里的较大值。
+
+### 思考深度
+
+三协议均可选择思考深度，代理会转成上游字段（顶层 `reasoningEffort` +
+`parameters.reasoning_effort` / `enable_thinking` / `reasoning_budget_tokens`，与客户端
+bundle 里的下发形状一致）：
+
+| 客户端写法 | 效果 |
+|---|---|
+| OpenAI `reasoning_effort: "low"/"medium"/"high"/...` | 直接选档；`minimal`→`low`，`off`/`disabled`→`none` |
+| OpenAI `thinking_budget: 4096`（Qwen 风格）/ `reasoning_budget_tokens` | 按预算反查档位（≤1K low、≤8K medium、≤24K high、≤49K xhigh，再高 max），预算随参上送 |
+| OpenAI `enable_thinking: false` | 等同 `reasoning_effort: "none"`（真机实测思考 token 归零） |
+| Responses `reasoning: {effort: "..."}` | 同上 |
+| Anthropic `thinking: {type: "enabled", budget_tokens: N}` / `{type: "disabled"}` | 按预算反查档位 / 关闭思考 |
+| Anthropic `preserve_thinking` / OpenAI `preserve_thinking` | 透传 |
+
+档位以模型声明为准：`/v1/models` 的 `metadata.thinking_config` 透出每个模型声明的
+`enabled.efforts` 与 `disabled`（例如 `qfmodel` 为 low/medium/xhigh + 可关）。请求了模型
+未声明的档位时按预算距离**就近调整**（同距取小；只有 none 可用而要求思考时不注入，
+走模型默认），调整会写进 `QODER_PROXY_LOG`。
+
+### 每日 Credits 签到
+
+```bash
+python qoder_proxy.py --checkin
+```
+
+- **多账号**：遍历池中所有账号，逐个领取今天的 campaign。
+- `GET /sash/api/v1/me/campaigns`（Bearer + Cosy 设备头，无签名）。
+  **`Cosy-ClientType` 必须是 10（桌面端）**：5 时服务端把活动列表清空（`showCampaign=false`、
+  `campaigns=[]`），领不到任何东西；`Cosy-Version` / `Cosy-MachineOS` 不参与这个门槛。
+- 逐项看 `actionType == "CLAIM_BENEFIT"` 且 `claimStatus == "CLAIMABLE"` 才领；已领过的项
+  会变 `CLAIMED`，所以重复执行是安全 no-op（顶层 `claimable` 只是总开关，不区分是哪个活动）。
+- 每项 `POST /sash/api/v1/me/campaigns/{campaignId}/claim`（body `{}`），领完再查一次确认状态。
+  响应就是发放回执（`grantId`/`claimedAt`/`grantedAt`）；重复 POST 返回 `replayed=true` 不会二次发放，
+  所以整条链路可随便重试。当日额度是 `benefit.kind=CREDITS, amount=100`，30 天有效。
+- **到账物证**：`/sash/api/v2/me/usage` 的 `qoderUsage.addOnQuota.total` 每成功领一次 +100
+  （客户端日志实测 100→200→300）。有领取动作时 `--checkin` 会打印 `额度 addOnQuota.total=N`，
+  定时轮次的日志也会带 `额度总额=N`，隔一天再比对就是硬证据。
+- **自动签到**：`--serve` 会起一个 `checkin` 线程，默认每天 11:30（`QODER_PROXY_CHECKIN_AT` 可改）
+  逐号领取；池里全部账号当天的份都到位才记 `done`，否则每 1800s 重试、最多 4 次后等明天。
+  进度写在 `~/.qoder-cn-proxy/checkin_state.json`（独立于账号池），重启会跳过已完成的天。
+  `QODER_PROXY_CHECKIN=0` 关闭。
+- 活动窗口 **10:00 → 次日 09:59（北京）**，错过不补（`startAt/endAt` 实测正是这个区间）。
+- Windows 计划任务示例（每天 10:05，用 `pythonw.exe` 可避免弹控制台）：
+
+```bat
+schtasks /Create /TN "QoderCheckin" /SC DAILY /ST 10:05 ^
+  /TR "\"<python.exe 或 pythonw.exe 的绝对路径>\" \"C:\GitHub\llm-proxy\qoder_proxy.py\" --checkin"
+```
+
+> 只用于你自己的账号。多账号批量领取属于刷活动，本工具不提供也不支持。
+
+### 端点
+
+| 端点 | 协议 | 说明 |
+|---|---|---|
+| `GET /health` | — | 只读本地状态：账号池 + 签名器 peek（不启动 node、不打上游，秒回） |
+| `GET /v1/models` | OpenAI | 模型列表（签名拉取 + 缓存） |
+| `POST /v1/chat/completions` | OpenAI | Chat Completions（流式/非流式；上游只吐 SSE，非流式由代理聚合） |
+| `POST /v1/responses` | Responses | Responses API（codex-cli 兼容，含 `response.in_progress` 等完整事件序列） |
+| `POST /v1/messages` | Anthropic | Messages API（流式/非流式，`thinking` + `text` 块） |
+| `POST /v1/messages/count_tokens` | Anthropic | 本地估算，不打上游 |
+
+`--api-key` / `QODER_PROXY_API_KEY` 非空时**所有**端点（含 `/health`）都要带 `Authorization: Bearer` 或 `X-Api-Key`。
+
+### 凭证与续期
+
+**凭证来源**（Electron safeStorage 双层加密，只在 `--capture` 时用一次）：
+
+```
+Local State.os_crypt.encrypted_key → DPAPI → 32B AES key
+→ AES-256-GCM 解 auth.v1.dat → {token, refreshToken, expiresAt, user.id, ...}
++ ~/.qoder-cn/.auth/machine_id + umid-cache.json（machineToken/Type/Code）
++ ~/.qoder-cn/.cache/endpoint-cache.json（自动发现 gateway / openapi 域名）
+→ 写入账号池 ~/.qoder-cn-proxy/accounts.json
+```
+
+**账号池**：多个账号自动 round-robin（指针自增在池锁内，并发取号不会挤到同一个账号）；
+上游 401/403 时把该账号标记失败并冷却 `FAIL_COOLDOWN_SEC = 300`，然后自动换下一个账号。
+上游 429 时按响应头的 `Retry-After`（没有则 `RATE_COOLDOWN_SEC = 60`）把该账号放进
+`cool_until` 冷却并换号，`/health` 的 `cooling_sec` 可以看到还剩几秒。连接失败和
+502/503/504 走指数退避重试（`RETRY_MAX = 2`，`RETRY_BACKOFF_SEC = 0.5` 起），重试不吃换号
+预算；上游 500 **不重试**——它可能已经把这一轮跑完并扣了额度，重放等于二次消费。
+池文件里是真 token，所以默认路径放在
+仓库外（`~/.qoder-cn-proxy/accounts.json`，可用 `QODER_PROXY_ACCOUNTS` 覆盖）。仓库根已加
+`.gitignore` 挡住 `*_accounts.json` / `*-pack.json`，但 `git add -f` 仍能强推出去——别这么干，
+也别把池文件贴到公开渠道（见「最小部署：三件套」关于同目录副本的说明）。
+
+**自动续期**：token 临期 1 天内（`QODER_PROXY_REFRESH_AHEAD`，默认 86400）或请求前扫到期，
+自动调 `POST openapi.qoder.com.cn/api/v1/deviceToken/refresh`（body 带 `refresh_token` /
+`machine_id` / `machine_token`，**不需要 Authorization**），并采纳轮换后的新
+`device_token` + `refresh_token` 写回池文件。access token 约 30 天、refresh token 约 1 年，
+期间无需人工干预；续期链彻底失效（400/401/403）时把账号标记 `refresh_dead`，不再反复重试。
+
+**并发安全**：`refresh_token` 用一次就作废，所以两处都要锁住。整池巡检 `_sweep_due`（最小间隔 30 秒）
+把"判断该不该扫"和"记下这次扫了"放进同一把 `_sweep_lock`；单个账号的续期再套一层按账号标签的单飞锁
+`_refresh_account` —— 请求路径选中路上的号、和 sweep 巡到同一个号，两件事会在同一瞬间一起发生。
+池文件（真 token）每次续期回写都以 `0o600` 落盘，不会因为一次自动续期就变成任何本机用户可读。
+
+**脱客户端运行**：客户端进程不需要开着，签名是纯 Python、只用磁盘上已落盘的登录态，不读安装目录。
+拿不到客户端登录态（换了机器、没装客户端）就用 `--login` 走浏览器设备码授权——**只有这条需要
+Node + 一份 `qoder-worker-runtime.obf.mjs`**（`QODER_WORKER_BUNDLE` 指路）。`--export` / `--import`
+做跨机迁移，目标机不需要 Windows/DPAPI、也不需要 Node，入池之后与 `--capture` 的账号完全等价。
+
+```bash
+python qoder_proxy.py --login                 # 浏览器设备码登录入池（不需要客户端）
+python qoder_proxy.py --capture               # 从本机客户端提取凭证入池（Windows）
+python qoder_proxy.py --list              # 账号池一览（token 只显示前缀 + 掩码）
+python qoder_proxy.py --remove LABEL      # 移除某个账号
+python qoder_proxy.py --export pack.json  # 导出凭证包（跨机迁移）
+python qoder_proxy.py --import pack.json  # 导入凭证包
+python qoder_proxy.py --models            # 签名拉取模型清单
+python qoder_proxy.py --check             # 网关/账号池/签名器/模型 四项自检
+python qoder_proxy.py --test-chat "hi"    # 一次最小真实对话（手工验证请用无害占位内容）
+```
+
+### 最小部署：三件套
+
+`qoder_proxy.py` + `llm_proxy_core/` + `qoder_accounts.json` 放进服务器同一目录即可跑，不需要 `qoder_cosy.py`
+（签名已内联进代理）、不需要 Node、不需要装客户端。`llm_proxy_core/` 是 OpenAI / Responses / Anthropic
+三种协议的转换与流式状态机，`codearts_proxy.py` 用的是同一份，**部署时必须整个目录一起拷过去**，
+漏了会在启动瞬间 `ModuleNotFoundError`（这两个代理谁单独搬都得带上它）。账号池路径按优先级解析：
+
+1. `QODER_PROXY_ACCOUNTS` 显式指定；
+2. `~/.qoder-cn-proxy/accounts.json` 存在就用它（本机日常走这条，行为不变）；
+3. 脚本同目录的 `qoder_accounts.json`（两件套部署免配置即跑）；
+4. 都不存在时回到第 2 项的路径，首次写池时自动创建。
+
+所以同一台 Windows 上无论仓库里有没有 `qoder_accounts.json`，读的都是 home 那份、不会两份池子漂移；
+只有全新机器/容器（没有 home 池）才会用同目录那份。`--export` / `--import` 是另一条迁移路线，
+适合只搬某几个账号或换池文件布局。
+
+```bash
+# 服务器侧
+scp qoder_proxy.py qoder_accounts.json user@host:/opt/qoder-proxy/
+scp -r llm_proxy_core user@host:/opt/qoder-proxy/     # 协议层，两个代理共用
+cd /opt/qoder-proxy && chmod 600 qoder_accounts.json
+QODER_PROXY_API_KEY=$(openssl rand -hex 16) python3 qoder_proxy.py --serve
+```
+
+**注意鉴权**：监听地址写死 `0.0.0.0`，而 `QODER_PROXY_API_KEY` 默认为空（=不鉴权）。
+跨机使用前必须先设 API Key，或把端口留在本机、走 SSH 隧道 / nginx 鉴权再暴露。
+
+### 设备码登录 `--login`
+
+和 `--capture` 殊途同归，但**本机可以完全没有 Qoder CN 客户端**（Linux / 新机器 / 容器都行）：
+
+```
+node qoder_sign.mjs --login --site https://qoder.cn --openapi https://openapi.qoder.com.cn
+  ├─ 复用客户端 bundle 里的 startDeviceFlow(openapi, site, machineId, isProd, signal, machineToken)
+  │    · PKCE：43~128 字符 verifier，challenge = base64url(sha256(verifier))，method=S256
+  │    · 授权页 https://qoder.cn/device/selectAccounts?challenge=..&nonce=..&machine_id=..&client_id=..
+  ├─ {"event":"auth_url"} → 代理打印链接并尝试开浏览器
+  └─ 每 1s GET openapi /api/v1/deviceToken/poll?nonce=..&verifier=..&challenge_method=S256
+       · 404 = 还没授权，继续等；5 分钟超时；拿到 {token, refresh_token, user_id, expires_at} → {"event":"token"}
+```
+
+几个踩过的坑：
+
+- **`client_id` 必须让 bundle 自己给**。它是 `_$d()` 混淆常量（实测
+  `e883ade2-e6e3-4d6d-adf7-f92ceff5fdcb`），只在 esbuild 的懒初始化包装 `Jli=S(()=>{…})` 里赋值。
+  直接调 `startDeviceFlow` 会拿到字面量 `client_id=undefined` 的 URL。所以 `qoder_sign.mjs`
+  在打补丁时按语义锚点（`|localhost|::1` 代理探测正则 + `1e3`/`3e5` 两个常量）定位该包装函数，
+  注入 `export const __qoderDeviceInit = () => Jli();`，`--login` 先调它再发起流程。
+  混淆变量名换版本会变，因此补丁带了 `PATCH_REV`，缓存文件名里的 hash 会随之失效重建。
+- 调试：`node qoder_sign.mjs --print-client-id` 只生成授权 URL 并打印 `client_id`，不联网轮询。
+- 没有客户端登录态时 `machine_id` 用随机 UUID，**没有** `machine_token`。这种账号的 token
+  到期后 `deviceToken/refresh` 可能被拒（`--login` 会显式提示），临近过期重新 `--login` 即可。
+- 授权动作必须人在浏览器里完成；代理不会、也无法替你点确认。
+- 这条链接本身就是一个"登录请求"：谁在浏览器里打开并确认，token 就发给持 verifier 的轮询方
+  （也就是这台机器）。所以别把它转发出去——别人点一下会把**他的**账号塞进你的池子，
+  但拿不走你的凭证。链接里还带 `machine_token`，不要贴到公开渠道。
+
+### 配置
+
+| 环境变量 | 默认值 | 说明 |
+|---|---|---|
+| `QODER_PROXY_PORT` | 8791 | 监听端口（`--port` 覆盖） |
+| `QODER_PROXY_API_KEY` | (空) | API Key 鉴权（空=不鉴权；`Authorization: Bearer` 或 `X-Api-Key`） |
+| `QODER_PROXY_ACCOUNTS` | `~/.qoder-cn-proxy/accounts.json`；不存在且同目录有 `qoder_accounts.json` 时用后者 | 账号池文件 |
+| `QODER_PROXY_SIGN_BACKEND` | `auto` | 签名后端：`auto`=纯 Python 优先、异常回落 node；`py`=只用纯 Python；`node`=只用 sidecar |
+| `QODER_SIGN_JS` | 脚本同目录 `qoder_sign.mjs` | Node sidecar 路径（`--login` / node 回落用） |
+| `QODER_PROXY_NODE` | `node` | Node 可执行文件（`--login` / node 回落用） |
+| `QODER_WORKER_BUNDLE` | 客户端安装目录 | `qoder-worker-runtime.obf.mjs`（`--login` / node 回落用，找不到时报错并提示设置） |
+| `QODER_PROXY_GATEWAY` / `QODER_PROXY_OPENAPI` | endpoint-cache 自动发现 | 覆盖上游域名 |
+| `QODER_PROXY_MODEL` | `auto` | 默认模型 |
+| `QODER_PROXY_SCENE` | `chat` | 业务场景（model/list 的场景过滤） |
+| `QODER_PROXY_TIMEOUT` | 600 | 上游超时（秒） |
+| `QODER_PROXY_MODELS_TTL` | 3600 | 模型清单缓存（秒） |
+| `QODER_PROXY_REFRESH_AHEAD` | 86400 | 提前多久续期（秒） |
+| `QODER_PROXY_SITE` | `https://qoder.cn` | 设备码授权页 base（`--site` 覆盖；国际版为 `https://qoder.com`） |
+| `QODER_PROXY_LOGIN_TIMEOUT` | 330 | `--login` 等待浏览器授权的超时（秒，服务端轮询本身 5 分钟超时） |
+| `QODER_PROXY_LOG` | (空=关闭) | 日志文件路径 |
+| `QODER_PROXY_LOG_MAX_MB` | 5 | 日志轮转上限（MB） |
+
+请求体上限 8MB（防 OOM，对齐 codearts/trae_proxy）。
+
+### 平台支持
+
+| 平台 | 代理运行 | `--capture` | 说明 |
+|---|---|---|---|
+| Windows | ✅ | ✅ | 全功能（DPAPI 解密客户端登录态） |
+| Linux / macOS | ✅ | ❌ | `--import` 导入凭证包后即可运行，代理与签名不需要 Node；`--login` 需要 Node + worker bundle |
+
+---
+
 ## 共同特性
 
 - **三协议兼容**：OpenAI Chat / Responses / Anthropic Messages 统一转换
@@ -166,12 +434,15 @@ python test_trae_proxy.py --integration         # 单元 + 集成测试
 - **自动续期**：token 临期自动刷新，无需手动登录
 - **API Key 鉴权**：可选，`Authorization: Bearer` 或 `X-Api-Key`
 - **body 限制**：8MB 上限防 OOM
-- **零依赖**：纯 Python 标准库 + `cryptography`
+- **零依赖**：运行路径只用 Python 标准库（`python -S` 关掉 site-packages 实测可跑）；
+  `cryptography` 只有 `--capture` 解 DPAPI/AES-GCM 时才需要（缺包时给一句可执行的提示，
+  可改用 `--login` 或 `--import` 拿凭证），`qoder_proxy.py` 额外需要一个 Node 签名 sidecar
 
 ## 依赖
 
 - Python 3.8+
 - `cryptography`（AES-256-GCM 解密 / ES256 DPoP 签名）
+- Node 18+（仅 `qoder_proxy.py`：签名 sidecar 要驱动客户端的 WASM 模块）
 
 ```bash
 pip install cryptography
@@ -181,16 +452,37 @@ pip install cryptography
 
 ```
 llm-proxy/
+├── llm_proxy_core/            # 协议层（两个代理共用）：请求/响应转换 + SSE 流式状态机
+│   ├── ids.py                 #   随机 id
+│   ├── frames.py              #   SSE 帧聚合、错误帧识别、分片工具名拼接
+│   ├── convert.py             #   Responses/Anthropic → OpenAI 请求
+│   ├── outbound.py            #   OpenAI → Responses/Anthropic 响应
+│   └── streams.py             #   Responses/Anthropic 流式状态机
 ├── codearts_proxy.py          # 华为 CodeArts Agent 代理（多账号 + 自动续期）
 ├── codearts-proxy.md          # codearts_proxy 设计文档（逆向细节）
-├── test_codearts_proxy.py     # codearts_proxy 测试套件（9 项）
+├── test_codearts_proxy.py     # codearts_proxy 测试套件（15 项）
 
 ├── trae_proxy.py              # 字节 TRAE SOLO CN 代理
 ├── test_trae_proxy.py         # trae_proxy 测试套件
 ├── trae_login.py              # TRAE 登录辅助
+
+├── qoder_proxy.py             # 阿里 Qoder CN 代理（Cosy 签名 + 账号池 + 自动续期）
+├── qoder_accounts.json        # 账号池副本（真 token；.gitignore 已挡住，勿提交/勿外传）
+├── qoder_sign.mjs             # Node 签名 sidecar（仅 --login 设备码 / 签名回落需要）
+├── test_qoder_proxy.py        # qoder_proxy 离线测试（81 项，全 mock，不触网、不写真状态文件）
+├── test_core_protocols.py     # 协议层契约测试（同一份用例打两个后端 + 防分叉守卫，21 项）
+├── test_qoder_cosy.py         # Cosy 签名向量测试（测的是 qoder_proxy 里的内联实现）
+├── .reverse/                  # Qoder CN 逆向笔记（协议/签名/凭证）
 ├── proxy.py                   # ws-proxy 合规层（账号拦截/脱敏/审计）
 ├── test_proxy.py              # ws-proxy 测试
 ├── ws_auth.py                 # ws-proxy 认证脚本
 ├── config.example.json        # trae_proxy 配置模板
 └── AGENTS.md                  # 项目操作守则
 ```
+
+协议层只有 `llm_proxy_core/` 一份实现，两个代理按老函数名做别名绑定（`aggregate_sse`、
+`convert_*`、`_*StreamState`）。后端差异只保留在**参数**上：qoder 的上游只吃字符串 content，
+所以图片走 `image_policy="placeholder"`；snap-access 支持多模态，所以 codearts 用
+`image_policy="preserve"`。`test_core_protocols.py` 里有三条守卫盯着这件事——别名必须指向 core
+的同一个对象、协议层不许在代理本地重新 `def`、只有转换 wrapper 能删协议键。任何人想把某个函数
+复制回代理里改一份，那三条会直接红。
