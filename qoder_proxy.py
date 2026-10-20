@@ -114,19 +114,19 @@ NODE = os.environ.get("QODER_PROXY_NODE", "node")
 SIGN_BACKEND = (os.environ.get("QODER_PROXY_SIGN_BACKEND") or "auto").strip().lower()
 # 账号池是"程序 + 账号文件"两件套里的第二个文件，路径按优先级解析：
 #   1. QODER_PROXY_ACCOUNTS 显式指定
-#   2. ~/.qoder-cn-proxy/accounts.json 存在就用它（本机日常走这条，行为不变）
-#   3. 脚本同目录的 qoder_accounts.json —— 把两个文件丢进服务器同一目录时免配置即跑
-# 同目录那份里是真 token：仓库根 .gitignore 已挡住，但仍不要提交、不要外传。
-# 两个都不存在时仍返回 home 路径，首次写池时自动创建。
+#   2. 脚本同目录的 qoder_accounts.json —— 默认位置，整目录拷走即可部署
+#   3. ~/.qoder-cn-proxy/accounts.json —— 兼容旧位置（迁移前放在这里仍能读）
+# 同目录那份里是真 token：仓库根 .gitignore 已挡 *_accounts.json，仍不要提交、不要外传。
+# 两个都不存在时返回同目录路径，首次写池时自动创建。
 def _default_accounts_file():
     env = os.environ.get("QODER_PROXY_ACCOUNTS")
     if env:
         return env
-    home = os.path.join(os.path.expanduser("~"), ".qoder-cn-proxy", "accounts.json")
-    if os.path.exists(home):
-        return home
     local = os.path.join(HERE, "qoder_accounts.json")
-    return local if os.path.exists(local) else home
+    if os.path.exists(local):
+        return local
+    home = os.path.join(os.path.expanduser("~"), ".qoder-cn-proxy", "accounts.json")
+    return home if os.path.exists(home) else local
 
 
 ACCOUNTS_FILE = _default_accounts_file()
