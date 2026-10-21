@@ -33,9 +33,14 @@ qoder_intl_proxy.py —— Qoder 国际版官方模型通道的本地 API 代理
   --capture            从本机客户端解密登录态并入池
   --list / --remove    查看、移除池内账号
   --export / --import  凭证包跨机迁移（目标机不需要 Windows/DPAPI/客户端）
+  设备身份            默认每个账号一套独立 machineId/machineType/machineCode：入池时自动发、
+                      落盘复用，只有缺失或与池内他人撞车才重发；签发时那台机器的身份留在
+                      loginMachineId/loginMachineToken 里，只给 deviceToken/refresh 用（它认设备）。
+                      想全部沿用本机指纹：QODER_INTL_PROXY_DEVICE=host
   运行时              token 临期自动续期（POST openapi /api/v1/deviceToken/refresh，无需签名），
                       401/403 自动换号重试，续期链失效的账号标记 refresh_dead 不再反复尝试
-  运行时·签到          每日 Credits 自动领（默认 11:30，逐个账号；没领到按 30 分钟重试，最多 4 次。
+  运行时·签到          每日 Credits 自动领（默认 11:30；先探测当日全局 campaignId 再逐号盲领——
+                      列表没条目 ≠ 没资格，claim 幂等可安全重试；没全到位按 30 分钟重试，最多 4 次。
                       QODER_INTL_PROXY_CHECKIN_AT 改时间，QODER_INTL_PROXY_CHECKIN=0 关掉，--checkin 手动来一发）
 
 零第三方依赖（纯标准库）。只有 --capture 需要 cryptography 解 AES-256-GCM；
@@ -45,8 +50,9 @@ qoder_intl_proxy.py —— Qoder 国际版官方模型通道的本地 API 代理
   python qoder_intl_proxy.py                      # 启动代理（默认弹交互菜单，tty 时）
   python qoder_intl_proxy.py --serve              # 跳过菜单直接启动
   python qoder_intl_proxy.py --login              # 跳浏览器授权，拿不到客户端时用这个
-  python qoder_intl_proxy.py --login --new-device # 强制生成新设备 ID（多账号隔离）
+  python qoder_intl_proxy.py --login --new-device # 授权时不用本机设备 ID（token 签发给一套新设备）
   python qoder_intl_proxy.py --capture
+  python qoder_intl_proxy.py --list             # 每个号各自的设备身份/机器 ID
   python qoder_intl_proxy.py --models
   python qoder_intl_proxy.py --checkin            # 领今天的每日 Credits（多账号）
   python qoder_intl_proxy.py --test-chat "hi"
@@ -64,6 +70,7 @@ import queue
 import re
 import secrets
 import shutil
+import socket
 import subprocess
 import sys
 import threading
@@ -78,6 +85,7 @@ from email.utils import parsedate
 # ── 常量与路径 ────────────────────────────────────────────────────────────────
 
 import llm_proxy_core as C
+import qoder_admin as QA
 
 PORT = int(os.environ.get("QODER_INTL_PROXY_PORT", "8792"))
 API_KEY = os.environ.get("QODER_INTL_PROXY_API_KEY") or ""      # 空 = 不鉴权
@@ -111,6 +119,13 @@ BUSINESS_PRODUCT = os.environ.get("QODER_INTL_PROXY_BUSINESS_PRODUCT", "cli")
 SESSION_TYPE = os.environ.get("QODER_INTL_PROXY_SESSION_TYPE", "qodercli")
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+# 管理层（qoder_admin 集成）：多 Key 存储 / 管理密码 / 模型路由文件。
+# 默认都放脚本同目录（与账号池同一个"程序 + 数据文件"部署模型），env 可覆盖。
+ADMIN_KEYS_FILE = (os.environ.get("QODER_INTL_PROXY_ADMIN_KEYS")
+                   or os.path.join(HERE, "qoder_intl_admin_keys.json"))
+ADMIN_PASSWORD = os.environ.get("QODER_INTL_PROXY_ADMIN_PASSWORD", "")   # 空 = 管理 API 禁用
+MODEL_ROUTES_FILE = (os.environ.get("QODER_INTL_PROXY_MODEL_ROUTES")
+                     or os.path.join(HERE, "qoder_intl_model_routes.json"))
 SIGN_JS = os.environ.get("QODER_INTL_SIGN_JS", os.path.join(HERE, "qoder_intl_sign.mjs"))
 NODE = os.environ.get("QODER_INTL_PROXY_NODE", "node")
 # auto（默认）：纯 Python 优先，异常才回落 node；py：只用纯 Python；node：只用 sidecar
@@ -161,6 +176,20 @@ DEFAULT_GATEWAY = "https://api3.qoder.sh"
 DEFAULT_OPENAPI = "https://openapi.qoder.sh"
 
 USER_AGENT = "qoder-intl-proxy/1.0 (+https://github.com)"
+
+# ── 签到链路请求形态常量（对齐 Qoder 桌面客户端 App 0.4.8 的逆向规格，
+#    reverse_asar_findings.md §1/§2/§9）：签到相关请求模拟桌面客户端，
+#    其余请求（登录、续期、对话）继续用上面的代理自身 USER_AGENT。──────
+# 客户端 App 版本号：签到 Cosy-Version 用它（app.getVersion()），与对话链路
+# 的 CLI 版本号 COSY_VERSION("1.1.69") 语义不同，别混用。
+CLIENT_APP_VERSION = "0.4.8"
+# 客户端两种请求两种 UA：campaigns 列表 GET 由主进程 nativeHttpService 发，
+# UA 字面量就是 "Qoder"；claim POST 由 campaign H5 iframe 发，走 Electron
+# session 默认 UA（qoder/<版本> 段随 CLIENT_APP_VERSION 变化）。
+CAMPAIGN_LIST_UA = "Qoder"
+CLAIM_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) qoder/%s Chrome/143.0.0.0 Electron/43.1.1 "
+            "Safari/537.36" % CLIENT_APP_VERSION)
 
 
 def _read_json_file(path):
@@ -323,6 +352,96 @@ def _machine_identity():
     }
 
 
+# 设备身份模式：isolate（默认，每个账号一套）/ host（沿用本机客户端那一套）
+DEVICE_MODE = (os.environ.get("QODER_INTL_PROXY_DEVICE") or "isolate").strip().lower()
+
+
+def _new_device_identity():
+    """一套新的设备指纹，形状对齐本机 umid 缓存：machineId 是 uuid，
+    machineType/machineCode 是 18 位小写 hex。machineToken 故意留空——那是本机
+    客户端的令牌，伪造只会让续期更容易被拒；请求头会退回用 machineId 填。"""
+    return {
+        "machineId": str(uuid.uuid4()),
+        "machineToken": "",
+        "machineType": secrets.token_hex(9),
+        "machineCode": secrets.token_hex(9),
+    }
+
+
+def _isolate_pool_devices(accs):
+    """池里每个账号各用一套设备身份：machineId 缺失或与池内他人重复时，给它重发一套。
+    排在前面、已经独占某个 id 的账号不动，所以只有真正撞车的才会被改，重跑也不会来回改。
+
+    被换掉的账号把签发时那台机器的身份留在 loginMachineId/loginMachineToken 里：
+    实测签名链路（/algo）和 openapi 只读接口都不校验 Cosy-MachineId 与 token 的对应
+    关系，但 deviceToken/refresh 是设备绑定的，续期只能用签发时那一套。
+    返回被改动的账号标签。"""
+    if DEVICE_MODE == "host":
+        return []
+    seen = set()
+    touched = []
+    for a in accs:
+        mid = a.get("machineId") or ""
+        if mid and mid not in seen:
+            seen.add(mid)
+            continue
+        if mid:
+            a["loginMachineId"] = mid
+            a["loginMachineToken"] = a.get("machineToken") or ""
+        a.update(_new_device_identity())
+        seen.add(a["machineId"])
+        touched.append(_label_of(a))
+    return touched
+
+
+def _refresh_device_fields(acct):
+    """续期请求里的设备字段：优先用签发 token 时那台机器的身份，不是池里给它发的独立指纹。"""
+    fields = {}
+    mid = acct.get("loginMachineId") or acct.get("machineId") or ""
+    if mid:
+        fields["machine_id"] = mid
+    token = acct.get("loginMachineToken") or acct.get("machineToken") or ""
+    if token:
+        fields["machine_token"] = token
+    return fields
+
+
+def _device_counts(accs):
+    """machineId -> 池内有几个号在用它。"""
+    counts = {}
+    for a in accs:
+        mid = a.get("machineId") or ""
+        if mid:
+            counts[mid] = counts.get(mid, 0) + 1
+    return counts
+
+
+def _device_state(acct, counts=None):
+    """展示用：这个号的设备身份是不是它自己的一套。"""
+    mid = acct.get("machineId") or ""
+    if not mid:
+        return "无"
+    if DEVICE_MODE == "host":
+        return "本机共用"
+    if counts is None:
+        with _pool_lock:
+            counts = _device_counts(_load_pool_locked())
+    return "共用" if counts.get(mid, 0) > 1 else "独立"
+
+
+def _device_summary(rows):
+    """面板上的设备身份小结（rows 来自 _account_table）。"""
+    if DEVICE_MODE == "host":
+        return "全部共用本机指纹（QODER_INTL_PROXY_DEVICE=host）"
+    total = len(rows)
+    iso = sum(1 for r in rows if r.get("device") == "独立")
+    out = "%d/%d 各一套" % (iso, total)
+    if iso < total:
+        out += " 仍在共用: " + ", ".join(r["account"] for r in rows
+                                        if r.get("device") != "独立")
+    return out
+
+
 _EXP_ISO = re.compile(r"(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2}):(\d{2})(?:\.\d+)?"
                       r"(Z|[+-]\d{2}:?\d{2})?")
 
@@ -350,12 +469,14 @@ def _parse_exp(s):
 
 
 # ── openapi 明文 JSON（无需 Cosy 签名）───────────────────────────────────────
-def _openapi_json(method, path, body=None, token="", timeout=20, headers=None):
-    """打一次 openapi 请求，返回 (status, json_dict)。这几个端点只认 Bearer，不签名。"""
+def _openapi_json(method, path, body=None, token="", timeout=20, headers=None, ua=None):
+    """打一次 openapi 请求，返回 (status, json_dict)。这几个端点只认 Bearer，不签名。
+    ua：User-Agent 覆盖（签到链路要区分客户端两种 UA，见 _checkin_account）；
+    缺省用全局 USER_AGENT（登录、续期、userinfo 等代理自身请求）。"""
     url = OPENAPI + path
     data = json.dumps(body, ensure_ascii=False).encode("utf-8") if body is not None else None
     req = urllib.request.Request(url, data=data, method=method)
-    req.add_header("User-Agent", USER_AGENT)
+    req.add_header("User-Agent", ua or USER_AGENT)
     req.add_header("Accept", "application/json")
     if data is not None:
         req.add_header("Content-Type", "application/json")
@@ -397,12 +518,54 @@ def _enrich_account(acct):
 
 
 # ── 每日 Credits 签到（单账号）──────────────────────────────────────────────
+# 客户端头值校验（electronMain.js NYe）：值 trim 后非空且全为可打印 ASCII
+# （[\x20-\x7e]）才发送，否则整头丢弃。
+_PRINTABLE_ASCII_RE = re.compile(r"^[\x20-\x7e]+$")
+_HOSTNAME_MAX = 96      # 客户端 DR0/Lf0：Cosy-MachineHostname 上限 96 字符
+
+
+def _sanitize_machine_hostname(raw):
+    """Cosy-MachineHostname 取值，对齐客户端 DR0（reverse_asar_findings.md §4）：
+    trim 后为可打印 ASCII 且 ≤96 字符原值直通（Windows 常规场景）；空返回 ""
+    （头不发送）；非 ASCII / 超长走兜底——可打印部分折叠成 "-" 拼 sha256 前
+    8 hex（简化实现，不做客户端的 domainToASCII/punycode 分支）。"""
+    x = str(raw or "").strip()
+    if not x:
+        return ""
+    if len(x) <= _HOSTNAME_MAX and _PRINTABLE_ASCII_RE.match(x):
+        return x
+    hash8 = hashlib.sha256(x.encode("utf-8")).hexdigest()[:8]
+    cleaned = re.sub(r"[^\x21-\x7e]+", "-", x)
+    cleaned = re.sub(r"-{2,}", "-", cleaned).strip("-")
+    limit = _HOSTNAME_MAX - len(hash8) - 1
+    if len(cleaned) > limit:
+        cleaned = cleaned[:limit].rstrip("- ")
+    return (cleaned + "-" + hash8) if cleaned else "unknown-" + hash8
+
+
+def _machine_hostname(acct):
+    """账号字段 machineHostname 优先，缺省用本机 hostname（客户端 os.hostname()）。"""
+    raw = acct.get("machineHostname") or ""
+    if not raw:
+        try:
+            raw = socket.gethostname()
+        except Exception:
+            raw = ""
+    return _sanitize_machine_hostname(raw)
+
+
 def _cosy_device_headers(acct):
-    # Cosy-ClientType 必须是 10（桌面端）：实测 5 时 /me/campaigns 恒返回
-    # showCampaign=false、campaigns=[]，签到一分领不到；10 才有活动列表。
-    # 推理链路仍用 5（见 _base_headers），只有签到走桌面端身份。
-    return {
-        "Cosy-Version": acct.get("cosyVersion") or "1.1.69",
+    """签到链路的桌面端设备头，形态对齐 Qoder 桌面客户端（reverse_asar_findings.md §1.3）：
+    Cosy-Version 用客户端 App 版本号（当前 0.4.8，账号字段 cosyVersion 可覆盖）；
+    Cosy-MachineHostname 恒发（客户端实测必带，取值见 _machine_hostname）；
+    其余设备字段沿用账号池身份。
+    Cosy-ClientType 必须是 10（桌面端）：实测 5 时 /me/campaigns 恒返回
+    showCampaign=false、campaigns=[]，签到一分领不到；10 才有活动列表。
+    推理链路仍用 5（见 CosyContext._base_headers），只有签到走桌面端身份。
+    所有头值按客户端 NYe 规则校验：trim 后非空且全为可打印 ASCII 才发送，
+    否则整头丢弃（不发空值/控制字符，账号字段塞了脏值也不发）。"""
+    h = {
+        "Cosy-Version": acct.get("cosyVersion") or CLIENT_APP_VERSION,
         "Cosy-ClientType": "10",
         "Cosy-MachineOS": MACHINE_OS,
         "Cosy-MachineId": acct.get("machineId") or "",
@@ -410,6 +573,16 @@ def _cosy_device_headers(acct):
         "Cosy-MachineType": str(acct.get("machineType") or "5"),
         "Cosy-MachineCode": acct.get("machineCode") or "",
     }
+    hostname = _machine_hostname(acct)
+    if hostname:
+        h["Cosy-MachineHostname"] = hostname
+    out = {}
+    for k, v in h.items():
+        v = str(v).strip()
+        if v and _PRINTABLE_ASCII_RE.match(v):
+            out[k] = v
+    return out
+
 
 
 def _campaign_id(campaign):
@@ -459,12 +632,24 @@ def _add_on_total(acct):
 
 
 def _checkin_account(acct):
-    """只给传入的这一个账号领今天的 Credits campaign；没有可领项就是成功 no-op。
-    claim 的响应就是发放回执（grantId/claimedAt/grantedAt），重复 POST 返回 replayed=true
-    不再二次发放，所以整条链路可以随便重试。"""
+    """给这一个账号把列表里所有可领的活动（CLAIM_BENEFIT + CLAIMABLE）逐个领一遍；
+    没有可领项就是成功 no-op。
+
+    行为对齐国内版 qoder_proxy.py（服务器实战验证：所有账号连续多天全部正常
+    领取）：签到一律用账号池身份——每号一套独立 machineId，machineToken 为空
+    就用 machineId 顶替（见 _cosy_device_headers），配合 _isolate_pool_devices
+    保证每号独立。此前盲领失败的根因是账号共用了本机客户端共享身份（撞设备
+    判重连坐），不是"列表没条目"，所以不盲领、不派生身份：只领自己列表里
+    CLAIMABLE 的条目（_claimable_campaigns），已领过的 claimStatus=CLAIMED
+    自然落进 no-op。claim 幂等（同账号重复 POST 返回 replayed=true 不二次发放），
+    整条链路可以随便重试。"""
     token = acct.get("token") or ""
-    headers = _cosy_device_headers(acct)
-    st, obj = _openapi_json("GET", CAMPAIGNS_PATH, token=token, headers=headers)
+    headers = _cosy_device_headers(acct)   # 账号池身份：签到认池里这号的设备字段
+    # 客户端两种请求两种 UA（reverse_asar_findings.md §2.2）：列表 GET 是主进程
+    # nativeHttpService 发的（UA="Qoder"）；claim POST 由 campaign H5 iframe 发，
+    # 走 Electron session 默认 UA（CLAIM_UA）。
+    st, obj = _openapi_json("GET", CAMPAIGNS_PATH, token=token, headers=headers,
+                            ua=CAMPAIGN_LIST_UA)
     rep = {"status": st, "campaigns": 0, "claimable": False, "claimed": [], "secured": False}
     if st != 200 or not isinstance(obj, dict):
         rep["error"] = ((obj or {}).get("message") if isinstance(obj, dict) else "")
@@ -483,17 +668,19 @@ def _checkin_account(acct):
         cid = _campaign_id(c)
         benefit = c.get("benefit") or {}
         path = "%s/%s/claim" % (CAMPAIGNS_PATH, urllib.parse.quote(cid, safe=""))
-        cst, cobj = _openapi_json("POST", path, body={}, token=token, headers=headers)
-        item = {"id": cid, "status": cst, "key": c.get("campaignKey"),
+        cst, cobj = _openapi_json("POST", path, body={}, token=token, headers=headers,
+                                  ua=CLAIM_UA)
+        item = {"id": cid, "status": cst,
+                "key": c.get("campaignKey"),
                 "kind": benefit.get("kind"), "amount": benefit.get("amount")}
         if isinstance(cobj, dict):
             for k in CLAIM_RECEIPT_KEYS:
                 if k in cobj:
                     item[k] = cobj[k]
-            # 国际版回执体里带 status:"CLAIMED"，不能拿它覆盖 HTTP 状态码
+            # 国际版回执体里带 status:"CLAIMED"/"BLOCKED"，不能拿它覆盖 HTTP 状态码
             if cobj.get("status") is not None:
                 item["claimStatus"] = cobj["status"]
-            for k in ("message", "code", "success"):
+            for k in ("message", "code", "success", "failureCode"):
                 if k in cobj:
                     item[k] = cobj[k]
             rb = cobj.get("benefit")
@@ -501,20 +688,52 @@ def _checkin_account(acct):
                 item["kind"] = rb.get("kind") or item["kind"]
                 item["amount"] = rb.get("amount") if rb.get("amount") is not None else item["amount"]
         rep["claimed"].append(item)
-    st2, obj2 = _openapi_json("GET", CAMPAIGNS_PATH, token=token, headers=headers)
+    # 领取后再看一眼列表（展示用）。secured 只升不降：回执已认定到账的，不能让
+    # 复查结果（列表可能滞后）把 True 冲掉。
+    st2, obj2 = _openapi_json("GET", CAMPAIGNS_PATH, token=token, headers=headers,
+                              ua=CAMPAIGN_LIST_UA)
     cps2 = [c for c in ((obj2 or {}).get("campaigns") or []) if isinstance(c, dict)] \
-        if st2 == 200 else []
+        if st2 == 200 and isinstance(obj2, dict) else []
     rep["after"] = {"status": st2,
                     "claimable": bool(obj2.get("claimable")) if isinstance(obj2, dict) else None}
-    if cps2:
-        rep["secured"] = _credits_secured(cps2)
+    rep["secured"] = rep["secured"] or _credits_secured(cps2)
     if rep["claimed"]:
         rep["addOnTotal"] = _add_on_total(acct)
-    ok = all(i["status"] in (200, 201, 204) for i in rep["claimed"])
-    if not ok:
-        bad = next(i for i in rep["claimed"] if i["status"] not in (200, 201, 204))
-        rep["error"] = bad.get("message") or "claim HTTP %s" % bad["status"]
+    # 回执逐条判定（兼容国内版"2xx 即成功"形态与国际版带业务状态的回执）：
+    #   2xx 且（无 claimStatus / CLAIMED）→ 发放到账；
+    #   2xx 且 BLOCKED + failureCode=SAME_PERSON_ALREADY_CLAIMED → 上游拒发，
+    #     该号未到账但不报错（判重每天每设备一份，当天重试只重放，别让 cron 误报）；
+    #   其它（非 2xx、或 BLOCKED 其它原因）→ 失败。
+
+    def _item_ok(i):
+        if i["status"] not in (200, 201, 204):
+            return False
+        rs = i.get("claimStatus")
+        return rs in (None, "CLAIMED") or (rs == "BLOCKED"
+                                           and i.get("failureCode") == "SAME_PERSON_ALREADY_CLAIMED")
+
+    bad = next((i for i in rep["claimed"] if not _item_ok(i)), None)
+    ok = bad is None
+    if ok:
+        granted = [i for i in rep["claimed"] if i.get("claimStatus") in (None, "CLAIMED")]
+        if granted:
+            rep["secured"] = True
+            has_fresh = any(not i.get("replayed") and i.get("grantedAt") for i in granted)
+            rep["message"] = ("今日 100 Credits 已到账（本轮已领取）" if has_fresh
+                              else "今日 100 Credits 已到账（本账号此前已领，回执 replayed）")
+        else:
+            rep["message"] = ("上游拒发：该设备身份今日已被领过（SAME_PERSON_ALREADY_CLAIMED），"
+                              "未到账；检查账号池 machineId 是否与他人或本机客户端共用"
+                              "（_isolate_pool_devices 保证每号独立）")
+    else:
+        detail = bad.get("message") or bad.get("failureCode") or ""
+        if bad["status"] not in (200, 201, 204):
+            rep["error"] = "claim HTTP %s%s" % (bad["status"],
+                                                (": " + detail) if detail else "")
+        else:
+            rep["error"] = detail or ("claim 回执 status=%s" % (bad.get("claimStatus") or "?"))
     return ok, rep
+
 
 
 # ── 账号池 ────────────────────────────────────────────────────────────────────
@@ -550,6 +769,9 @@ def _load_pool_locked():
         accs = data.get("accounts") if isinstance(data, dict) else data
         _pool["accounts"] = [a for a in (accs or []) if isinstance(a, dict) and a.get("token")]
         _pool["mtime"] = mtime
+        # 默认每个号一套设备身份；发出来的必须落盘，否则每次重启都换一套
+        if _isolate_pool_devices(_pool["accounts"]):
+            _save_pool_locked()
     return _pool["accounts"]
 
 
@@ -596,8 +818,18 @@ def _add_session_to_pool(acct):
             acct["account"] = label
             acct.setdefault("session_seed", label)
             accs.append(acct)
+        _isolate_pool_devices(accs)
         _save_pool_locked()
         return label
+
+
+def _pooled_account(label, fallback=None):
+    """按标签读池里那条真正落盘的记录（入池时设备身份可能被重发过，展示要用落盘后的值）。"""
+    with _pool_lock:
+        for a in _load_pool_locked():
+            if _label_of(a) == label:
+                return a
+    return fallback or {}
 
 
 def _update_account(label, patch):
@@ -649,7 +881,8 @@ def _capture_current():
         raise RuntimeError("auth.v1.dat 里没有 token，客户端可能未登录")
     acct.update(_machine_identity())
     if not acct.get("machineId"):
-        raise RuntimeError("找不到 machine_id（%s），签名需要它" % MACHINE_ID_FILE)
+        _log("提示：本机没有 machine_id（%s），入池时会给这个号发一套独立设备身份"
+             % MACHINE_ID_FILE)
     acct = _enrich_account(acct)
     if not acct.get("uid"):
         acct["uid"] = user.get("id") or ""
@@ -802,14 +1035,17 @@ def _cmd_login(_args=None, popen=None, open_url=None, new_device=False):
         _log("补全账号信息失败: %s" % e)
         _print_err("提示：没取到组织信息，如果上游报 403 请重新 --login")
     label = _add_session_to_pool(acct)
+    row = _pooled_account(label, acct)
     print("已入池: %s" % label)
-    print("  token      %s" % _redact(acct["token"]))
-    print("  有效期至   %s" % (acct.get("expiresAt") or "unknown"))
-    print("  可续期     %s" % ("是" if acct.get("refreshToken") else "否"))
-    print("  机器 ID    %s" % (acct.get("machineId") or "-"))
+    print("  token      %s" % _redact(row.get("token") or acct.get("token")))
+    print("  有效期至   %s" % (row.get("expiresAt") or acct.get("expiresAt") or "unknown"))
+    print("  可续期     %s" % ("是" if (row.get("refreshToken") or acct.get("refreshToken"))
+                               else "否"))
+    print("  设备身份   %s（机器 ID %s）" % (_device_state(row),
+                                          _redact(row.get("machineId"), 8) or "-"))
     print("  凭证文件   %s" % ACCOUNTS_FILE)
-    if not acct.get("machineToken"):
-        _print_err("提示：本机没有客户端的 machine_token，自动续期可能被拒；"
+    if not _refresh_device_fields(row).get("machine_token"):
+        _print_err("提示：这个号没有 machine_token，自动续期可能被拒；"
                    "临期重新 --login 即可")
     return 0
 
@@ -863,10 +1099,7 @@ def _refresh_account_once(acct, force=False):
     if not force and acct.get("exp") and acct["exp"] - now > REFRESH_AHEAD_SEC:
         return acct
     body = {"refresh_token": rt}
-    if acct.get("machineId"):
-        body["machine_id"] = acct["machineId"]
-    if acct.get("machineToken"):
-        body["machine_token"] = acct["machineToken"]
+    body.update(_refresh_device_fields(acct))
     st, js = _openapi_json("POST", REFRESH_PATH, body)
     if st == 200 and isinstance(js, dict) and (js.get("device_token") or js.get("token")):
         patch = {
@@ -2022,6 +2255,13 @@ class ProxyError(Exception):
 
 def _map_upstream_error(status, text=""):
     s = str(text or "").lower()
+    # 上游把业务限制塞进 SSE 首帧（HTTP 200 + statusCodeValue 403），内层还是 JSON：
+    # 110=Billing daily count exceeded（该号当日请求数用尽），10605/isQueued=模型排队
+    # 限流（带 retryAfterSeconds），112/pricingUrl=额度用尽。都不是鉴权问题，
+    # 映成 401 会误导人去重新 --capture。
+    if any(k in s for k in ("daily count exceeded", "isqueued", "10605",
+                            '"code":"112"', "pricingurl")):
+        return 429
     if status in (401, 403):
         return 401
     if status == 429:
@@ -2129,6 +2369,412 @@ def _open_upstream(oa, model):
     raise last or ProxyError(502, "上游请求失败")
 
 
+# ── 管理层：qoder_admin 集成（多 Key 鉴权 / 管理 API / 模型映射）──────────────
+# qoder_admin.py 是双代理共享的管理层（纯标准库、框架无关）；本段把它的
+# KeyStore / AdminApi 接进国际版代理的现有函数。约定：
+#   * 账号在管理 API 里的 id = 账号标签（_label_of，即池内 account 字段）
+#   * KeyStore 空 且配了 QODER_INTL_PROXY_API_KEY 时走单 Key 兼容；都没配不鉴权
+#   * adapters 全部是本模块函数，上游交互复用签到/续期/签名链路
+
+_key_store = None
+_key_store_lock = threading.Lock()
+
+
+def _get_key_store():
+    """KeyStore 单例（懒加载；测试可整只替换 _key_store 注入）。"""
+    global _key_store
+    if _key_store is None:
+        with _key_store_lock:
+            if _key_store is None:
+                _key_store = QA.KeyStore(ADMIN_KEYS_FILE)
+    return _key_store
+
+
+def _check_key_auth(candidates):
+    """数据面鉴权判定（Handler._check_api_key 的纯逻辑部分，便于离线单测）。
+
+    优先级：KeyStore 多 Key → 单 Key env 兼容 → 不鉴权。
+    candidates 是按优先级排的候选明文（Authorization Bearer 值、X-Api-Key 值）。
+    返回 (ok, status, message, err_type)：ok=True 时后三个为占位值。
+    """
+    try:
+        has_keys = bool(_get_key_store().list())
+    except Exception:
+        has_keys = False
+    if has_keys:
+        for raw in candidates:
+            if not raw:
+                continue
+            record, allowed = _get_key_store().lookup(raw)
+            if record is not None:
+                if allowed:
+                    return True, 0, "", ""
+                return False, 429, "当日调用次数已用尽（该 Key 的 max_calls）", \
+                    "rate_limit_exceeded"
+        return False, 401, "missing or invalid API key", "invalid_api_key"
+    if not API_KEY:
+        return True, 0, "", ""
+    for raw in candidates:
+        if raw and secrets.compare_digest(raw, API_KEY):
+            return True, 0, "", ""
+    return False, 401, "missing or invalid API key", "invalid_api_key"
+
+
+# 今日请求计数（LLM 数据面）：stats 面板用；UTC 日切，进程内存，重启归零。
+# total_tokens 没有计量来源，恒 0 —— 不虚构。
+_req_stats = {"date": "", "requests": 0}
+_req_stats_lock = threading.Lock()
+
+
+def _bump_req_stats():
+    today = time.strftime("%Y-%m-%d", time.gmtime())
+    with _req_stats_lock:
+        if _req_stats["date"] != today:
+            _req_stats["date"] = today
+            _req_stats["requests"] = 0
+        _req_stats["requests"] += 1
+
+
+def _req_stats_snapshot():
+    today = time.strftime("%Y-%m-%d", time.gmtime())
+    with _req_stats_lock:
+        if _req_stats["date"] != today:
+            return {"requests": 0, "total_tokens": 0}
+        return {"requests": _req_stats["requests"], "total_tokens": 0}
+
+
+# ── 模型映射（mappings 链式改写 + aliases 假名）──────────────────────────────
+_model_routes = {"mappings": {}, "aliases": {}, "mtime": 0.0}
+_model_routes_lock = threading.RLock()
+
+
+def _norm_route_map(obj):
+    """路由表规范化：非 dict → {}；键值转 str、去空白、丢空键/空值。"""
+    if not isinstance(obj, dict):
+        return {}
+    out = {}
+    for k, v in obj.items():
+        ks, vs = str(k).strip(), str(v).strip()
+        if ks and vs:
+            out[ks] = vs
+    return out
+
+
+def _load_model_routes_locked():
+    """路由文件热加载（mtime 变了重读；手工编辑与管理 API 写盘都走得通）。"""
+    try:
+        mtime = os.path.getmtime(MODEL_ROUTES_FILE)
+    except Exception:
+        _model_routes.update(mappings={}, aliases={}, mtime=0.0)
+        return _model_routes
+    if mtime != _model_routes["mtime"]:
+        data = _read_json_file(MODEL_ROUTES_FILE) or {}
+        mappings = data.get("mappings") if isinstance(data, dict) else None
+        aliases = data.get("aliases") if isinstance(data, dict) else None
+        _model_routes["mappings"] = _norm_route_map(mappings)
+        _model_routes["aliases"] = _norm_route_map(aliases)
+        _model_routes["mtime"] = mtime
+    return _model_routes
+
+
+def _save_model_routes_locked():
+    """原子写路由文件（tmp + replace + 0600，参照 _save_pool_locked）。"""
+    tmp = MODEL_ROUTES_FILE + ".tmp"
+    os.makedirs(os.path.dirname(os.path.abspath(MODEL_ROUTES_FILE)), exist_ok=True)
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump({"mappings": _model_routes["mappings"],
+                   "aliases": _model_routes["aliases"]},
+                  f, ensure_ascii=False, indent=2)
+    os.replace(tmp, MODEL_ROUTES_FILE)
+    try:
+        _model_routes["mtime"] = os.path.getmtime(MODEL_ROUTES_FILE)
+    except Exception:
+        pass
+
+
+def _route_model_name(raw):
+    """模型名路由：aliases 先（一次替换）、mappings 后（链式跟进，防环 8 跳）。
+    未命中原样透传；纯本地查表，不依赖模型清单、不触网。"""
+    name = str(raw or "").strip()
+    if not name:
+        return raw
+    with _model_routes_lock:
+        routes = _load_model_routes_locked()
+        routed = routes["aliases"].get(name, name)
+        seen = set()
+        for _ in range(8):        # 链深上限：到顶即停，环不会死循环
+            nxt = routes["mappings"].get(routed)
+            if nxt is None or routed in seen:
+                break
+            seen.add(routed)
+            routed = nxt
+    return routed
+
+
+def _model_route_entries(upstream_list, created):
+    """/v1/models 的附加条目：aliases 假名与 mappings 源名（客户端可请求的
+    额外名字），元数据取"路由后最终目标"的模型（假名常指向中间名，再经
+    mappings 链落到真实上游模型）；最终目标不在上游清单的悬空映射不虚构条目。"""
+    with _model_routes_lock:
+        routes = _load_model_routes_locked()
+        alias_map = dict(routes["aliases"])
+        mapping_map = dict(routes["mappings"])
+    base_by_key = {m["key"].lower(): m for m in upstream_list}
+    entries, seen = [], set()
+    for name, kind in ([(a, "alias") for a in alias_map]
+                       + [(m, "mapping") for m in mapping_map]):
+        low = str(name).lower()
+        if low in seen or low in base_by_key:
+            continue
+        base = base_by_key.get(str(_route_model_name(name)).lower())
+        if base is None:
+            continue          # 悬空映射：最终目标不在上游清单，不虚构条目
+        entries.append({
+            "id": name, "object": "model", "created": created,
+            "owned_by": "qoder-intl", "name": base["name"],
+            "context_window": base["ctx"], "reasoning": base["reasoning"],
+            "vision": base["vision"],
+            "metadata": {"display_name": base["name"], "source": kind,
+                         "target": base["key"]}})
+        seen.add(low)
+    return entries
+
+
+# ── AdminApi adapters（把现有函数接进 qoder_admin.AdminApi）─────────────────
+
+def _admin_account_row(a, counts=None, now=None):
+    """账号公开视图（admin 页面 renderAccounts 需要的字段；不回显 token）。"""
+    label = _label_of(a)
+    exp = a.get("exp")
+    now = time.time() if now is None else now
+    return {
+        "id": label,
+        "label": label,
+        "uid": a.get("uid") or "",
+        "expires_at": a.get("expiresAt") or "",
+        "exp": exp,
+        "left_days": round((exp - now) / 86400, 1) if exp else None,
+        "has_refresh": bool(a.get("refreshToken")),
+        "refresh_dead": bool(a.get("refresh_dead")),
+        "failed_at": a.get("failed_at") or 0,
+        "failed_status": a.get("failed_status"),
+        "machine_id": _redact(a.get("machineId"), 6),
+        "device": _device_state(a, counts if counts is not None else {}),
+    }
+
+
+def _admin_list_accounts():
+    with _pool_lock:
+        accs = list(_load_pool_locked())
+    counts = _device_counts(accs)
+    now = time.time()
+    return [_admin_account_row(a, counts, now) for a in accs]
+
+
+def _admin_latest_checkins():
+    """签到摘要（读签到状态文件）。状态文件按天存全池汇总（不分号），按此汇报，
+    不虚构分号明细；过期日期不展示。"""
+    st = _read_checkin_state()
+    today = time.strftime("%Y-%m-%d")
+    if not isinstance(st, dict) or st.get("date") != today:
+        return []
+    return [{
+        "account_id": "*",
+        "label": "全池汇总",
+        "secured": bool(st.get("done")),
+        "status": "ok" if st.get("last_all_ok") else "failed",
+        "amount": 100 * int(st.get("secured_accounts") or 0),
+        "add_on_total": None,
+        "message": "已到位 %s/%s（尝试 %s 次，done=%s）" % (
+            st.get("secured_accounts"), st.get("pool_accounts"),
+            st.get("attempts"), st.get("done")),
+        "updated_at": st.get("last_at"),
+    }]
+
+
+def _admin_import_accounts(items):
+    """导入账号（token 必填）；同标签覆盖旧记录（_add_session_to_pool 语义）。"""
+    imported = updated = skipped = 0
+    out = []
+    for it in items if isinstance(items, list) else []:
+        if not isinstance(it, dict) or not str(it.get("token") or "").strip():
+            skipped += 1
+            out.append({"error": "missing token"})
+            continue
+        acct = dict(it)
+        label = _label_of(acct)
+        with _pool_lock:
+            existed = any(_label_of(a) == label for a in _load_pool_locked())
+        final = _add_session_to_pool(acct)
+        if existed:
+            updated += 1
+            action = "updated"
+        else:
+            imported += 1
+            action = "imported"
+        out.append({"id": final, "label": final, "action": action})
+    return {"imported": imported, "updated": updated, "skipped": skipped,
+            "items": out}
+
+
+_ADMIN_ACCOUNT_READONLY = ("account", "session_seed")
+
+
+def _admin_patch_account(aid, fields):
+    """按标签改账号字段；account/session_seed 由入池逻辑管理，不接受外部改。"""
+    if not isinstance(fields, dict):
+        return None
+    patch = {k: v for k, v in fields.items()
+             if k not in _ADMIN_ACCOUNT_READONLY}
+    with _pool_lock:
+        accs = _load_pool_locked()
+        hit = next((a for a in accs if _label_of(a) == aid), None)
+    if hit is None:
+        return None
+    if patch:
+        _update_account(aid, patch)
+    merged = _pooled_account(aid)
+    if not merged:
+        return None
+    return _admin_account_row(merged)
+
+
+def _admin_delete_account(aid):
+    """幂等删除（对齐 _cmd_remove 的池写回，但不打印）。"""
+    with _pool_lock:
+        accs = _load_pool_locked()
+        keep = [a for a in accs if _label_of(a) != aid]
+        if len(keep) != len(accs):
+            _pool["accounts"] = keep
+            _save_pool_locked()
+
+
+def _admin_test_account(aid):
+    """轻量上游探测：用该号签名拉一次模型清单。失败抛 KeyStoreError(status=502)，
+    AdminApi.handle 会带 status 回给客户端。"""
+    acct = _pooled_account(aid)
+    if not acct.get("token"):
+        return None
+    params = {"endpoint": GATEWAY, "path": MODEL_LIST_PATH, "method": "GET"}
+    try:
+        status, resp = _signed_send(acct, params)
+        try:
+            raw = resp.read().decode("utf-8", "replace")
+        finally:
+            try:
+                resp.close()
+            except Exception:
+                pass
+    except Exception as e:
+        raise QA.KeyStoreError("账号测试失败: %s" % e, 502)
+    if status != 200:
+        raise QA.KeyStoreError("账号测试失败: 上游 HTTP %s" % status, 502)
+    try:
+        models = _normalize_models(json.loads(raw))
+    except Exception as e:
+        raise QA.KeyStoreError("账号测试失败: 模型清单解析失败 %s" % e, 502)
+    return {"ok": True, "models": len(models)}
+
+
+def _admin_refresh_account(aid):
+    """手动续期（force=True：按"续期"按钮语义直接刷，不看临期阈值）。"""
+    acct = _pooled_account(aid)
+    if not acct.get("token"):
+        return None
+    if not acct.get("refreshToken"):
+        return {"ok": False, "expires_at": acct.get("expiresAt") or "",
+                "refresh_dead": bool(acct.get("refresh_dead")),
+                "error": "该账号没有 refreshToken，无法续期"}
+    merged = _refresh_account(acct, force=True)
+    out = {
+        "ok": not merged.get("refresh_dead"),
+        "expires_at": merged.get("expiresAt") or "",
+        "refresh_dead": bool(merged.get("refresh_dead")),
+    }
+    if merged.get("refresh_error"):
+        out["error"] = merged["refresh_error"]
+    return out
+
+
+def _admin_checkin_account(aid):
+    """单号签到：回执 rep 含 secured/message（页面 toast 直接展示）。"""
+    acct = _pooled_account(aid)
+    if not acct.get("token"):
+        return None
+    ok, rep = _checkin_account(acct)
+    return {"ok": bool(ok), "rep": rep}
+
+
+def _admin_stats():
+    with _pool_lock:
+        n_accounts = len(_load_pool_locked())
+    return {
+        "today": _req_stats_snapshot(),
+        "trend": [],                       # 本地代理没有历史聚合，不虚构
+        "accounts": n_accounts,
+        "models": len(_models["list"]),
+        "checkins": _admin_latest_checkins(),
+        "gateway": GATEWAY,
+        "port": PORT,
+    }
+
+
+def _admin_list_models():
+    try:
+        cached = _fetch_models()
+    except Exception as e:
+        raise QA.KeyStoreError("模型清单不可用: %s" % e, 502)
+    rows = [{"id": m["key"], "name": m["name"], "context_length": m["ctx"],
+             "max_output_tokens": m["max_output_tokens"],
+             "reasoning": m["reasoning"], "vision": m["vision"]}
+            for m in cached["list"]]
+    # updated_at 用毫秒（对齐页面 fmtTime(Math.floor(v/1000)) 的口径）
+    return {"models": rows, "updated_at": int(_models["at"] * 1000)}
+
+
+def _admin_model_routes():
+    with _model_routes_lock:
+        routes = _load_model_routes_locked()
+        return {"mappings": dict(routes["mappings"]),
+                "aliases": dict(routes["aliases"])}
+
+
+def _admin_patch_model_routes(body):
+    if not isinstance(body, dict):
+        return None
+    mappings = _norm_route_map(body.get("mappings"))
+    aliases = _norm_route_map(body.get("aliases"))
+    with _model_routes_lock:
+        _model_routes["mappings"] = mappings
+        _model_routes["aliases"] = aliases
+        _save_model_routes_locked()
+    return {"mappings": mappings, "aliases": aliases}
+
+
+def _admin_adapters():
+    return {
+        "list_accounts": _admin_list_accounts,
+        "latest_checkins": _admin_latest_checkins,
+        "import_accounts": _admin_import_accounts,
+        "patch_account": _admin_patch_account,
+        "delete_account": _admin_delete_account,
+        "test_account": _admin_test_account,
+        "refresh_account": _admin_refresh_account,
+        "checkin_account": _admin_checkin_account,
+        "stats": _admin_stats,
+        "list_models": _admin_list_models,
+        "model_routes": _admin_model_routes,
+        "patch_model_routes": _admin_patch_model_routes,
+    }
+
+
+def _admin_api():
+    """AdminApi 工厂（无状态：KeyStore 单例 + 当前 ADMIN_PASSWORD + adapters；
+    每次请求现取，测试里改全局即可生效）。"""
+    return QA.AdminApi(_get_key_store(), ADMIN_PASSWORD, _admin_adapters())
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "qoder-intl-proxy/1.0"
@@ -2155,16 +2801,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
         return self._json(code, {"error": {"message": str(message)[:600], "type": err_type}})
 
     def _check_api_key(self):
-        """没设 QODER_INTL_PROXY_API_KEY 时不鉴权；失败时已回复，返回 False。"""
-        if not API_KEY:
-            return True
+        """鉴权：多 Key（qoder_admin.KeyStore）优先；KeyStore 空且配了
+        QODER_INTL_PROXY_API_KEY 时走单 Key 兼容；都没配不鉴权。
+        失败时已回复，返回 False。"""
         authz = self.headers.get("Authorization") or ""
-        xkey = self.headers.get("X-Api-Key") or ""
-        ok = (authz.startswith("Bearer ") and secrets.compare_digest(authz[7:], API_KEY)) \
-            or (xkey and secrets.compare_digest(xkey, API_KEY))
+        bearer = authz[7:].strip() if authz.startswith("Bearer ") else ""
+        xkey = (self.headers.get("X-Api-Key") or "").strip()
+        ok, status, message, err_type = _check_key_auth([bearer, xkey])
         if ok:
             return True
-        self._err(401, "missing or invalid API key", "invalid_api_key")
+        self._err(status, message, err_type)
         return False
 
     def _read_json_body(self):
@@ -2189,15 +2835,54 @@ class Handler(http.server.BaseHTTPRequestHandler):
         return None
 
     # 路由
+    def _maybe_admin(self):
+        """admin 路由（/admin 页面 + /api/* 管理 API）接管请求；其余返回 False。
+        admin 有自己的 Bearer 管理密码鉴权，不走数据面 _check_api_key。"""
+        path = self.path.split("?", 1)[0]
+        if path.startswith("/api") or path.rstrip("/") == "/admin":
+            self._handle_admin()
+            return True
+        return False
+
+    def _handle_admin(self):
+        """qoder_admin.AdminApi 薄转接：headers 直接传 email.message.Message
+        （qoder_admin 大小写不敏感取 Authorization）；path 过一道 unquote ——
+        账号标签带空格/中文时浏览器会 percent-encode，不解码就命中不了标签。"""
+        length = int(self.headers.get("Content-Length") or 0)
+        if length > MAX_BODY_BYTES:
+            _drain_body(self, length)
+            self.close_connection = True
+            return self._err(413, "请求体过大（%d > %d 字节）" % (length, MAX_BODY_BYTES))
+        body = self.rfile.read(length) if length else b""
+        try:
+            status, headers, payload = _admin_api().handle(
+                self.command, urllib.parse.unquote(self.path), self.headers, body)
+        except Exception as e:
+            _log("管理接口异常 %s %s: %r" % (self.command, self.path, e))
+            return self._err(500, "管理接口内部错误: %s" % e)
+        self.send_response(status)
+        for k, v in headers.items():
+            self.send_header(k, v)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        try:
+            self.wfile.write(payload)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
     def do_OPTIONS(self):
         self.send_response(204)
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Methods",
+                         "GET, POST, PATCH, PUT, DELETE, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "*")
         self.send_header("Content-Length", "0")
         self.end_headers()
 
     def do_GET(self):
+        if self._maybe_admin():
+            return
         path = self.path.split("?")[0]
         if not self._check_api_key():
             return
@@ -2212,6 +2897,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._err(500, "内部错误: %s" % e)
 
     def do_POST(self):
+        if self._maybe_admin():
+            return
         path = self.path.split("?")[0]
         if not self._check_api_key():
             return
@@ -2225,6 +2912,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._handle_chat("anthropic")
         return self._err(404, "支持: POST /v1/chat/completions, /v1/responses, "
                               "/v1/messages, /v1/messages/count_tokens")
+
+    def do_PATCH(self):
+        if self._maybe_admin():
+            return
+        return self._err(404, "PATCH 仅用于 /api/* 管理接口")
+
+    def do_PUT(self):
+        if self._maybe_admin():
+            return
+        return self._err(404, "PUT 仅用于 /api/* 管理接口")
+
+    def do_DELETE(self):
+        if self._maybe_admin():
+            return
+        return self._err(404, "DELETE 仅用于 /api/* 管理接口")
 
     # /health 只读本地状态：不启动 node、不打上游，保证秒回
     def _handle_health(self):
@@ -2269,6 +2971,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                               "enabled": m["enabled"], "scene": m["scene"],
                               "thinking_config": m["thinking_config"]}}
                 for m in cached["list"]]
+        data.extend(_model_route_entries(cached["list"], now))
         return self._json(200, {"object": "list", "data": data})
 
     def _handle_count_tokens(self):
@@ -2284,6 +2987,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         body = self._read_json_body()
         if body is None:
             return
+        _bump_req_stats()
         if protocol == "responses":
             oa = convert_responses_to_openai(body)
             if not body.get("input") and not body.get("messages"):
@@ -2293,6 +2997,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not oa.get("messages"):
                 return self._bad("缺少 messages")
         req_model = body.get("model") or DEFAULT_MODEL
+        routed_model = _route_model_name(req_model)
         if not _models["list"]:
             try:
                 _fetch_models()
@@ -2301,7 +3006,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             except Exception as e:
                 _log("模型清单不可用，模型名原样透传: %s" % e)
         try:
-            model = _resolve_model(req_model)
+            model = _resolve_model(routed_model)
         except Exception as e:
             return self._err(502, "模型清单不可用: %s" % e)
         if model is None:
@@ -2467,6 +3172,7 @@ class QuietServer(http.server.ThreadingHTTPServer):
 def _account_table():
     with _pool_lock:
         accs = list(_load_pool_locked())
+    counts = _device_counts(accs)
     rows = []
     now = time.time()
     for a in accs:
@@ -2479,6 +3185,7 @@ def _account_table():
             "has_refresh": bool(a.get("refreshToken")),
             "refresh_dead": bool(a.get("refresh_dead")),
             "machine_id": _redact(a.get("machineId"), 6),
+            "device": _device_state(a, counts),
         })
     return rows
 
@@ -2490,11 +3197,14 @@ def _cmd_capture(_args=None):
         _print_err("提取登录态失败: %s" % e)
         return 1
     label = _add_session_to_pool(acct)
+    row = _pooled_account(label, acct)
     print("已入池: %s" % label)
     print("  token      %s" % _redact(acct.get("token")))
     print("  有效期至   %s" % (acct.get("expiresAt") or "unknown"))
     print("  可续期     %s" % ("是" if acct.get("refreshToken") else "否"))
     print("  组织       %s" % (acct.get("organizationId") or "-"))
+    print("  设备身份   %s（机器 ID %s）" % (_device_state(row),
+                                          _redact(row.get("machineId"), 8) or "-"))
     print("  凭证文件   %s" % ACCOUNTS_FILE)
     return 0
 
@@ -2505,11 +3215,13 @@ def _cmd_list(_args=None):
         print("账号池为空: python qoder_intl_proxy.py --capture")
         return 1
     for r in rows:
-        print("%-16s token=%-28s 到期=%s(剩 %s 天) 续期=%s%s"
+        print("%-16s token=%-28s 到期=%s(剩 %s 天) 续期=%s 设备=%s(%s)%s"
               % (r["account"], r["token"], r["expires_at"], r["left_days"],
                  "有" if r["has_refresh"] else "无",
+                 r["device"], r["machine_id"],
                  " [续期链已失效]" if r["refresh_dead"] else ""))
-    print("共 %d 个账号，文件 %s" % (len(rows), ACCOUNTS_FILE))
+    print("共 %d 个账号，设备身份 %s，文件 %s"
+          % (len(rows), _device_summary(rows), ACCOUNTS_FILE))
     return 0
 
 
@@ -2584,9 +3296,13 @@ def _cmd_check(_args=None):
     print("openapi  %s" % OPENAPI)
     print("账号池   %s（%d 个）" % (ACCOUNTS_FILE, len(rows)))
     for r in rows:
-        print("  %-16s 到期=%s 续期=%s%s" % (r["account"], r["expires_at"],
-                                            "有" if r["has_refresh"] else "无",
-                                            " [续期链已失效]" if r["refresh_dead"] else ""))
+        print("  %-16s 到期=%s 续期=%s 设备=%s(%s)%s"
+              % (r["account"], r["expires_at"],
+                 "有" if r["has_refresh"] else "无",
+                 r["device"], r["machine_id"],
+                 " [续期链已失效]" if r["refresh_dead"] else ""))
+    print("设备身份 %s（每号一套是默认，QODER_INTL_PROXY_DEVICE=host 才共用本机）"
+          % _device_summary(rows))
     info = _signer.info()
     if info.get("backend") == "node" or info.get("node"):
         print("签名器   node=%s cosy=%s wasm=%s bundle=%s%s"
@@ -2622,9 +3338,12 @@ def _cmd_checkin(_args=None):
         return 1
     all_ok = True
     secured = 0
+    counts = _device_counts(accs)
     for acct in accs:
         ok, rep = _checkin_account(acct)
         print("账号     %s" % _label_of(acct))
+        print("设备     %s（机器 ID %s）" % (_device_state(acct, counts),
+                                          _redact(acct.get("machineId"), 8) or "-"))
         print("活动     HTTP %s campaigns=%d claimable=%s 今天的份=%s"
               % (rep["status"], rep["campaigns"], rep["claimable"],
                  "已到位" if rep.get("secured") else "没到位"))
@@ -2652,14 +3371,21 @@ def _cmd_checkin(_args=None):
         if len(accs) > 1:
             print("-" * 40)
     print("合计     今天的 Credits 已到位 %d/%d 个号" % (secured, len(accs)))
+    if len(accs) > 1 and secured < len(accs):
+        _print_err("提示：部分号被上游以 SAME_PERSON_ALREADY_CLAIMED 拒发（每天每设备一份，"
+                    "当天重试只重放）；签到已用账号池独立身份，若仍撞车检查该号"
+                    " machineId 是否与他人共用")
     return 0 if (all_ok and secured == len(accs)) else 1
 
 
 def _checkin_round(reason):
-    """给池里每个号各跑一次当日 Credits 签到。
+    """给池里每个号各跑一次当日 Credits 签到（对齐国内版：账号池身份，只领
+    各号列表里 CLAIM_BENEFIT+CLAIMABLE 的条目，不探测、不盲领）。
     返回 (今天的份已到位的号数, 池内号数, 是否全部调用成功)。
     "已到位"= 这个号今天的 CREDITS 活动是 CLAIMED（这一轮领的、或客户端/上一轮领的都算），
-    只有全部到位才算今天不用再来；单号异常只记日志并继续下一个。"""
+    只有全部到位才算今天不用再来；单号异常只记日志并继续下一个。
+    SAME_PERSON_ALREADY_CLAIMED 的号 ok=True 但不"已到位"（上游拒发的判定每天
+    每设备一份，当天重试只是幂等重放，不多领也不误报失败）。"""
     with _pool_lock:
         accs = list(_load_pool_locked())
     total = len(accs)
@@ -2676,7 +3402,10 @@ def _checkin_round(reason):
             all_ok = False
             continue
         claimed = [c for c in (rep.get("claimed") or []) if c.get("status") in (200, 201, 204)]
-        fresh = [c for c in claimed if not c.get("replayed")]
+        # BLOCKED（含 SAME_PERSON）也回 HTTP 200 且带 benefit 字段，
+        # 必须按业务状态过滤，否则"无份"会被算成"本轮新领"。
+        fresh = [c for c in claimed if not c.get("replayed")
+                 and c.get("claimStatus") == "CLAIMED"]
         credits = sum(int(c.get("amount") or 0)
                       for c in fresh if (c.get("kind") or "").upper() == "CREDITS")
         if fresh:
@@ -2834,15 +3563,25 @@ def _interactive_menu():
         print("  Qoder 国际版官方模型本地代理")
         print("=" * 56)
         print("  账号池: %d 个账号" % len(accs))
+        counts = _device_counts(accs)
+        if DEVICE_MODE == "host":
+            print("  设备身份: 全部共用本机指纹（QODER_INTL_PROXY_DEVICE=host）")
+        else:
+            print("  设备身份: %d/%d 各一套"
+                  % (sum(1 for a in accs if _device_state(a, counts) == "独立"), len(accs)))
         for a in accs:
             exp = a.get("exp") or 0
             tag = "[过期]" if exp and exp < now else "[有效]"
-            print("    %s %s %s" % (_label_of(a), tag, (a.get("expiresAt") or "")[:19]))
+            print("    %s %s %s [%s 机器ID %s]"
+                  % (_label_of(a), tag, (a.get("expiresAt") or "")[:19],
+                     _device_state(a, counts), _redact(a.get("machineId"), 8) or "-"))
+        if len(accs) > 1 and DEVICE_MODE != "host":
+            print("  注: 各一套设备身份做指纹隔离；能否每号都领到每日 Credits 取决于上游判重（桌面端换号可领，代理连发曾被拒，待验证）")
         print("-" * 56)
         if sys.platform == "win32":
             print("  0 启动代理")
             print("  1 浏览器设备码登录（加入账号池，可连续登多个）")
-            print("  2 浏览器设备码登录（新设备 ID，最大隔离）")
+            print("  2 浏览器设备码登录（token 直接签发给一套全新设备）")
             print("  3 抓取本机 Qoder 国际版客户端登录态")
             print("  4 领取今天的每日 Credits（多账号）")
             print("  5 查看账号池详情")
@@ -2853,7 +3592,7 @@ def _interactive_menu():
         else:
             print("  0 启动代理")
             print("  1 浏览器设备码登录（加入账号池，可连续登多个）")
-            print("  2 浏览器设备码登录（新设备 ID，最大隔离）")
+            print("  2 浏览器设备码登录（token 直接签发给一套全新设备）")
             print("  3 领取今天的每日 Credits（多账号）")
             print("  4 查看账号池详情")
             print("  5 移除账号")
@@ -2937,14 +3676,30 @@ def _serve():
     print("  健康        GET /health")
     print("  上游        %s%s" % (GATEWAY, INFER_PATH))
     print("  签名        %s" % _signer.describe())
-    if API_KEY:
-        print("  API Key     已启用（QODER_INTL_PROXY_API_KEY）")
+    if ADMIN_PASSWORD:
+        print("  管理后台    http://127.0.0.1:%d/admin（QODER_INTL_PROXY_ADMIN_PASSWORD 已配置）"
+              % PORT)
     else:
-        print("  API Key     未设置 —— 任何本机进程都能用这个代理，建议设 QODER_INTL_PROXY_API_KEY")
+        print("  管理后台    /admin 页面可看，但管理 API 已禁用"
+              "（未配置 QODER_INTL_PROXY_ADMIN_PASSWORD）")
+    try:
+        n_keys = len(_get_key_store().list())
+    except Exception:
+        n_keys = 0
+    if n_keys:
+        print("  API Key     多 Key 已启用（%d 个，管理: /admin；%s）"
+              % (n_keys, ADMIN_KEYS_FILE))
+    elif API_KEY:
+        print("  API Key     已启用（QODER_INTL_PROXY_API_KEY；/admin 可切多 Key）")
+    else:
+        print("  API Key     未设置 —— 任何本机进程都能用这个代理，建议设 QODER_INTL_PROXY_API_KEY"
+              " 或在 /admin 建多 Key")
     with _pool_lock:
         n = len(_load_pool_locked())
     if not n:
         print("  警告        账号池为空，先运行: python qoder_intl_proxy.py --login 或 --capture")
+    else:
+        print("  设备        %s" % _device_summary(_account_table()))
     _log("启动 port=%d accounts=%d" % (PORT, n))
     if CHECKIN_ENABLED:
         print("  签到        每日 %s 自动领 Credits（今天没领成会重试 %d 次，间隔 %ds）"
@@ -2970,7 +3725,8 @@ def main():
     p.add_argument("--login", action="store_true",
                    help="浏览器设备码登录换 token 入池（不需要装 Qoder 国际版客户端）")
     p.add_argument("--new-device", action="store_true",
-                   help="配合 --login：强制生成新设备 ID（不用本机的），用于多账号隔离")
+                   help="配合 --login：授权时不用本机设备 ID，token 直接签发给一套新设备"
+                        "（入池后每号本来也各发一套）")
     p.add_argument("--site", help="设备码授权页 base（默认 https://qoder.com，等价 QODER_INTL_PROXY_SITE）")
     p.add_argument("--client-id", help="覆盖设备码登录的 client_id（默认取自客户端 bundle）")
     p.add_argument("--list", action="store_true", help="列出池内账号（脱敏）")

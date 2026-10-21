@@ -28,6 +28,8 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 // ── 定位客户端 worker runtime ───────────────────────────────────────────────
 const BUNDLE_CANDIDATES = [
   process.env.QODER_WORKER_BUNDLE,
+  // 同目录同时部署 CN/国际两份 bundle 时，用专属文件名避免通用名撞车
+  path.join(HERE, "qoder_assets", "qoder-worker-runtime-cn.obf.mjs"),
   path.join(HERE, "qoder_assets", "qoder-worker-runtime.obf.mjs"),
   // Windows 默认安装位置
   "C:/Programs/Qoder CN/resources/app.asar.unpacked/node_modules/@qoder-ai/qoder-cn-agent-sdk/dist/_worker/qoder-worker-runtime.obf.mjs",

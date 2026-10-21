@@ -29,6 +29,7 @@ import time
 import urllib.error
 import urllib.request
 
+import qoder_admin as QA
 import qoder_proxy as Q
 
 TEST_KEY = "testkey123"
@@ -286,7 +287,8 @@ class _Env:
         self.sleeps = []       # 记录退避第几次，测试不真等
         self._saved = {k: getattr(Q, k) for k in
                        ("ACCOUNTS_FILE", "GATEWAY", "OPENAPI", "API_KEY", "_signer",
-                        "_backoff_sleep", "CHECKIN_STATE_FILE")}
+                        "_backoff_sleep", "CHECKIN_STATE_FILE", "ADMIN_PASSWORD",
+                        "ADMIN_KEYS_FILE", "MODEL_ROUTES_FILE", "_key_store", "_admin_api")}
         # 签到状态路径在 import 时按环境变量定死，不一起搬进临时目录的话，
         # 在服务器上跑测试会把真那轮的账（今天领没领到）写成测试池的 0/0。
         Q.ACCOUNTS_FILE = self.accounts_file
@@ -295,9 +297,19 @@ class _Env:
         Q.OPENAPI = self.upstream.base
         Q._signer = self.signer
         Q._backoff_sleep = lambda n: self.sleeps.append(n)
+        # 管理面（qoder_admin 集成）也全部搬进临时目录：KeyStore 文件、模型路由
+        # 文件、管理密码，避免测试在仓库目录落下 qoder_admin_keys.json 之类。
+        Q.ADMIN_KEYS_FILE = os.path.join(self.tmpdir, "admin_keys.json")
+        Q.MODEL_ROUTES_FILE = os.path.join(self.tmpdir, "model_routes.json")
+        Q.ADMIN_PASSWORD = ""
+        Q._key_store = QA.KeyStore(Q.ADMIN_KEYS_FILE)
+        Q._admin_api = None
         Q._pool.update({"accounts": [], "mtime": 0.0})
         Q._rr = 0
         Q._models.update({"at": 0.0, "list": [], "by_id": {}, "alias": {}})
+        Q._model_routes.update({"routes": {"mappings": {}, "aliases": {}}, "mtime": 0.0})
+        with Q._usage_stats_lock:
+            Q._usage_stats.clear()
         self._openapi_orig = Q._openapi_json
         self._clear_conns()
 
@@ -319,6 +331,9 @@ class _Env:
         for k, v in self._saved.items():
             setattr(Q, k, v)
         Q._pool.update({"accounts": [], "mtime": 0.0})
+        Q._model_routes.update({"routes": {"mappings": {}, "aliases": {}}, "mtime": 0.0})
+        with Q._usage_stats_lock:
+            Q._usage_stats.clear()
 
     @staticmethod
     def _clear_conns():
@@ -372,6 +387,22 @@ def _post_stream(url, obj, timeout=25):
             lines.append((cur_event, ln[5:].strip()))
             cur_event = ""
     return code, lines
+
+
+def _adm_req(env, method, path, obj=None, headers=None, raw=None, timeout=15):
+    """管理端任意 method 的 HTTP 请求 helper（GET/POST/PUT/PATCH/DELETE）。"""
+    data = raw if raw is not None else (
+        json.dumps(obj, ensure_ascii=False).encode("utf-8") if obj is not None else None)
+    req = urllib.request.Request(env.url + path, data=data, method=method)
+    if data is not None:
+        req.add_header("Content-Type", "application/json")
+    for k, v in (headers or {}).items():
+        req.add_header(k, v)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status, r.read()
+    except urllib.error.HTTPError as e:
+        return e.code, e.read()
 
 
 # ── 1. 纯函数 ──────────────────────────────────────────────────────────────
@@ -1177,6 +1208,338 @@ def test_pool_write_keeps_file_secret():
         env.close()
 
 
+# ── 多 Key 鉴权 + 管理面板 + 模型映射（qoder_admin 集成）────────────────────
+
+def test_multi_key_auth():
+    """KeyStore 多 Key 数据面鉴权：命中 200 / 错 Key 401 / 禁用 401 / 限额 429 / reset 恢复。"""
+    env = _Env()
+    try:
+        ks = Q._key_store
+        row = ks.create("多Key一号", {"key": "sk-multi-0001"})
+        kv = row["key_value"]
+        c1, _ = _get(env.url + "/v1/models", {"Authorization": "Bearer " + kv})
+        c2, _ = _get(env.url + "/v1/models", {"Authorization": "Bearer sk-wrong"})
+        c3, _ = _get(env.url + "/v1/models")
+        c4, _ = _get(env.url + "/v1/models", {"X-Api-Key": kv})
+        _record("multi_key_auth_basic",
+                c1 == 200 and c2 == 401 and c3 == 401 and c4 == 200,
+                "%s %s %s %s" % (c1, c2, c3, c4))
+        # 禁用 → 401；重新启用 → 200
+        ks.patch(row["id"], {"enabled": 0})
+        c5, _ = _get(env.url + "/v1/models", {"Authorization": "Bearer " + kv})
+        ks.patch(row["id"], {"enabled": 1})
+        c6, _ = _get(env.url + "/v1/models", {"Authorization": "Bearer " + kv})
+        _record("multi_key_auth_disable", c5 == 401 and c6 == 200, "%s %s" % (c5, c6))
+        # 限额：reset 后 max_calls=1 → 第一次 200、第二次 429；再 reset 恢复 200
+        ks.reset_usage(row["id"])
+        ks.patch(row["id"], {"max_calls": 1})
+        c7, _ = _get(env.url + "/v1/models", {"Authorization": "Bearer " + kv})
+        c8, r8 = _get(env.url + "/v1/models", {"Authorization": "Bearer " + kv})
+        ks.reset_usage(row["id"])
+        c9, _ = _get(env.url + "/v1/models", {"Authorization": "Bearer " + kv})
+        _record("multi_key_auth_quota",
+                c7 == 200 and c8 == 429 and c9 == 200 and b"rate_limit_exceeded" in r8,
+                "%s %s %s body=%s" % (c7, c8, c9, r8[:80]))
+    finally:
+        env.close()
+
+
+def test_keystore_precedence_over_single_key():
+    """KeyStore 有 key 时旧单 Key（QODER_PROXY_API_KEY）不再放行——多 Key 优先。"""
+    env = _Env()
+    try:
+        Q.API_KEY = TEST_KEY
+        ks = Q._key_store
+        row = ks.create("优先级", {"key": "sk-prec-0001"})
+        c1, _ = _get(env.url + "/v1/models", {"Authorization": "Bearer " + TEST_KEY})
+        c2, _ = _get(env.url + "/v1/models", {"Authorization": "Bearer " + row["key_value"]})
+        _record("keystore_precedence_over_single_key",
+                c1 == 401 and c2 == 200, "%s %s" % (c1, c2))
+    finally:
+        Q.API_KEY = ""
+        env.close()
+
+
+def test_admin_page_and_login():
+    """/admin 页面免 Bearer；密码未配置管理接口全 403；登录对/错、Bearer 对/错/缺。"""
+    env = _Env()
+    try:
+        c1, raw1 = _get(env.url + "/admin")
+        c2, raw2 = _get(env.url + "/admin/")
+        c3, _ = _adm_req(env, "GET", "/api/keys")
+        c4, _ = _adm_req(env, "POST", "/api/auth/login", {"password": "whatever"})
+        ok_page = (c1 == 200 and c2 == 200 and b"<html" in raw1.lower()
+                   and b"Qoder Admin" in raw1)
+        ok_nopw = c3 == 403 and c4 == 403
+        Q.ADMIN_PASSWORD = "adm-pw-1"
+        H = {"Authorization": "Bearer adm-pw-1"}
+        c5, _ = _adm_req(env, "POST", "/api/auth/login", {"password": "adm-pw-1"})
+        c6, _ = _adm_req(env, "POST", "/api/auth/login", {"password": "bad"})
+        c7, raw7 = _adm_req(env, "GET", "/api/keys", headers=H)
+        c8, _ = _adm_req(env, "GET", "/api/keys")
+        c9, _ = _adm_req(env, "GET", "/api/keys", {"Authorization": "Bearer bad"})
+        ok_auth = (c5 == 200 and c6 == 401 and c7 == 200 and c8 == 401 and c9 == 401
+                   and json.loads(raw7) == {"keys": []})
+        _record("admin_page_and_login", ok_page and ok_nopw and ok_auth,
+                "%s %s %s | %s %s %s %s %s %s" % (c1, c2, c3, c4, c5, c6, c7, c8, c9))
+    finally:
+        Q.ADMIN_PASSWORD = ""
+        env.close()
+
+
+def test_admin_keys_crud():
+    """/api/keys CRUD（带 Bearer 管理密码），管理面改动立即作用于数据面鉴权。"""
+    env = _Env()
+    try:
+        Q.ADMIN_PASSWORD = "adm-pw-2"
+        H = {"Authorization": "Bearer adm-pw-2"}
+        c1, raw1 = _adm_req(env, "POST", "/api/keys",
+                            {"name": "key1", "key": "sk-admin-0001"}, headers=H)
+        row = json.loads(raw1)
+        kid = row["id"]
+        ok1 = c1 == 200 and row["key_value"] == "sk-admin-0001" and row["enabled"] == 1
+        c2, raw2 = _adm_req(env, "GET", "/api/keys", headers=H)
+        ok2 = c2 == 200 and json.loads(raw2)["keys"][0]["name"] == "key1"
+        c3, raw3 = _adm_req(env, "PATCH", "/api/keys/" + kid, {"enabled": 0}, headers=H)
+        ok3 = c3 == 200 and json.loads(raw3)["enabled"] == 0
+        c4, _ = _adm_req(env, "PATCH", "/api/keys/no-such-id", {"enabled": 1}, headers=H)
+        c5, raw5 = _adm_req(env, "POST", "/api/keys/%s/reset" % kid, headers=H)
+        ok5 = c5 == 200 and json.loads(raw5) == {"ok": True, "used": 0}
+        # 管理面禁用后，数据面立即 401
+        c6, _ = _get(env.url + "/v1/models", {"Authorization": "Bearer sk-admin-0001"})
+        c7, raw7 = _adm_req(env, "DELETE", "/api/keys/" + kid, headers=H)
+        c8, _ = _adm_req(env, "DELETE", "/api/keys/" + kid, headers=H)
+        _record("admin_keys_crud",
+                ok1 and ok2 and ok3 and c4 == 404 and ok5 and c6 == 401
+                and c7 == 200 and json.loads(raw7) == {"ok": True} and c8 == 404,
+                "%s %s %s %s %s %s %s %s" % (c1, c2, c3, c4, c5, c6, c7, c8))
+    finally:
+        Q.ADMIN_PASSWORD = ""
+        env.close()
+
+
+def test_admin_accounts_adapters():
+    """账号适配钩子：list/checkin/test/refresh/patch/import/delete/stats/models 全链路（mock 上游）。"""
+    env = _Env()
+    try:
+        Q.ADMIN_PASSWORD = "adm-pw-3"
+        H = {"Authorization": "Bearer adm-pw-3"}
+        # list：假池 1 个号（uid-fake0001 的 uid=fake-uid-0001 → 管理端 id "fake-uid"）
+        c1, raw1 = _adm_req(env, "GET", "/api/accounts", headers=H)
+        obj1 = json.loads(raw1)
+        acc = obj1["accounts"][0] if obj1.get("accounts") else {}
+        ok1 = (c1 == 200 and len(obj1.get("accounts") or []) == 1
+               and acc.get("id") == "fake-uid" and acc.get("label") == "uid-fake0001"
+               and acc.get("has_refresh") is True and acc.get("expires_at")
+               and isinstance(obj1.get("checkins"), list))
+        # 签到：打桩 campaigns（先 CLAIMABLE，claim 之后 CLAIMED）
+        claimed = {"done": False}
+
+        def fake_openapi(method, path, body=None, token="", timeout=20, headers=None):
+            if path.startswith(Q.CAMPAIGNS_PATH):
+                if method == "POST":
+                    claimed["done"] = True
+                    return 200, {"grantId": "g-1", "claimedAt": "2026-10-21T10:00:00Z",
+                                 "grantedAt": "2026-10-21T10:00:00Z"}
+                status = "CLAIMED" if claimed["done"] else "CLAIMABLE"
+                return 200, {"campaigns": [{
+                    "campaignId": "camp-1", "campaignKey": "daily_credits",
+                    "actionType": "CLAIM_BENEFIT", "claimStatus": status,
+                    "benefit": {"kind": "CREDITS", "amount": 100}}],
+                    "claimable": not claimed["done"]}
+            if path == Q.USAGE_PATH:
+                return 200, {"qoderUsage": {"addOnQuota": {"total": 100}}}
+            return 404, {"message": "no route"}
+
+        env.patch_openapi(fake_openapi)
+        c2, raw2 = _adm_req(env, "POST", "/api/accounts/fake-uid/checkin", headers=H)
+        obj2 = json.loads(raw2)
+        ok2 = (c2 == 200 and obj2.get("ok") is True
+               and obj2.get("rep", {}).get("secured") is True
+               and obj2["rep"]["claimed"][0]["status"] == 200)
+        c3, _ = _adm_req(env, "POST", "/api/accounts/no-such/checkin", headers=H)
+        # 测试连通（走 mock 上游模型清单）
+        c4, raw4 = _adm_req(env, "POST", "/api/accounts/fake-uid/test", headers=H)
+        obj4 = json.loads(raw4)
+        ok4 = c4 == 200 and obj4.get("ok") is True and obj4.get("models") == 3
+        # 续期：打桩 deviceToken/refresh
+        def fake_refresh(method, path, body=None, token="", timeout=20, headers=None):
+            if path == Q.REFRESH_PATH:
+                return 200, {"device_token": "dt-refreshed",
+                             "refresh_token": "drt-refreshed",
+                             "expires_at": "2099-01-01T00:00:00Z",
+                             "refresh_token_expires_at": "2099-06-01T00:00:00Z"}
+            return fake_openapi(method, path, body, token, timeout, headers)
+
+        env.patch_openapi(fake_refresh)
+        c5, raw5 = _adm_req(env, "POST", "/api/accounts/fake-uid/refresh", headers=H)
+        obj5 = json.loads(raw5)
+        ok5 = c5 == 200 and obj5.get("ok") is True \
+            and obj5.get("expires_at") == "2099-01-01T00:00:00Z"
+        with open(env.accounts_file, encoding="utf-8") as f:
+            pool = json.load(f)["accounts"]
+        ok5b = any(a.get("token") == "dt-refreshed" for a in pool)
+        # patch 改 label
+        c6, raw6 = _adm_req(env, "PATCH", "/api/accounts/fake-uid",
+                            {"label": "renamed-acct"}, headers=H)
+        obj6 = json.loads(raw6)
+        ok6 = c6 == 200 and obj6.get("label") == "renamed-acct"
+        c6b, _ = _adm_req(env, "PATCH", "/api/accounts/zz", {"label": "x"}, headers=H)
+        # import：token 必填，缺 token 记 skipped
+        c7, raw7 = _adm_req(env, "POST", "/api/accounts/import",
+                            {"accounts": [{"token": "dt-imported", "uid": "imported-uid-42",
+                                           "expiresAt": "2099-01-01T00:00:00Z"}]},
+                            headers=H)
+        obj7 = json.loads(raw7)
+        ok7 = c7 == 200 and obj7.get("imported") == 1 and obj7.get("skipped") == 0
+        c7b, raw7b = _adm_req(env, "POST", "/api/accounts", [{"uid": "no-token"}], headers=H)
+        ok7b = json.loads(raw7b).get("skipped") == 1
+        # delete 一个，剩 1 个
+        c8, _ = _adm_req(env, "DELETE", "/api/accounts/fake-uid", headers=H)
+        c8b, raw8b = _adm_req(env, "GET", "/api/accounts", headers=H)
+        ok8 = c8 == 200 and len(json.loads(raw8b)["accounts"]) == 1
+        # models（先拉清单）→ stats（models 字段是缓存计数）→ model-routes
+        c10, raw10 = _adm_req(env, "GET", "/api/models", headers=H)
+        obj10 = json.loads(raw10)
+        ok10 = c10 == 200 and len(obj10.get("models") or []) == 3 \
+            and obj10["models"][0]["id"] == "fkmodel"
+        c9, raw9 = _adm_req(env, "GET", "/api/stats", headers=H)
+        obj9 = json.loads(raw9)
+        ok9 = (c9 == 200 and obj9.get("accounts") == 1 and obj9.get("models") == 3
+               and obj9.get("keys") == 0 and "today" in obj9 and "trend" in obj9
+               and "checkins" in obj9)
+        c11, raw11 = _adm_req(env, "GET", "/api/model-routes", headers=H)
+        ok11 = c11 == 200 and json.loads(raw11) == {"mappings": {}, "aliases": {}}
+        _record("admin_accounts_adapters",
+                ok1 and ok2 and c3 == 404 and ok4 and ok5 and ok5b and ok6
+                and c6b == 404 and ok7 and ok7b and ok8 and ok9 and ok10 and ok11,
+                "page=%s checkin=%s test404=%s test=%s refresh=%s/%s patch=%s/%s "
+                "import=%s/%s del=%s stats=%s models=%s routes=%s"
+                % (ok1, ok2, c3, ok4, ok5, ok5b, ok6, c6b, ok7, ok7b, ok8, ok9,
+                   ok10, ok11))
+    finally:
+        Q.ADMIN_PASSWORD = ""
+        env.close()
+
+
+def test_admin_stats_usage():
+    """stats.today 的请求数/token 近似计数：非流式 + 流式各一次后 requests==2。"""
+    env = _Env()
+    try:
+        Q.ADMIN_PASSWORD = "adm-pw-5"
+        H = {"Authorization": "Bearer adm-pw-5"}
+        code1, _ = _post(env.url + "/v1/chat/completions",
+                         {"model": "fkmodel", "messages": [{"role": "user", "content": "hi"}]})
+        code2, _ = _post(env.url + "/v1/chat/completions",
+                         {"model": "fkmodel",
+                          "messages": [{"role": "user", "content": "hi"}], "stream": True})
+        c, raw = _adm_req(env, "GET", "/api/stats", headers=H)
+        obj = json.loads(raw)
+        today = obj.get("today") or {}
+        trend = obj.get("trend") or []
+        ok = (code1 == 200 and code2 == 200 and c == 200
+              and today.get("requests") == 2 and (today.get("total_tokens") or 0) >= 2
+              and obj.get("accounts") == 1 and obj.get("models") == 3
+              and isinstance(trend, list) and len(trend) == 7
+              and trend[-1].get("requests") == 2)
+        _record("admin_stats_usage", ok, "today=%s trend_len=%d"
+                % (json.dumps(today, ensure_ascii=False), len(trend)))
+    finally:
+        Q.ADMIN_PASSWORD = ""
+        env.close()
+
+
+def test_model_routes_apply():
+    """请求侧模型映射：alias 链式（alias→mapping）、alias 直指、mapping、不命中原样透传；
+    /v1/models 附带假名行。"""
+    env = _Env()
+    try:
+        routes = {"mappings": {"fkmapped": "fkmodel"}, "aliases": {"myfake": "fkmapped",
+                                                                   "plainfk": "fkmodel"}}
+        with open(Q.MODEL_ROUTES_FILE, "w", encoding="utf-8") as f:
+            json.dump(routes, f, ensure_ascii=False)
+        # 链式：myfake →(alias) fkmapped →(mapping) fkmodel
+        code1, _ = _post(env.url + "/v1/chat/completions",
+                         {"model": "myfake", "messages": [{"role": "user", "content": "hi"}]})
+        m1 = env.signer.calls[-1]["params"]["infer"]["model"]
+        # alias 直指真实名：plainfk → fkmodel（alias 命中后无 mapping，原样）
+        code2, _ = _post(env.url + "/v1/chat/completions",
+                         {"model": "plainfk", "messages": [{"role": "user", "content": "hi"}]})
+        m2 = env.signer.calls[-1]["params"]["infer"]["model"]
+        # mapping：fkmapped → fkmodel
+        code3, _ = _post(env.url + "/v1/chat/completions",
+                         {"model": "fkmapped", "messages": [{"role": "user", "content": "hi"}]})
+        m3 = env.signer.calls[-1]["params"]["infer"]["model"]
+        # 不命中：真实名原样透传（路由不改名，行为与无路由文件一致）
+        code4, _ = _post(env.url + "/v1/chat/completions",
+                         {"model": "fkmodel", "messages": [{"role": "user", "content": "hi"}]})
+        m4 = env.signer.calls[-1]["params"]["infer"]["model"]
+        # 未知名且无路由 → 维持现状 404
+        code5, _ = _post(env.url + "/v1/chat/completions",
+                         {"model": "zzz-not-routed",
+                          "messages": [{"role": "user", "content": "hi"}]})
+        ok_resolve = (code1 == 200 and m1 == "fkmodel" and code2 == 200 and m2 == "fkmodel"
+                      and code3 == 200 and m3 == "fkmodel" and code4 == 200 and m4 == "fkmodel"
+                      and code5 == 404)
+        # /v1/models：真实名 + mapping 键 + 假名都在列表里，且假名标注 alias_of/maps_to
+        c6, raw6 = _get(env.url + "/v1/models")
+        data = json.loads(raw6)["data"]
+        ids = [m["id"] for m in data]
+        row_myfake = next((m for m in data if m["id"] == "myfake"), {})
+        row_fkmapped = next((m for m in data if m["id"] == "fkmapped"), {})
+        ok_list = (c6 == 200 and all(x in ids for x in
+                                     ("fkmodel", "fktwo", "fkmapped", "myfake", "plainfk"))
+                   and row_myfake.get("metadata", {}).get("alias_of") == "fkmapped"
+                   and row_myfake.get("metadata", {}).get("maps_to") == "fkmodel"
+                   and row_fkmapped.get("metadata", {}).get("maps_to") == "fkmodel")
+        _record("model_routes_apply", ok_resolve and ok_list,
+                "infer=%s/%s/%s/%s 404=%s models=%s"
+                % (m1, m2, m3, m4, code5, c6))
+    finally:
+        env.close()
+
+
+def test_admin_model_routes_api():
+    """/api/model-routes PUT/PATCH 全量替换 + 落盘 + 请求侧立即生效。"""
+    env = _Env()
+    try:
+        Q.ADMIN_PASSWORD = "adm-pw-4"
+        H = {"Authorization": "Bearer adm-pw-4"}
+        c1, raw1 = _adm_req(env, "PUT", "/api/model-routes",
+                            {"mappings": {"mapA": "fkmodel"},
+                             "aliases": {"aliasB": "mapA"}}, headers=H)
+        obj1 = json.loads(raw1)
+        ok1 = c1 == 200 and obj1.get("mappings") == {"mapA": "fkmodel"} \
+            and obj1.get("aliases") == {"aliasB": "mapA"}
+        with open(Q.MODEL_ROUTES_FILE, encoding="utf-8") as f:
+            saved = json.load(f)
+        ok1b = saved.get("mappings") == {"mapA": "fkmodel"} \
+            and saved.get("aliases") == {"aliasB": "mapA"}
+        c2, raw2 = _adm_req(env, "GET", "/api/model-routes", headers=H)
+        obj2 = json.loads(raw2)
+        ok2 = c2 == 200 and obj2 == {"mappings": {"mapA": "fkmodel"},
+                                     "aliases": {"aliasB": "mapA"}}
+        # 请求侧立即生效：aliasB → mapA → fkmodel（链式）
+        code, _ = _post(env.url + "/v1/chat/completions",
+                        {"model": "aliasB", "messages": [{"role": "user", "content": "hi"}]})
+        m = env.signer.calls[-1]["params"]["infer"]["model"]
+        ok3 = code == 200 and m == "fkmodel"
+        # PATCH 全量替换（只给 aliases → mappings 清空）
+        c4, raw4 = _adm_req(env, "PATCH", "/api/model-routes",
+                            {"aliases": {"aliasC": "fkmodel"}}, headers=H)
+        obj4 = json.loads(raw4)
+        ok4 = c4 == 200 and obj4.get("aliases") == {"aliasC": "fkmodel"} \
+            and obj4.get("mappings") == {}
+        # 坏 JSON 400
+        c5, _ = _adm_req(env, "PUT", "/api/model-routes", raw=b"{not json", headers=H)
+        _record("admin_model_routes_api",
+                ok1 and ok1b and ok2 and ok3 and ok4 and c5 == 400,
+                "%s %s %s %s %s %s infer=%s" % (c1, c2, code, c4, c5, ok1b, m))
+    finally:
+        Q.ADMIN_PASSWORD = ""
+        env.close()
+
+
 def test_capture_decodes_client_blob():
     """--capture 的解密路径：用假 key/假密文打桩，只验证字段抽取，不读真实文件。"""
     plain = {"schemaVersion": 1, "token": "dt-fake", "refreshToken": "drt-fake",
@@ -1326,11 +1689,41 @@ def test_device_login_new_device():
         argv = seen["argv"] or []
         ok = (rc == 0 and len(pool) == 1 and pool[0]["token"] == "dt-newdev"
               and "--machine-id" not in argv and "--machine-token" not in argv
-              and pool[0]["machineId"] == "")
+              and pool[0]["machineId"] not in ("", "fake-machine")
+              and len(pool[0]["machineId"]) == 36)
         _record("device_login_new_device", ok, "machineId=%s" % pool[0].get("machineId"))
     finally:
         for k, v in saved.items():
             setattr(Q, k, v)
+        env.close()
+
+
+def test_pool_device_isolation():
+    """默认每个号一套设备身份：撞车的重发、原来那套留给续期、结果落盘且重跑幂等。"""
+    env = _Env(accounts=[_fake_account("uid-dv0001"), _fake_account("uid-dv0002"),
+                         _fake_account("uid-dv0003")])
+    try:
+        rows = Q._account_table()
+        with open(env.accounts_file, encoding="utf-8") as f:
+            pool = json.load(f)["accounts"]
+        mids = [p.get("machineId") for p in pool]
+        ok = (len(set(mids)) == 3 and mids[0] == "fake-machine"
+              and all(p.get("loginMachineId") == "fake-machine"
+                      and p.get("loginMachineToken") == "fake-machine-token"
+                      for p in pool[1:])
+              and all(r["device"] == "独立" for r in rows)
+              and Q._device_summary(rows).startswith("3/3")
+              and Q._refresh_device_fields(pool[1]) == {"machine_id": "fake-machine",
+                                                        "machine_token": "fake-machine-token"})
+        Q._pool.update({"accounts": [], "mtime": 0.0})     # 当作重启进程重新读盘
+        again = Q._account_table()
+        with open(env.accounts_file, encoding="utf-8") as f:
+            pool2 = json.load(f)["accounts"]
+        ok = (ok and [p.get("machineId") for p in pool2] == mids
+              and all(r["device"] == "独立" for r in again))
+        _record("pool_device_isolation", ok, "独立=%d/%d"
+                % (sum(1 for r in rows if r["device"] == "独立"), len(rows)))
+    finally:
         env.close()
 
 
@@ -1475,7 +1868,12 @@ def test_map_upstream_error():
           and Q._map_upstream_error(500, "oops") == 502
           and Q._map_upstream_error(200, "sensitive") == 400
           and Q._map_upstream_error(200, "content_security") == 400
-          and Q._map_upstream_error(999) == 502)
+          and Q._map_upstream_error(999) == 502
+          # 上游业务限制藏在首帧的 403 里：不能当鉴权失败（实测 code 110 / 10605 / 112）
+          and Q._map_upstream_error(403, '{"code":"110","message":"Billing daily count exceeded"}') == 429
+          and Q._map_upstream_error(403, '{"code":"10605","message":"{\\"isQueued\\":true}"}') == 429
+          and Q._map_upstream_error(403, '{"code":"112","message":"{\\"pricingUrl\\":\\"https://qoder.com/pricing\\"}"}') == 429
+          and Q._map_upstream_error(403, "invalid device token") == 401)
     _record("map_upstream_error", ok)
 
 
@@ -1926,13 +2324,13 @@ def test_checkin_cli_all_accounts():
 def test_checkin_today_at():
     """到点计算：合法 HH:MM、非法退回、00:00 边界。"""
     base = time.mktime((2026, 10, 18, 8, 0, 0, 0, 0, -1))
-    want = time.mktime((2026, 10, 18, 11, 30, 0, 0, 0, -1))
-    ok = (Q._today_at("11:30", base) == want
-          and Q._today_at("25:99", base) == want          # 非法 → 退回 11:30
+    want = time.mktime((2026, 10, 18, 10, 30, 0, 0, 0, -1))
+    ok = (Q._today_at("10:30", base) == want
+          and Q._today_at("25:99", base) == want          # 非法 → 退回 10:30
           and Q._today_at("", base) == want
           and Q._today_at("00:00", base) == time.mktime((2026, 10, 18, 0, 0, 0, 0, 0, -1))
           and Q._today_at("23:59", base) == time.mktime((2026, 10, 18, 23, 59, 0, 0, 0, -1)))
-    _record("checkin_today_at", ok, "got=%r" % Q._today_at("11:30", base))
+    _record("checkin_today_at", ok, "got=%r" % Q._today_at("10:30", base))
 
 
 def test_checkin_plan_boundaries():
@@ -2067,6 +2465,7 @@ def main():
         test_device_login_argv,
         test_device_login_cmd,
         test_device_login_new_device,
+        test_pool_device_isolation,
         test_device_login_failures,
         test_login_wait_deadline,
         # 纯函数边界
@@ -2109,6 +2508,15 @@ def main():
         test_sweep_guard_is_atomic,
         test_env_isolates_checkin_state_file,
         test_pool_write_keeps_file_secret,
+        # 多 Key 鉴权 + 管理面板 + 模型映射（qoder_admin 集成）
+        test_multi_key_auth,
+        test_keystore_precedence_over_single_key,
+        test_admin_page_and_login,
+        test_admin_keys_crud,
+        test_admin_accounts_adapters,
+        test_admin_stats_usage,
+        test_model_routes_apply,
+        test_admin_model_routes_api,
     ]
     for fn in tests:
         try:

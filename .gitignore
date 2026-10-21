@@ -2,3 +2,6 @@ __pycache__/
 *.py[cod]
 *_accounts.json
 .qoder-intl-proxy/
+# 启动脚本含管理密码，不提交（每台机器各自维护）
+start_cn.sh
+start_intl.sh
