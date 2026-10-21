@@ -1,60 +1,46 @@
 # -*- coding: utf-8 -*-
 """
-qoder_proxy.py —— Qoder CN 官方模型通道的本地 API 代理（OpenAI / Responses / Anthropic 三协议）
+qoder_proxy.py —— Qoder 双区官方模型通道的本地 API 代理（OpenAI / Responses / Anthropic 三协议）
 
-把已登录的 Qoder CN 桌面端官方模型通道转成本地标准 API，供任意客户端调用：
+单进程单端口同时服务国内版（cn）与国际版（intl）账号：按账号 realm 路由上游端点、
+签到形态、签名器 bundle。把已登录的 Qoder 桌面端官方模型通道转成本地标准 API：
   OpenAI 兼容      GET  /v1/models、POST /v1/chat/completions（流式 + 非流式）
   OpenAI Responses POST /v1/responses（兼容 codex-cli 等）
   Anthropic 兼容   POST /v1/messages、POST /v1/messages/count_tokens
   健康检查         GET  /health
-  管理面板         GET  /admin（qoder_admin 共享管理层：多 API Key、账号池、
-                   模型映射管理，/api/* 需 QODER_PROXY_ADMIN_PASSWORD）
+  管理面板         GET  /admin（qoder_admin 共享管理层：多 API Key、账号池、模型映射）
   CORS             OPTIONS 同上路径
 
-上游是 Qoder CN 的推理网关（逆向自客户端 worker runtime）：
-  POST https://gateway.qoder.com.cn/algo/api/v2/service/pro/sse/agent_chat_generation
-       ?FetchKeys=llm_model_result&AgentId=agent_common&Encode=1
-  GET  https://gateway.qoder.com.cn/algo/api/v2/model/list
+双区域配置 REALM_CONFIGS（参照 qoder2api-hub）：
+  cn   国内版  gateway=gateway.qoder.com.cn  openapi=openapi.qoder.com.cn  sign_js=qoder_sign.mjs
+  intl 国际版  gateway=api3.qoder.sh         openapi=openapi.qoder.sh       sign_js=qoder_intl_sign.mjs
+  账号池每个号带 realm 字段（缺省按 domain 推断，再缺省 QODER_PROXY_DEFAULT_REALM=cn）。
+  请求路由：LLM 端点按 X-Realm 头选 realm → 选该 realm 的可用账号；缺省取全部（按账号自身 realm 走端点）。
+  签到形态按 realm 区分：cn 基础（Cosy-Version 1.1.69、无 MachineHostname）；
+    intl 对齐 0.4.8（Cosy-Version 0.4.8 + MachineHostname + 双UA + NYe 头校验）。
+
+上游是 Qoder 推理网关（逆向自客户端 worker runtime），端点按账号 realm 取：
+  cn   POST https://gateway.qoder.com.cn/algo/api/v2/service/pro/sse/agent_chat_generation
+  intl POST https://api3.qoder.sh/algo/api/v2/service/pro/sse/agent_chat_generation
   两者都要求 Authorization: Bearer COSY.<base64>.<sig> 一整套 Cosy-* 签名头，
   且请求体要按 Encode=1 编码 —— 签名与编码已从客户端的 Rust/WASM 模块
   qoder_auth_wasm_bg.wasm 逐字节还原，内联在本文件的 Cosy 段落（纯 Python，
   所以部署只需要 qoder_proxy.py 这一个文件，不需要 qoder_cosy.py）。
-  默认不需要 node；QODER_PROXY_SIGN_BACKEND=node 可切回 qoder_sign.mjs sidecar 对照。
-
-脱离桌面端：只读磁盘上的登录态文件，不启动、不连接 Qoder CN 进程；
-签名在进程内完成，客户端可以完全没打开。只有 --login 的设备码流程需要 node
-（PKCE 授权与轮询逻辑在客户端 bundle 里，暂未用 Python 复刻）。
-  %APPDATA%\\com.qodercn.app.stable\\auth.v1.dat   Electron safeStorage（DPAPI + AES-256-GCM）
-  ~\\.qoder-cn\\.auth\\machine_id                    机器 ID（签名要用）
-  ~\\.qoder-cn\\umid-cache.json                      machine_token/machineType/machineCode
-  ~\\.qoder-cn\\.cache\\endpoint-cache.json           网关/openapi host（自动发现）
-
-账号池（对齐 codearts_proxy.py 的用法）：
-  --login              浏览器设备码登录换 token 入池（本机可以完全没有 Qoder CN 客户端）
-  --capture            从本机客户端解密登录态并入池
-  --list / --remove    查看、移除池内账号
-  --export / --import  凭证包跨机迁移（目标机不需要 Windows/DPAPI/客户端）
-  设备身份            默认每个账号一套独立 machineId/machineType/machineCode：入池时自动发、
-                      落盘复用，只有缺失或与池内他人撞车才重发；签发时那台机器的身份留在
-                      loginMachineId/loginMachineToken 里，只给 deviceToken/refresh 用（它认设备）。
-                      想全部沿用本机指纹：QODER_PROXY_DEVICE=host
-  运行时              token 临期自动续期（POST openapi /api/v1/deviceToken/refresh，无需签名），
-                      401/403 自动换号重试，续期链失效的账号标记 refresh_dead 不再反复尝试
-   运行时·签到          每日 Credits 自动领（默认 10:30，逐个账号；没领到按 30 分钟重试，最多 4 次。
-                      QODER_PROXY_CHECKIN_AT 改时间，QODER_PROXY_CHECKIN=0 关掉，--checkin 手动来一发）
+  默认不需要 node；QODER_PROXY_SIGN_BACKEND=node 可切回 sidecar 对照（按 realm 选 bundle）。
 
 零第三方依赖（纯标准库）。只有 --capture 需要 cryptography 解 AES-256-GCM；
 用 --import 迁移动凭证时不需要任何依赖。日常代理与签名都不需要 node。
 
 用法:
   python qoder_proxy.py                      # 启动代理（默认弹交互菜单，tty 时）
-  python qoder_proxy.py --serve              # 跳过菜单直接启动
-  python qoder_proxy.py --login              # 跳浏览器授权，拿不到客户端时用这个
+  python qoder_proxy.py --serve              # 跳过菜单直接启动（单进程单端口 8791 服务双区）
+  python qoder_proxy.py --login --realm cn   # 浏览器授权登录国内版账号入池
+  python qoder_proxy.py --login --realm intl # 浏览器授权登录国际版账号入池
   python qoder_proxy.py --login --new-device # 授权时不用本机设备 ID（token 签发给一套新设备）
-  python qoder_proxy.py --capture
-  python qoder_proxy.py --list             # 每个号各自的设备身份/机器 ID
+  python qoder_proxy.py --capture --realm cn # 从本机国内版客户端解密登录态入池
+  python qoder_proxy.py --list               # 每个号各自的设备身份/机器 ID/realm
   python qoder_proxy.py --models
-  python qoder_proxy.py --checkin            # 领今天的每日 Credits（多账号）
+  python qoder_proxy.py --checkin            # 领今天的每日 Credits（遍历池中所有账号，按各自 realm 签到）
   python qoder_proxy.py --test-chat "hi"
 """
 import argparse
@@ -70,6 +56,7 @@ import queue
 import re
 import secrets
 import shutil
+import socket
 import subprocess
 import sys
 import threading
@@ -81,11 +68,10 @@ import uuid
 import webbrowser
 from email.utils import parsedate
 
-import qoder_admin as QA
-
 # ── 常量与路径 ────────────────────────────────────────────────────────────────
 
 import llm_proxy_core as C
+import qoder_admin as QA
 
 PORT = int(os.environ.get("QODER_PROXY_PORT", "8791"))
 API_KEY = os.environ.get("QODER_PROXY_API_KEY") or ""      # 空 = 不鉴权
@@ -100,7 +86,7 @@ RETRY_MAX = 2                   # 连接失败 / 502/503/504 的额外重试次�
 RETRY_BACKOFF_SEC = 0.5         # 退避基数，指数增长
 SWEEP_SEC = 30                  # 账号池临期巡检最小间隔
 
-# 每日 Credits 自动签到（活动窗口每天 10:00 后开放，留半小时余量，默认 10:30）
+# 每日 Credits 自动签到（活动窗口每天 10:00 后开放，越晚越稳，所以默认 11:30）
 CHECKIN_ENABLED = (os.environ.get("QODER_PROXY_CHECKIN", "1").strip().lower()
                    not in ("0", "off", "false", "no"))
 CHECKIN_AT = (os.environ.get("QODER_PROXY_CHECKIN_AT") or "10:30").strip()
@@ -109,32 +95,31 @@ CHECKIN_MAX_ATTEMPTS = int(os.environ.get("QODER_PROXY_CHECKIN_TRIES", "4"))
 # 状态单独放一个文件（不含 token）：池文件由续期写，混在一起会把"池 md5 变了=续期了"
 # 这条判据弄脏；而且进程重启后要知道"今天签过没"，不能只靠内存。
 CHECKIN_STATE_FILE = os.environ.get("QODER_PROXY_CHECKIN_STATE") or os.path.join(
-    os.path.expanduser("~"), ".qoder-cn-proxy", "checkin_state.json")
+    os.path.expanduser("~"), ".qoder-proxy", "checkin_state.json")
 
 SCENE = os.environ.get("QODER_PROXY_SCENE", "chat")
 DEFAULT_MODEL = os.environ.get("QODER_PROXY_MODEL", "auto")
 BUSINESS_TYPE = os.environ.get("QODER_PROXY_BUSINESS_TYPE", "agent")
 BUSINESS_PRODUCT = os.environ.get("QODER_PROXY_BUSINESS_PRODUCT", "cli")
+# v3 会话类型：国际版桌面端/CLI 都是 qodercli（客户端 bundle 里的 HMA）。
+SESSION_TYPE = os.environ.get("QODER_PROXY_SESSION_TYPE", "qodercli")
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-SIGN_JS = os.environ.get("QODER_SIGN_JS", os.path.join(HERE, "qoder_sign.mjs"))
+# 管理层（qoder_admin 集成）：多 Key 存储 / 管理密码 / 模型路由文件。
+# 默认都放脚本同目录（与账号池同一个"程序 + 数据文件"部署模型），env 可覆盖。
+ADMIN_KEYS_FILE = (os.environ.get("QODER_PROXY_ADMIN_KEYS")
+                   or os.path.join(HERE, "qoder_admin_keys.json"))
+ADMIN_PASSWORD = os.environ.get("QODER_PROXY_ADMIN_PASSWORD", "")   # 空 = 管理 API 禁用
+MODEL_ROUTES_FILE = (os.environ.get("QODER_PROXY_MODEL_ROUTES")
+                     or os.path.join(HERE, "qoder_model_routes.json"))
+SIGN_JS = os.environ.get("QODER_SIGN_JS") or os.path.join(HERE, "qoder_sign.mjs")  # 占位，REALM_CONFIGS 块后按 DEFAULT_REALM 修正
 NODE = os.environ.get("QODER_PROXY_NODE", "node")
 # auto（默认）：纯 Python 优先，异常才回落 node；py：只用纯 Python；node：只用 sidecar
 SIGN_BACKEND = (os.environ.get("QODER_PROXY_SIGN_BACKEND") or "auto").strip().lower()
-
-# ── 管理面（qoder_admin 共享管理层）──────────────────────────────────────────
-# ADMIN_PASSWORD：管理 Bearer 密码，空 = /api/* 全拒绝（页面与 /api/auth/login 仍可达）
-ADMIN_PASSWORD = os.environ.get("QODER_PROXY_ADMIN_PASSWORD", "")
-# 多 API Key 存储（0600 原子写由 qoder_admin 处理）；LLM 数据面鉴权见 _check_api_key
-ADMIN_KEYS_FILE = os.environ.get("QODER_PROXY_ADMIN_KEYS") or os.path.join(
-    HERE, "qoder_admin_keys.json")
-# 模型映射 {"mappings": {请求名: 上游名}, "aliases": {假名: 请求名}}，请求侧 resolve
-MODEL_ROUTES_FILE = os.environ.get("QODER_PROXY_MODEL_ROUTES") or os.path.join(
-    HERE, "qoder_model_routes.json")
 # 账号池是"程序 + 账号文件"两件套里的第二个文件，路径按优先级解析：
 #   1. QODER_PROXY_ACCOUNTS 显式指定
 #   2. 脚本同目录的 qoder_accounts.json —— 默认位置，整目录拷走即可部署
-#   3. ~/.qoder-cn-proxy/accounts.json —— 兼容旧位置（迁移前放在这里仍能读）
+#   3. ~/.qoder-proxy/accounts.json —— 兼容旧位置（迁移前放在这里仍能读）
 # 同目录那份里是真 token：仓库根 .gitignore 已挡 *_accounts.json，仍不要提交、不要外传。
 # 两个都不存在时返回同目录路径，首次写池时自动创建。
 def _default_accounts_file():
@@ -144,7 +129,7 @@ def _default_accounts_file():
     local = os.path.join(HERE, "qoder_accounts.json")
     if os.path.exists(local):
         return local
-    home = os.path.join(os.path.expanduser("~"), ".qoder-cn-proxy", "accounts.json")
+    home = os.path.join(os.path.expanduser("~"), ".qoder-proxy", "accounts.json")
     return home if os.path.exists(home) else local
 
 
@@ -153,14 +138,116 @@ ACCOUNTS_FILE = _default_accounts_file()
 HOME = os.path.expanduser("~")
 APPDATA = os.environ.get("APPDATA", os.path.join(HOME, "AppData", "Roaming"))
 USERPROFILE = os.environ.get("USERPROFILE", HOME)
-USER_DATA = os.path.join(APPDATA, "com.qodercn.app.stable")
-QODER_HOME = os.path.join(USERPROFILE, ".qoder-cn")
+
+# ── 双区域配置（国内 cn / 国际 intl）──────────────────────────────────────────
+# 参照 qoder2api-hub 的 REALM_CONFIGS：单进程单端口同时服务双区账号，按账号 realm
+# 路由上游端点、签到形态、签名器 bundle。DEFAULT_REALM 缺省 cn（国内风控宽松）。
+REALM_CONFIGS = {
+    "cn": {
+        "name": "国内版",
+        "gateway": "https://gateway.qoder.com.cn",
+        "openapi": "https://openapi.qoder.com.cn",
+        "website": "https://qoder.com.cn",
+        "site": "https://qoder.cn",          # 设备码授权页 base
+        "sign_js": "qoder_sign.mjs",         # 签名器 bundle
+        "domain": "qoder.com.cn",
+        "app_dir": "com.qodercn.app.stable",  # 桌面 App Roaming 数据目录
+        "home_dir": ".qoder-cn",              # 官方客户端本地目录
+        "has_checkin": True,
+        # cn 签到形态：基础（Cosy-Version 1.1.69、无 MachineHostname、UA 用代理默认）
+        "checkin_shape": "basic",
+    },
+    "intl": {
+        "name": "国际版",
+        "gateway": "https://api3.qoder.sh",
+        "openapi": "https://openapi.qoder.sh",
+        "website": "https://qoder.com",
+        "site": "https://qoder.com",
+        "sign_js": "qoder_intl_sign.mjs",
+        "domain": "qoder.com",
+        "app_dir": "com.qoder.app.stable",
+        "home_dir": ".qoder",
+        "has_checkin": False,
+        # intl 签到形态：对齐 0.4.8（Cosy-Version 0.4.8 + MachineHostname + 双UA + NYe）
+        "checkin_shape": "aligned",
+    },
+}
+DEFAULT_REALM = (os.environ.get("QODER_PROXY_DEFAULT_REALM") or "cn").strip().lower()
+if DEFAULT_REALM not in REALM_CONFIGS:
+    DEFAULT_REALM = "cn"
+
+
+def detect_realm_from_domain(domain):
+    """按域名推断 realm：含 qoder.sh 或等于 qoder.com → intl，否则 cn。"""
+    d = (domain or "").strip().lower()
+    if "qoder.sh" in d or d == "qoder.com":
+        return "intl"
+    return "cn"
+
+
+def get_realm_config(realm):
+    """取 realm 配置；未知 realm 回落 cn。"""
+    return REALM_CONFIGS.get(realm) or REALM_CONFIGS["cn"]
+
+
+def _realm_of(acct):
+    """从账号对象取 realm；缺省按 domain 推断，再缺省 DEFAULT_REALM。"""
+    if isinstance(acct, dict):
+        r = (acct.get("realm") or "").strip().lower()
+        if r in REALM_CONFIGS:
+            return r
+        d = acct.get("domain") or ""
+        if d:
+            return detect_realm_from_domain(d)
+    return DEFAULT_REALM
+
+
+def _gw(realm):
+    """按 realm 取推理网关 host。env 覆盖优先（测试 mock 赋值 GATEWAY 时走全局）。"""
+    return get_realm_config(realm)["gateway"]
+
+
+def _oa(realm):
+    """按 realm 取 openapi host。"""
+    return get_realm_config(realm)["openapi"]
+
+
+def _sign_js_path(realm):
+    """按 realm 取签名器 bundle 路径。"""
+    return os.path.join(HERE, get_realm_config(realm)["sign_js"])
+
+
+def _site_url(realm):
+    """按 realm 取设备码授权页 base。"""
+    return get_realm_config(realm)["site"]
+
+
+def _user_data_dir(realm):
+    return os.path.join(APPDATA, get_realm_config(realm)["app_dir"])
+
+
+def _qoder_home(realm):
+    return os.path.join(USERPROFILE, get_realm_config(realm)["home_dir"])
+
+
+def _endpoint_cache_path(realm):
+    return os.path.join(_qoder_home(realm), ".cache", "endpoint-cache.json")
+
+
+# 模块级默认值（= DEFAULT_REALM 的路径），测试可直接赋值 mock（如 Q.GATEWAY = mock_base）。
+# 按 realm 路由时用上面的 _gw/_oa/_sign_js_path 等函数，不要直接读这些全局常量。
+USER_DATA = _user_data_dir(DEFAULT_REALM)
+QODER_HOME = _qoder_home(DEFAULT_REALM)
 
 AUTH_BLOB = os.path.join(USER_DATA, "auth.v1.dat")
 LOCAL_STATE = os.path.join(USER_DATA, "Local State")
 MACHINE_ID_FILE = os.path.join(QODER_HOME, ".auth", "machine_id")
 UMID_FILE = os.path.join(QODER_HOME, "umid-cache.json")
-ENDPOINT_CACHE = os.path.join(QODER_HOME, ".cache", "endpoint-cache.json")
+ENDPOINT_CACHE = _endpoint_cache_path(DEFAULT_REALM)
+
+# REALM_CONFIGS 块已定义，按 DEFAULT_REALM 修正 SIGN_JS（env 未显式指定时）
+if not os.environ.get("QODER_SIGN_JS"):
+    SIGN_JS = _sign_js_path(DEFAULT_REALM)
 
 MODEL_LIST_PATH = "/algo/api/v2/model/list"
 INFER_PATH = "/algo/api/v2/service/pro/sse/agent_chat_generation"
@@ -173,11 +260,6 @@ USAGE_PATH = "/sash/api/v2/me/usage"
 MACHINE_OS = os.environ.get("QODER_PROXY_MACHINE_OS") or (
     "x86_64_win32" if sys.platform == "win32" else "x86_64_" + sys.platform)
 
-DEFAULT_GATEWAY = "https://gateway.qoder.com.cn"
-DEFAULT_OPENAPI = "https://openapi.qoder.com.cn"
-
-USER_AGENT = "qoder-proxy/1.0 (+https://github.com)"
-
 
 def _read_json_file(path):
     try:
@@ -187,9 +269,12 @@ def _read_json_file(path):
         return None
 
 
-def _endpoint(kind):
-    """从客户端 endpoint-cache 自动发现 host；拿不到就用官方默认域名。"""
-    cache = _read_json_file(ENDPOINT_CACHE) or {}
+def _endpoint(kind, realm=None):
+    """从客户端 endpoint-cache 自动发现 host；拿不到就用 REALM_CONFIGS 默认域名。
+    realm 缺省用 DEFAULT_REALM。cache 路径按 realm 分键（cn/intl 各一套缓存）。"""
+    r = realm or DEFAULT_REALM
+    cfg = get_realm_config(r)
+    cache = _read_json_file(_endpoint_cache_path(r)) or {}
     entries = cache.get("entries") or {}
     prod = entries.get("prod") or {}
     if kind == "openapi":
@@ -200,16 +285,36 @@ def _endpoint(kind):
             host = host[0] if host else None
     if isinstance(host, str) and host.startswith("http"):
         return host.rstrip("/")
-    return DEFAULT_GATEWAY if kind != "openapi" else DEFAULT_OPENAPI
+    return cfg["gateway"] if kind != "openapi" else cfg["openapi"]
 
 
 GATEWAY = os.environ.get("QODER_PROXY_GATEWAY") or _endpoint("infer")
 OPENAPI = os.environ.get("QODER_PROXY_OPENAPI") or _endpoint("openapi")
 
+USER_AGENT = "qoder-proxy/1.0 (+https://github.com)"
+
+# ── 签到链路请求形态常量（对齐 Qoder 桌面客户端 App 0.4.8 的逆向规格，
+#    reverse_asar_findings.md §1/§2/§9）：签到相关请求模拟桌面客户端，
+#    其余请求（登录、续期、对话）继续用上面的代理自身 USER_AGENT。──────
+# 客户端 App 版本号：intl 签到 Cosy-Version 用它（app.getVersion()），与对话链路
+# 的 CLI 版本号 COSY_VERSION("1.1.69") 语义不同，别混用。
+CLIENT_APP_VERSION = "0.4.8"
+# cn 签到用基础形态：Cosy-Version 沿用 CLI 版本号 1.1.69（国内版风控宽松，实战验证）。
+CN_CHECKIN_VERSION = "1.1.69"
+# 客户端两种请求两种 UA：campaigns 列表 GET 由主进程 nativeHttpService 发，
+# UA 字面量就是 "Qoder"；claim POST 由 campaign H5 iframe 发，走 Electron
+# session 默认 UA（qoder/<版本> 段随 CLIENT_APP_VERSION 变化）。
+CAMPAIGN_LIST_UA = "Qoder"
+CLAIM_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) qoder/%s Chrome/143.0.0.0 Electron/43.1.1 "
+            "Safari/537.36" % CLIENT_APP_VERSION)
+
+
+
 # 设备码登录（--login）：站点授权页 base 取自 bundle 里 startDeviceFlow 的 site 参数
-# （CN 版是 https://qoder.cn，国际版是 https://qoder.com）；轮询走 openapi host。
+# （cn 版 https://qoder.cn / 国际版 https://qoder.com，按 realm 取）；轮询走 openapi host。
 # 客户端 bundle 里的懒初始化会给出真 client_id，所以这里不需要硬编码。
-SITE = os.environ.get("QODER_PROXY_SITE") or "https://qoder.cn"
+SITE = os.environ.get("QODER_PROXY_SITE") or _site_url(DEFAULT_REALM)
 LOGIN_TIMEOUT_SEC = int(os.environ.get("QODER_PROXY_LOGIN_TIMEOUT", "330"))
 
 LOG_FILE = os.environ.get("QODER_PROXY_LOG") or ""
@@ -295,7 +400,7 @@ def _get_master_key():
     """Local State → os_crypt.encrypted_key → 去 "DPAPI" 前缀 → 32B AES-256 key。"""
     ls = _read_json_file(LOCAL_STATE)
     if not ls:
-        raise RuntimeError("找不到 %s（Qoder CN 未安装或未登录）" % LOCAL_STATE)
+        raise RuntimeError("找不到 %s（Qoder 国际版未安装或未登录）" % LOCAL_STATE)
     raw = base64.b64decode(ls["os_crypt"]["encrypted_key"])
     if raw[:5] != b"DPAPI":
         raise RuntimeError("Local State 主密钥前缀异常，客户端加密方案可能已变")
@@ -321,12 +426,14 @@ def _machine_identity():
     except Exception:
         pass
     if not mid:
-        app_mid = os.path.join(USER_DATA, "machine-id")
-        try:
-            with open(app_mid, encoding="utf-8") as f:
-                mid = f.read().strip()
-        except Exception:
-            mid = ""
+        for name in ("machine-id", "auth.machine-id"):
+            try:
+                with open(os.path.join(USER_DATA, name), encoding="utf-8") as f:
+                    mid = f.read().strip()
+            except Exception:
+                mid = ""
+            if mid:
+                break
     umid = _read_json_file(UMID_FILE) or {}
     info = umid.get("info") if isinstance(umid.get("info"), dict) else umid
     return {
@@ -454,12 +561,17 @@ def _parse_exp(s):
 
 
 # ── openapi 明文 JSON（无需 Cosy 签名）───────────────────────────────────────
-def _openapi_json(method, path, body=None, token="", timeout=20, headers=None):
-    """打一次 openapi 请求，返回 (status, json_dict)。这几个端点只认 Bearer，不签名。"""
-    url = OPENAPI + path
+def _openapi_json(method, path, body=None, token="", timeout=20, headers=None, ua=None, realm=None):
+    """打一次 openapi 请求，返回 (status, json_dict)。这几个端点只认 Bearer，不签名。
+    ua：User-Agent 覆盖（签到链路要区分客户端两种 UA，见 _checkin_account）；
+    缺省用全局 USER_AGENT（登录、续期、userinfo 等代理自身请求）。
+    realm：按区域取 openapi host（cn/intl 各自端点）；缺省用全局 OPENAPI
+    （测试 mock 直接赋值 Q.OPENAPI 时走全局，向后兼容）。"""
+    base = _oa(realm) if realm else OPENAPI
+    url = base + path
     data = json.dumps(body, ensure_ascii=False).encode("utf-8") if body is not None else None
     req = urllib.request.Request(url, data=data, method=method)
-    req.add_header("User-Agent", USER_AGENT)
+    req.add_header("User-Agent", ua or USER_AGENT)
     req.add_header("Accept", "application/json")
     if data is not None:
         req.add_header("Content-Type", "application/json")
@@ -486,7 +598,8 @@ def _openapi_json(method, path, body=None, token="", timeout=20, headers=None):
 def _enrich_account(acct):
     """补 uid / 组织信息（签名要用）；只存 id 和显示名，不存邮箱等 PII。"""
     tok = acct.get("token") or ""
-    st, ui = _openapi_json("GET", USERINFO_PATH, token=tok)
+    realm = _realm_of(acct)
+    st, ui = _openapi_json("GET", USERINFO_PATH, token=tok, realm=realm)
     if st == 200 and isinstance(ui, dict):
         acct["uid"] = ui.get("id") or acct.get("uid") or ""
         acct["organizationId"] = ui.get("orgId") or ""
@@ -494,19 +607,64 @@ def _enrich_account(acct):
                                or ui.get("nickName") or acct.get("displayName") or "")
         org = acct["organizationId"]
         if org:
-            st2, tags = _openapi_json("GET", ORG_TAGS_PATH.format(org=org), token=tok)
+            st2, tags = _openapi_json("GET", ORG_TAGS_PATH.format(org=org), token=tok,
+                                      realm=realm)
             if st2 == 200 and isinstance(tags, dict):
                 acct["organizationTags"] = tags.get("tags") or tags.get("data") or []
     return acct
 
 
 # ── 每日 Credits 签到（单账号）──────────────────────────────────────────────
+# 客户端头值校验（electronMain.js NYe）：值 trim 后非空且全为可打印 ASCII
+# （[\x20-\x7e]）才发送，否则整头丢弃。
+_PRINTABLE_ASCII_RE = re.compile(r"^[\x20-\x7e]+$")
+_HOSTNAME_MAX = 96      # 客户端 DR0/Lf0：Cosy-MachineHostname 上限 96 字符
+
+
+def _sanitize_machine_hostname(raw):
+    """Cosy-MachineHostname 取值，对齐客户端 DR0（reverse_asar_findings.md §4）：
+    trim 后为可打印 ASCII 且 ≤96 字符原值直通（Windows 常规场景）；空返回 ""
+    （头不发送）；非 ASCII / 超长走兜底——可打印部分折叠成 "-" 拼 sha256 前
+    8 hex（简化实现，不做客户端的 domainToASCII/punycode 分支）。"""
+    x = str(raw or "").strip()
+    if not x:
+        return ""
+    if len(x) <= _HOSTNAME_MAX and _PRINTABLE_ASCII_RE.match(x):
+        return x
+    hash8 = hashlib.sha256(x.encode("utf-8")).hexdigest()[:8]
+    cleaned = re.sub(r"[^\x21-\x7e]+", "-", x)
+    cleaned = re.sub(r"-{2,}", "-", cleaned).strip("-")
+    limit = _HOSTNAME_MAX - len(hash8) - 1
+    if len(cleaned) > limit:
+        cleaned = cleaned[:limit].rstrip("- ")
+    return (cleaned + "-" + hash8) if cleaned else "unknown-" + hash8
+
+
+def _machine_hostname(acct):
+    """账号字段 machineHostname 优先，缺省用本机 hostname（客户端 os.hostname()）。"""
+    raw = acct.get("machineHostname") or ""
+    if not raw:
+        try:
+            raw = socket.gethostname()
+        except Exception:
+            raw = ""
+    return _sanitize_machine_hostname(raw)
+
+
 def _cosy_device_headers(acct):
-    # Cosy-ClientType 必须是 10（桌面端）：实测 5 时 /me/campaigns 恒返回
-    # showCampaign=false、campaigns=[]，签到一分领不到；10 才有活动列表。
-    # 推理链路仍用 5（见 _base_headers），只有签到走桌面端身份。
-    return {
-        "Cosy-Version": acct.get("cosyVersion") or "1.1.69",
+    """签到链路的桌面端设备头，按账号 realm 区分签到形态：
+    cn（基础形态）：Cosy-Version 用 CLI 版本号 1.1.69、无 MachineHostname、无 NYe 校验
+        —— 国内版风控宽松，对齐国内版实战验证行为。
+    intl（对齐形态）：Cosy-Version 用客户端 App 版本号 0.4.8、恒发 MachineHostname、
+        所有头值按 NYe 规则校验（trim 后非空且全为可打印 ASCII 才发）
+        —— 对齐 Qoder 桌面客户端 0.4.8 逆向规格（reverse_asar_findings.md §1.3/§4）。
+    Cosy-ClientType 必须是 10（桌面端）：实测 5 时 /me/campaigns 恒返回
+    showCampaign=false、campaigns=[]，签到一分领不到；10 才有活动列表。
+    推理链路仍用 5（见 CosyContext._base_headers），只有签到走桌面端身份。"""
+    realm = _realm_of(acct)
+    h = {
+        "Cosy-Version": acct.get("cosyVersion") or (
+            CLIENT_APP_VERSION if realm == "intl" else CN_CHECKIN_VERSION),
         "Cosy-ClientType": "10",
         "Cosy-MachineOS": MACHINE_OS,
         "Cosy-MachineId": acct.get("machineId") or "",
@@ -514,6 +672,18 @@ def _cosy_device_headers(acct):
         "Cosy-MachineType": str(acct.get("machineType") or "5"),
         "Cosy-MachineCode": acct.get("machineCode") or "",
     }
+    if realm == "intl":
+        hostname = _machine_hostname(acct)
+        if hostname:
+            h["Cosy-MachineHostname"] = hostname
+        out = {}
+        for k, v in h.items():
+            v = str(v).strip()
+            if v and _PRINTABLE_ASCII_RE.match(v):
+                out[k] = v
+        return out
+    return h
+
 
 
 def _campaign_id(campaign):
@@ -544,15 +714,16 @@ def _credits_secured(cps):
     return any(_is_credits_benefit(c) and c.get("claimStatus") == "CLAIMED" for c in cps)
 
 
-CLAIM_RECEIPT_KEYS = ("grantId", "claimedAt", "grantedAt", "replayed", "status")
+CLAIM_RECEIPT_KEYS = ("grantId", "claimedAt", "grantedAt", "replayed")
 
 
 def _add_on_total(acct):
     """额度桶里的 addOnQuota.total——发放回执只证明服务端说给了，这个才证明真到手。
     实测每成功领一次它 +100（客户端日志里 100→200→300）。读不到就 None，不影响签到结论。"""
+    realm = _realm_of(acct)
     try:
         st, obj = _openapi_json("GET", USAGE_PATH, token=acct.get("token") or "",
-                                headers=_cosy_device_headers(acct))
+                                headers=_cosy_device_headers(acct), realm=realm)
     except Exception:
         return None
     if st != 200 or not isinstance(obj, dict):
@@ -563,12 +734,27 @@ def _add_on_total(acct):
 
 
 def _checkin_account(acct):
-    """只给传入的这一个账号领今天的 Credits campaign；没有可领项就是成功 no-op。
-    claim 的响应就是发放回执（grantId/claimedAt/grantedAt），重复 POST 返回 replayed=true
-    不再二次发放，所以整条链路可以随便重试。"""
+    """给这一个账号把列表里所有可领的活动（CLAIM_BENEFIT + CLAIMABLE）逐个领一遍；
+    没有可领项就是成功 no-op。
+
+    行为对齐国内版 qoder_proxy.py（服务器实战验证：所有账号连续多天全部正常
+    领取）：签到一律用账号池身份——每号一套独立 machineId，machineToken 为空
+    就用 machineId 顶替（见 _cosy_device_headers），配合 _isolate_pool_devices
+    保证每号独立。此前盲领失败的根因是账号共用了本机客户端共享身份（撞设备
+    判重连坐），不是"列表没条目"，所以不盲领、不派生身份：只领自己列表里
+    CLAIMABLE 的条目（_claimable_campaigns），已领过的 claimStatus=CLAIMED
+    自然落进 no-op。claim 幂等（同账号重复 POST 返回 replayed=true 不二次发放），
+    整条链路可以随便重试。"""
     token = acct.get("token") or ""
-    headers = _cosy_device_headers(acct)
-    st, obj = _openapi_json("GET", CAMPAIGNS_PATH, token=token, headers=headers)
+    realm = _realm_of(acct)
+    headers = _cosy_device_headers(acct)   # 账号池身份：签到认池里这号的设备字段
+    # 签到 UA 按 realm 区分：intl 对齐桌面客户端两种 UA（reverse_asar_findings.md §2.2）
+    # ——列表 GET 是主进程 nativeHttpService 发的（UA="Qoder"）；claim POST 由 campaign
+    # H5 iframe 发，走 Electron session 默认 UA（CLAIM_UA）。cn 用代理默认 UA（风控宽松）。
+    list_ua = CAMPAIGN_LIST_UA if realm == "intl" else None
+    claim_ua = CLAIM_UA if realm == "intl" else None
+    st, obj = _openapi_json("GET", CAMPAIGNS_PATH, token=token, headers=headers,
+                            ua=list_ua, realm=realm)
     rep = {"status": st, "campaigns": 0, "claimable": False, "claimed": [], "secured": False}
     if st != 200 or not isinstance(obj, dict):
         rep["error"] = ((obj or {}).get("message") if isinstance(obj, dict) else "")
@@ -587,14 +773,19 @@ def _checkin_account(acct):
         cid = _campaign_id(c)
         benefit = c.get("benefit") or {}
         path = "%s/%s/claim" % (CAMPAIGNS_PATH, urllib.parse.quote(cid, safe=""))
-        cst, cobj = _openapi_json("POST", path, body={}, token=token, headers=headers)
-        item = {"id": cid, "status": cst, "key": c.get("campaignKey"),
+        cst, cobj = _openapi_json("POST", path, body={}, token=token, headers=headers,
+                                  ua=claim_ua, realm=realm)
+        item = {"id": cid, "status": cst,
+                "key": c.get("campaignKey"),
                 "kind": benefit.get("kind"), "amount": benefit.get("amount")}
         if isinstance(cobj, dict):
             for k in CLAIM_RECEIPT_KEYS:
                 if k in cobj:
                     item[k] = cobj[k]
-            for k in ("message", "code", "success"):
+            # 国际版回执体里带 status:"CLAIMED"/"BLOCKED"，不能拿它覆盖 HTTP 状态码
+            if cobj.get("status") is not None:
+                item["claimStatus"] = cobj["status"]
+            for k in ("message", "code", "success", "failureCode"):
                 if k in cobj:
                     item[k] = cobj[k]
             rb = cobj.get("benefit")
@@ -602,20 +793,52 @@ def _checkin_account(acct):
                 item["kind"] = rb.get("kind") or item["kind"]
                 item["amount"] = rb.get("amount") if rb.get("amount") is not None else item["amount"]
         rep["claimed"].append(item)
-    st2, obj2 = _openapi_json("GET", CAMPAIGNS_PATH, token=token, headers=headers)
+    # 领取后再看一眼列表（展示用）。secured 只升不降：回执已认定到账的，不能让
+    # 复查结果（列表可能滞后）把 True 冲掉。
+    st2, obj2 = _openapi_json("GET", CAMPAIGNS_PATH, token=token, headers=headers,
+                              ua=list_ua, realm=realm)
     cps2 = [c for c in ((obj2 or {}).get("campaigns") or []) if isinstance(c, dict)] \
-        if st2 == 200 else []
+        if st2 == 200 and isinstance(obj2, dict) else []
     rep["after"] = {"status": st2,
                     "claimable": bool(obj2.get("claimable")) if isinstance(obj2, dict) else None}
-    if cps2:
-        rep["secured"] = _credits_secured(cps2)
+    rep["secured"] = rep["secured"] or _credits_secured(cps2)
     if rep["claimed"]:
         rep["addOnTotal"] = _add_on_total(acct)
-    ok = all(i["status"] in (200, 201, 204) for i in rep["claimed"])
-    if not ok:
-        bad = next(i for i in rep["claimed"] if i["status"] not in (200, 201, 204))
-        rep["error"] = bad.get("message") or "claim HTTP %s" % bad["status"]
+    # 回执逐条判定（兼容国内版"2xx 即成功"形态与国际版带业务状态的回执）：
+    #   2xx 且（无 claimStatus / CLAIMED）→ 发放到账；
+    #   2xx 且 BLOCKED + failureCode=SAME_PERSON_ALREADY_CLAIMED → 上游拒发，
+    #     该号未到账但不报错（判重每天每设备一份，当天重试只重放，别让 cron 误报）；
+    #   其它（非 2xx、或 BLOCKED 其它原因）→ 失败。
+
+    def _item_ok(i):
+        if i["status"] not in (200, 201, 204):
+            return False
+        rs = i.get("claimStatus")
+        return rs in (None, "CLAIMED") or (rs == "BLOCKED"
+                                           and i.get("failureCode") == "SAME_PERSON_ALREADY_CLAIMED")
+
+    bad = next((i for i in rep["claimed"] if not _item_ok(i)), None)
+    ok = bad is None
+    if ok:
+        granted = [i for i in rep["claimed"] if i.get("claimStatus") in (None, "CLAIMED")]
+        if granted:
+            rep["secured"] = True
+            has_fresh = any(not i.get("replayed") and i.get("grantedAt") for i in granted)
+            rep["message"] = ("今日 100 Credits 已到账（本轮已领取）" if has_fresh
+                              else "今日 100 Credits 已到账（本账号此前已领，回执 replayed）")
+        else:
+            rep["message"] = ("上游拒发：该设备身份今日已被领过（SAME_PERSON_ALREADY_CLAIMED），"
+                              "未到账；检查账号池 machineId 是否与他人或本机客户端共用"
+                              "（_isolate_pool_devices 保证每号独立）")
+    else:
+        detail = bad.get("message") or bad.get("failureCode") or ""
+        if bad["status"] not in (200, 201, 204):
+            rep["error"] = "claim HTTP %s%s" % (bad["status"],
+                                                (": " + detail) if detail else "")
+        else:
+            rep["error"] = detail or ("claim 回执 status=%s" % (bad.get("claimStatus") or "?"))
     return ok, rep
+
 
 
 # ── 账号池 ────────────────────────────────────────────────────────────────────
@@ -650,6 +873,10 @@ def _load_pool_locked():
         data = _read_json_file(ACCOUNTS_FILE) or {}
         accs = data.get("accounts") if isinstance(data, dict) else data
         _pool["accounts"] = [a for a in (accs or []) if isinstance(a, dict) and a.get("token")]
+        # 给每个号补 realm（缺省按 domain 推断，再缺省 DEFAULT_REALM）
+        for a in _pool["accounts"]:
+            if not a.get("realm"):
+                a["realm"] = _realm_of(a)
         _pool["mtime"] = mtime
         # 默认每个号一套设备身份；发出来的必须落盘，否则每次重启都换一套
         if _isolate_pool_devices(_pool["accounts"]):
@@ -778,13 +1005,18 @@ class LoginError(Exception):
     pass
 
 
-def _device_login_argv(machine, site=None, client_id=None):
+def _device_login_argv(machine, site=None, client_id=None, realm=None):
     """组 sidecar 的一次性 --login 命令行。
 
     没有客户端登录态时 machine 参数直接省略（sidecar 自己生成 uuid），这样
     全新机器 / 纯 Linux 容器也能 --login。
+    realm：按区域选签名器 bundle（cn→qoder_sign.mjs / intl→qoder_intl_sign.mjs）、
+    openapi host、授权页 base；缺省用全局 SIGN_JS/OPENAPI/SITE（测试 mock 兼容）。
     """
-    argv = [NODE, SIGN_JS, "--login", "--site", site or SITE, "--openapi", OPENAPI]
+    sign_js = _sign_js_path(realm) if realm else SIGN_JS
+    openapi = _oa(realm) if realm else OPENAPI
+    site_base = site or (_site_url(realm) if realm else SITE)
+    argv = [NODE, sign_js, "--login", "--site", site_base, "--openapi", openapi]
     if machine.get("machineId"):
         argv += ["--machine-id", machine["machineId"]]
     if machine.get("machineToken"):
@@ -794,11 +1026,12 @@ def _device_login_argv(machine, site=None, client_id=None):
     return argv
 
 
-def _account_from_device_token(dev, machine=None):
+def _account_from_device_token(dev, machine=None, realm=None):
     """设备码轮询回来的 JSON → 池内账号 dict。
 
     上游给的是 snake_case，客户端自己归一化成 camelCase，两种都要吃下；
     只存显示名和 id，不存邮箱等 PII。
+    realm：登录时指定的区域（cn/intl），写入账号字段供按 realm 路由；缺省 DEFAULT_REALM。
     """
     if not isinstance(dev, dict):
         return None
@@ -815,6 +1048,9 @@ def _account_from_device_token(dev, machine=None):
             exp = time.time() + float(dev["expires_in"])
         except Exception:
             exp = None
+    r = (realm or dev.get("realm") or DEFAULT_REALM).strip().lower()
+    if r not in REALM_CONFIGS:
+        r = DEFAULT_REALM
     acct = {
         "token": token,
         "refreshToken": (dev.get("refresh_token") or dev.get("device_refresh_token")
@@ -833,6 +1069,7 @@ def _account_from_device_token(dev, machine=None):
         "cosyVersion": os.environ.get("QODER_COSY_VERSION", "1.1.69"),
         "captured_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "login": "device",
+        "realm": r,
     }
     for k in ("machineId", "machineToken", "machineType", "machineCode"):
         acct[k] = (machine or {}).get(k) or ""
@@ -863,10 +1100,14 @@ def _consume_login_lines(lines, on_auth_url=None, deadline=None):
     raise LoginError("签名器没有返回 token（未授权、超时或 sidecar 已退出）")
 
 
-def _cmd_login(_args=None, popen=None, open_url=None, new_device=False):
+def _cmd_login(_args=None, popen=None, open_url=None, new_device=False, realm=None):
     """设备码登录：打印/打开授权链接 → sidecar 轮询 → token 入池。
-    new_device=True 时强制生成新设备 ID（不用本机的），用于多账号隔离。"""
-    site = getattr(_args, "site", None) or SITE
+    new_device=True 时强制生成新设备 ID（不用本机的），用于多账号隔离。
+    realm：按区域选签名器 bundle 和授权页（cn/intl）；缺省 DEFAULT_REALM。"""
+    realm = (realm or getattr(_args, "realm", None) or DEFAULT_REALM).strip().lower()
+    if realm not in REALM_CONFIGS:
+        realm = DEFAULT_REALM
+    site = getattr(_args, "site", None) or _site_url(realm)
     client_id = getattr(_args, "client_id", None)
     machine = {} if new_device else _machine_identity()
     spawn = popen or (lambda argv, **kw: subprocess.Popen(
@@ -874,11 +1115,12 @@ def _cmd_login(_args=None, popen=None, open_url=None, new_device=False):
         text=True, encoding="utf-8", bufsize=1, cwd=HERE))
     opener = open_url or webbrowser.open
     try:
-        proc = spawn(_device_login_argv(machine, site=site, client_id=client_id))
+        proc = spawn(_device_login_argv(machine, site=site, client_id=client_id, realm=realm))
     except Exception as e:
         _print_err("启动签名器失败: %s" % e)
-        _print_err("--login 需要 node 和 qoder_sign.mjs"
-                   "（可用 QODER_PROXY_NODE / QODER_SIGN_JS 指定路径）")
+        _print_err("--login 需要 node 和 %s"
+                   "（可用 QODER_PROXY_NODE / QODER_SIGN_JS 指定路径）"
+                   % get_realm_config(realm)["sign_js"])
         return 1
 
     def _show(url):
@@ -907,7 +1149,7 @@ def _cmd_login(_args=None, popen=None, open_url=None, new_device=False):
                 proc.kill()
             except Exception:
                 pass
-    acct = _account_from_device_token(dev, machine)
+    acct = _account_from_device_token(dev, machine, realm=realm)
     if not acct:
         _print_err("授权结果里没有 token，请重新 --login")
         return 1
@@ -948,8 +1190,9 @@ def _acct_cooling(a, now):
     return bool(until) and now < until
 
 
-def _next_account():
+def _next_account(realm=None):
     """轮询取一个可用账号；全不可用时退回第一个（让上游告诉我们到底行不行）。
+    realm：按区域过滤账号（cn/intl 各自轮询）；缺省取全部。
 
     指针自增必须在 _pool_lock 里：代理是 ThreadingHTTPServer，一个请求一个线程，
     锁外自增会让两个线程算出同一个 _rr、拿到同一个号，配额分布就歪了。
@@ -957,6 +1200,8 @@ def _next_account():
     global _rr
     with _pool_lock:
         accs = list(_load_pool_locked())
+        if realm:
+            accs = [a for a in accs if _realm_of(a) == realm]
         if not accs:
             return None
         now = time.time()
@@ -982,7 +1227,7 @@ def _refresh_account_once(acct, force=False):
         return acct
     body = {"refresh_token": rt}
     body.update(_refresh_device_fields(acct))
-    st, js = _openapi_json("POST", REFRESH_PATH, body)
+    st, js = _openapi_json("POST", REFRESH_PATH, body, realm=_realm_of(acct))
     if st == 200 and isinstance(js, dict) and (js.get("device_token") or js.get("token")):
         patch = {
             "token": js.get("device_token") or js.get("token"),
@@ -1045,10 +1290,11 @@ def _refresh_account(acct, force=False):
             _refreshing.discard(label)
 
 
-def _read_session():
-    """取一个可发请求的账号：轮询 + 临期自动续期 + 过期账号按需续一次。"""
+def _read_session(realm=None):
+    """取一个可发请求的账号：轮询 + 临期自动续期 + 过期账号按需续一次。
+    realm：按区域选账号（cn/intl 各自轮询）；缺省取全部。"""
     _sweep_due()
-    acct = _next_account()
+    acct = _next_account(realm)
     if acct is None:
         return None
     now = time.time()
@@ -1063,7 +1309,7 @@ def _read_session():
 # 注意：这里的 GATEWAY / INFER_PATH / INFER_QUERY 是 "/algo" 之前的相对形态，与文件
 # 顶部那组同名常量取值不同，所以带 _COSY_ 前缀，别改回去。
 COSY_VERSION = "1.1.69"
-_COSY_GATEWAY = "https://gateway.qoder.com.cn"
+_COSY_GATEWAY = "https://api3.qoder.sh"
 _COSY_INFER_PATH = "/api/v2/service/pro/sse/agent_chat_generation"
 _COSY_INFER_QUERY = "FetchKeys=llm_model_result&AgentId=agent_common&Encode=1"
 
@@ -1349,7 +1595,7 @@ class CosyContext:
         return out
 
 
-# ── 签名 sidecar（qoder_sign.mjs）────────────────────────────────────────────
+# ── 签名 sidecar（qoder_intl_sign.mjs）────────────────────────────────────────────
 class SignerError(Exception):
     pass
 
@@ -1373,8 +1619,8 @@ class _Signer:
             raise SignerError("找不到签名器 %s" % SIGN_JS)
         node = NODE
         if not shutil.which(node):
-            raise SignerError("找不到 node（%s）。Qoder CN 的签名在客户端 WASM 里，"
-                              "需要 Node 运行 qoder_sign.mjs" % node)
+            raise SignerError("找不到 node（%s）。Qoder 国际版的签名在客户端 WASM 里，"
+                              "需要 Node 运行 qoder_intl_sign.mjs" % node)
         self._proc = subprocess.Popen(
             [node, SIGN_JS], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL, bufsize=0, encoding="utf-8", cwd=HERE)
@@ -1590,7 +1836,7 @@ class _AutoSigner:
 
     def describe(self):
         if self.mode == "node":
-            return "qoder_sign.mjs（node 子进程）"
+            return "qoder_intl_sign.mjs（node 子进程）"
         if self.mode == "py":
             return self._native.describe()
         return "纯 Python 优先（内联 Cosy 实现；node 仅回落）"
@@ -1737,6 +1983,7 @@ def _normalize_models(raw):
                 "default": bool(m.get("is_default")),
                 "enabled": bool(m.get("enable", True)),
                 "ctx": ctx,
+                "max_output_tokens": int(m.get("max_output_tokens") or 0),
                 "price_factor": m.get("price_factor"),
                 "format": m.get("format") or "openai",
                 "scene": scene,
@@ -1754,7 +2001,7 @@ def _fetch_models(force=False):
     acct = _read_session()
     if acct is None:
         raise RuntimeError("账号池为空：先运行 python qoder_proxy.py --capture")
-    params = {"endpoint": GATEWAY, "path": MODEL_LIST_PATH, "method": "GET"}
+    params = {"endpoint": _gw(_realm_of(acct)), "path": MODEL_LIST_PATH, "method": "GET"}
     _log("拉取模型清单")
     status, resp = _signed_send(acct, params)
     try:
@@ -1798,7 +2045,7 @@ def _resolve_model(name):
 def _session_id(acct):
     """同一账号稳定复用同一 session_id（上游按它做上下文与计费聚合）。"""
     seed = "%s:%s" % (_label_of(acct), acct.get("session_seed") or "")
-    return str(uuid.uuid5(uuid.NAMESPACE_URL, "qoder-proxy:" + seed))
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, "qoder-intl-proxy:" + seed))
 
 
 # 思考深度：与客户端一致的档位表与预算换算（bundle: Ujc 表 / s_() 分段）。
@@ -1936,34 +2183,99 @@ def _thinking_upstream(oa, model):
     return effort, params
 
 
+def _content_text(content):
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for p in content:
+            if isinstance(p, str):
+                parts.append(p)
+            elif isinstance(p, dict) and isinstance(p.get("text"), str):
+                parts.append(p["text"])
+        return "\n".join(parts)
+    return ""
+
+
 def _build_infer_payload(oa, model, acct):
+    """国际版网关的 v3 请求体（对齐客户端 bundle 里的 y4e 构造）。
+
+    和 CN 版不同，国际版必须带 chat_task / chat_context / agent_id / version，
+    否则会被 agent_router 以 "flow nodes found" 拒绝（HTTP 200 信封里的 400）。
+    """
     mid = str(uuid.uuid4())
-    payload = {
-        "session_id": _session_id(acct),
+    session_id = _session_id(acct)
+    messages = oa.get("messages") or []
+    think_effort, think_params = _thinking_upstream(oa, model)
+    is_reasoning = bool(model.get("reasoning")) and think_effort != "none"
+
+    user_text = ""
+    for m in reversed(messages):
+        if isinstance(m, dict) and m.get("role") == "user":
+            user_text = _content_text(m.get("content"))
+            break
+    system_text = "\n\n".join(
+        _content_text(m.get("content")) for m in messages
+        if isinstance(m, dict) and m.get("role") == "system")
+
+    params = {}
+    for key in ("temperature", "top_p", "tool_choice"):
+        if oa.get(key) is not None:
+            params[key] = oa[key]
+    max_tokens = oa.get("max_tokens")
+    if not isinstance(max_tokens, int) or isinstance(max_tokens, bool) or max_tokens <= 0:
+        max_tokens = int(model.get("max_output_tokens") or 0) or 32000
+    params["max_tokens"] = max_tokens
+    base = oa.get("parameters")
+    if isinstance(base, dict):
+        params.update(base)
+    if think_params:
+        params.update(think_params)
+
+    return {
         "request_id": mid,
         "request_set_id": mid,
-        "source_session_id": _session_id(acct),
-        "scene": SCENE,
-        "messages": oa.get("messages") or [],
-        "model_config": {"key": model["key"], "source": model.get("source") or "system"},
-        "business": {"type": BUSINESS_TYPE, "product": BUSINESS_PRODUCT},
+        "chat_record_id": mid,
+        "session_id": session_id,
         "stream": True,
+        "chat_task": "FREE_INPUT",
+        "chat_context": {
+            "text": user_text,
+            "features": [],
+            "extra": {
+                "context": [],
+                "modelConfig": {"key": model["key"], "is_reasoning": is_reasoning},
+                "originalContent": user_text,
+            },
+            "chatPrompt": "",
+            "imageUrls": None,
+        },
+        "is_reply": True,
+        "is_retry": False,
+        "source": 1,
+        "version": "3",
+        "agent_id": "agent_common",
+        "task_id": "common",
+        "session_type": SESSION_TYPE,
+        "aliyun_user_type": "",
+        "model_config": {
+            "key": model["key"],
+            "display_name": model.get("name") or model["key"],
+            "model": "",
+            "format": model.get("format") or "openai",
+            "is_vl": bool(model.get("vision")),
+            "is_reasoning": is_reasoning,
+            "api_key": "",
+            "url": "",
+            "source": model.get("source") or "system",
+            "max_input_tokens": int(model.get("ctx") or 0) or 200000,
+        },
+        "system": system_text,
+        "messages": messages,
+        "tools": oa.get("tools") or [],
+        "parameters": params,
+        "business": {"type": BUSINESS_TYPE, "product": BUSINESS_PRODUCT},
     }
-    for k in ("tools", "tool_choice", "temperature", "top_p", "max_tokens", "stop",
-              "presence_penalty", "frequency_penalty", "seed", "response_format"):
-        if oa.get(k) is not None:
-            payload[k] = oa[k]
-    think_effort, think_params = _thinking_upstream(oa, model)
-    if think_effort:
-        payload["reasoningEffort"] = think_effort
-    if think_params:
-        base = oa.get("parameters")
-        merged = dict(base) if isinstance(base, dict) else {}
-        merged.update(think_params)
-        payload["parameters"] = merged
-    if payload["model_config"].get("key") in (None, "auto", ""):
-        payload["model_config"]["key"] = DEFAULT_MODEL
-    return payload
 
 
 def _unwrap_frame(data_text):
@@ -2042,7 +2354,7 @@ def _iter_upstream(resp):
 
 
 # ── 协议层：与 codearts_proxy.py 共用 llm_proxy_core，不再各写一份 ──────────────
-# 保留原有函数名，是为了让既有调用点和 test_qoder_proxy.py 的用例继续按老名字打。
+# 保留原有函数名，是为了让既有调用点和 test_qoder_intl_proxy.py 的用例继续按老名字打。
 # aggregate_sse 取"恒返回 dict"那个入口：_complete() 直接 merged["choices"][0]，不能给它 None。
 aggregate_sse = C.aggregate_sse
 convert_anthropic_to_openai = C.anthropic_to_openai
@@ -2116,7 +2428,7 @@ def _backoff_sleep(n):
 RETRY_STATUS = (502, 503, 504)
 
 
-def _open_upstream(oa, model):
+def _open_upstream(oa, model, realm=None):
     """签名 + 发上游。
 
       401/403   → 标记账号失效，换号
@@ -2126,6 +2438,7 @@ def _open_upstream(oa, model):
       SignerError → 直接 502：本地签名坏了，换号或重试都没意义
 
     重试只发生在拿到响应头之前，流一旦开始就不在这条路上，不会向客户端重复输出。
+    realm：按区域选账号（cn/intl 各自轮询）；缺省取全部（按账号自身 realm 路由端点）。
     """
     with _pool_lock:
         n_acc = len(_load_pool_locked())
@@ -2133,10 +2446,10 @@ def _open_upstream(oa, model):
     switches = max(2, min(n_acc, 4))
     retried = 0
     while switches > 0:
-        acct = _read_session()
+        acct = _read_session(realm)
         if acct is None:
             raise ProxyError(401, "账号池为空：先运行 python qoder_proxy.py --capture")
-        params = {"endpoint": GATEWAY, "method": "POST", "path": INFER_PATH,
+        params = {"endpoint": _gw(_realm_of(acct)), "method": "POST", "path": INFER_PATH,
                   "infer": {"model": model["key"], "source": model.get("source") or "system"},
                   "body": _build_infer_payload(oa, model, acct)}
         try:
@@ -2185,14 +2498,19 @@ def _open_upstream(oa, model):
     raise last or ProxyError(502, "上游请求失败")
 
 
-# ── 管理面板与多 Key 鉴权（qoder_admin 集成）─────────────────────────────────
+# ── 管理层：qoder_admin 集成（多 Key 鉴权 / 管理 API / 模型映射）──────────────
+# qoder_admin.py 是双代理共享的管理层（纯标准库、框架无关）；本段把它的
+# KeyStore / AdminApi 接进国际版代理的现有函数。约定：
+#   * 账号在管理 API 里的 id = 账号标签（_label_of，即池内 account 字段）
+#   * KeyStore 空 且配了 QODER_PROXY_API_KEY 时走单 Key 兼容；都没配不鉴权
+#   * adapters 全部是本模块函数，上游交互复用签到/续期/签名链路
+
 _key_store = None
 _key_store_lock = threading.Lock()
-_admin_api = None
 
 
 def _get_key_store():
-    """KeyStore 惰性单例（读不到文件就是空库，首次建 key 才落盘）。"""
+    """KeyStore 单例（懒加载；测试可整只替换 _key_store 注入）。"""
     global _key_store
     if _key_store is None:
         with _key_store_lock:
@@ -2201,360 +2519,393 @@ def _get_key_store():
     return _key_store
 
 
-def _get_admin_api():
-    """AdminApi 单例；ADMIN_PASSWORD / KeyStore 被替换（测试或热改配置）时自动重建。"""
-    global _admin_api
-    ks = _get_key_store()
-    pw = ADMIN_PASSWORD or ""
-    api = _admin_api
-    if api is not None and api.admin_password == pw and api.key_store is ks:
-        return api
-    api = QA.AdminApi(ks, pw, adapters=_build_admin_adapters())
-    _admin_api = api
-    return api
+def _check_key_auth(candidates):
+    """数据面鉴权判定（Handler._check_api_key 的纯逻辑部分，便于离线单测）。
+
+    优先级：KeyStore 多 Key → 单 Key env 兼容 → 不鉴权。
+    candidates 是按优先级排的候选明文（Authorization Bearer 值、X-Api-Key 值）。
+    返回 (ok, status, message, err_type)：ok=True 时后三个为占位值。
+    """
+    try:
+        has_keys = bool(_get_key_store().list())
+    except Exception:
+        has_keys = False
+    if has_keys:
+        for raw in candidates:
+            if not raw:
+                continue
+            record, allowed = _get_key_store().lookup(raw)
+            if record is not None:
+                if allowed:
+                    return True, 0, "", ""
+                return False, 429, "当日调用次数已用尽（该 Key 的 max_calls）", \
+                    "rate_limit_exceeded"
+        return False, 401, "missing or invalid API key", "invalid_api_key"
+    if not API_KEY:
+        return True, 0, "", ""
+    for raw in candidates:
+        if raw and secrets.compare_digest(raw, API_KEY):
+            return True, 0, "", ""
+    return False, 401, "missing or invalid API key", "invalid_api_key"
 
 
-def _account_admin_id(a, seq):
-    """管理端账号公开 id：uid 前 8 位；无 uid 退回稳定序号 acct-NN。"""
-    uid = str(a.get("uid") or "").strip()
-    if uid:
-        return uid[:8]
-    return "acct-%02d" % seq
+# 今日请求计数（LLM 数据面）：stats 面板用；UTC 日切，进程内存，重启归零。
+# total_tokens 没有计量来源，恒 0 —— 不虚构。
+_req_stats = {"date": "", "requests": 0}
+_req_stats_lock = threading.Lock()
+# 兼容旧测试（国内版用 _usage_stats/{date:{requests,total_tokens}}，intl 版用 _req_stats；
+# 这里提供空 dict + lock 别名供测试 clear，实际统计走 _req_stats/_bump_req_stats）
+_usage_stats = {}
+_usage_stats_lock = _req_stats_lock
 
 
-def _adm_account_row(a, aid):
-    """账号公开视图（对齐 CF publicAccount 口径：不含任何 token 字段）。"""
-    now = time.time()
+def _bump_req_stats():
+    today = time.strftime("%Y-%m-%d", time.gmtime())
+    with _req_stats_lock:
+        if _req_stats["date"] != today:
+            _req_stats["date"] = today
+            _req_stats["requests"] = 0
+        _req_stats["requests"] += 1
+
+
+def _req_stats_snapshot():
+    today = time.strftime("%Y-%m-%d", time.gmtime())
+    with _req_stats_lock:
+        if _req_stats["date"] != today:
+            return {"requests": 0, "total_tokens": 0}
+        return {"requests": _req_stats["requests"], "total_tokens": 0}
+
+
+# ── 模型映射（mappings 链式改写 + aliases 假名）──────────────────────────────
+_model_routes = {"mappings": {}, "aliases": {}, "mtime": 0.0}
+_model_routes_lock = threading.RLock()
+
+
+def _norm_route_map(obj):
+    """路由表规范化：非 dict → {}；键值转 str、去空白、丢空键/空值。"""
+    if not isinstance(obj, dict):
+        return {}
+    out = {}
+    for k, v in obj.items():
+        ks, vs = str(k).strip(), str(v).strip()
+        if ks and vs:
+            out[ks] = vs
+    return out
+
+
+def _load_model_routes_locked():
+    """路由文件热加载（mtime 变了重读；手工编辑与管理 API 写盘都走得通）。"""
+    try:
+        mtime = os.path.getmtime(MODEL_ROUTES_FILE)
+    except Exception:
+        _model_routes.update(mappings={}, aliases={}, mtime=0.0)
+        return _model_routes
+    if mtime != _model_routes["mtime"]:
+        data = _read_json_file(MODEL_ROUTES_FILE) or {}
+        mappings = data.get("mappings") if isinstance(data, dict) else None
+        aliases = data.get("aliases") if isinstance(data, dict) else None
+        _model_routes["mappings"] = _norm_route_map(mappings)
+        _model_routes["aliases"] = _norm_route_map(aliases)
+        _model_routes["mtime"] = mtime
+    return _model_routes
+
+
+def _save_model_routes_locked():
+    """原子写路由文件（tmp + replace + 0600，参照 _save_pool_locked）。"""
+    tmp = MODEL_ROUTES_FILE + ".tmp"
+    os.makedirs(os.path.dirname(os.path.abspath(MODEL_ROUTES_FILE)), exist_ok=True)
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump({"mappings": _model_routes["mappings"],
+                   "aliases": _model_routes["aliases"]},
+                  f, ensure_ascii=False, indent=2)
+    os.replace(tmp, MODEL_ROUTES_FILE)
+    try:
+        _model_routes["mtime"] = os.path.getmtime(MODEL_ROUTES_FILE)
+    except Exception:
+        pass
+
+
+def _route_model_name(raw):
+    """模型名路由：aliases 先（一次替换）、mappings 后（链式跟进，防环 8 跳）。
+    未命中原样透传；纯本地查表，不依赖模型清单、不触网。"""
+    name = str(raw or "").strip()
+    if not name:
+        return raw
+    with _model_routes_lock:
+        routes = _load_model_routes_locked()
+        routed = routes["aliases"].get(name, name)
+        seen = set()
+        for _ in range(8):        # 链深上限：到顶即停，环不会死循环
+            nxt = routes["mappings"].get(routed)
+            if nxt is None or routed in seen:
+                break
+            seen.add(routed)
+            routed = nxt
+    return routed
+
+
+def _model_route_entries(upstream_list, created):
+    """/v1/models 的附加条目：aliases 假名与 mappings 源名（客户端可请求的
+    额外名字），元数据取"路由后最终目标"的模型（假名常指向中间名，再经
+    mappings 链落到真实上游模型）；最终目标不在上游清单的悬空映射不虚构条目。"""
+    with _model_routes_lock:
+        routes = _load_model_routes_locked()
+        alias_map = dict(routes["aliases"])
+        mapping_map = dict(routes["mappings"])
+    base_by_key = {m["key"].lower(): m for m in upstream_list}
+    entries, seen = [], set()
+    for name, kind in ([(a, "alias") for a in alias_map]
+                       + [(m, "mapping") for m in mapping_map]):
+        low = str(name).lower()
+        if low in seen or low in base_by_key:
+            continue
+        base = base_by_key.get(str(_route_model_name(name)).lower())
+        if base is None:
+            continue          # 悬空映射：最终目标不在上游清单，不虚构条目
+        entries.append({
+            "id": name, "object": "model", "created": created,
+            "owned_by": "qoder-intl", "name": base["name"],
+            "context_window": base["ctx"], "reasoning": base["reasoning"],
+            "vision": base["vision"],
+            "metadata": {"display_name": base["name"], "source": kind,
+                         "target": base["key"]}})
+        seen.add(low)
+    return entries
+
+
+# ── AdminApi adapters（把现有函数接进 qoder_admin.AdminApi）─────────────────
+
+def _admin_account_row(a, counts=None, now=None):
+    """账号公开视图（admin 页面 renderAccounts 需要的字段；不回显 token）。"""
+    label = _label_of(a)
     exp = a.get("exp")
+    now = time.time() if now is None else now
     return {
-        "id": aid,
-        "label": _label_of(a),
-        "uid": str(a.get("uid") or ""),
-        "display_name": str(a.get("displayName") or ""),
+        "id": label,
+        "label": label,
+        "uid": a.get("uid") or "",
         "expires_at": a.get("expiresAt") or "",
-        "expires_ts": int(exp) if exp else 0,
-        "expired": bool(exp and exp < now),
+        "exp": exp,
+        "left_days": round((exp - now) / 86400, 1) if exp else None,
         "has_refresh": bool(a.get("refreshToken")),
         "refresh_dead": bool(a.get("refresh_dead")),
         "failed_at": a.get("failed_at") or 0,
         "failed_status": a.get("failed_status"),
-        "cooling": bool(a.get("cool_until") and now < a["cool_until"]),
-        "machine_id": str(a.get("machineId") or "")[:8],
+        "machine_id": _redact(a.get("machineId"), 6),
+        "device": _device_state(a, counts if counts is not None else {}),
     }
 
 
-def _adm_account_rows():
+def _admin_list_accounts():
     with _pool_lock:
         accs = list(_load_pool_locked())
-    return [_adm_account_row(a, _account_admin_id(a, i))
-            for i, a in enumerate(accs, 1)]
+    counts = _device_counts(accs)
+    now = time.time()
+    return [_admin_account_row(a, counts, now) for a in accs]
 
 
-def _find_account_by_admin_id(aid):
-    """管理端账号 id（uid 前 8 / 标签 / acct-NN 序号）→ 池内记录。"""
-    with _pool_lock:
-        accs = list(_load_pool_locked())
-    want = str(aid or "")
-    for a in accs:
-        uid = str(a.get("uid") or "").strip()
-        if uid and uid[:8] == want:
-            return a
-    for a in accs:
-        if _label_of(a) == want:
-            return a
-    if want.startswith("acct-"):
-        try:
-            idx = int(want[5:]) - 1
-        except ValueError:
-            idx = -1
-        if 0 <= idx < len(accs):
-            return accs[idx]
-    return None
-
-
-def _adm_latest_checkins():
-    """今日签到摘要（读 CHECKIN_STATE_FILE，不虚构逐号明细：状态文件只有汇总口径）。"""
+def _admin_latest_checkins():
+    """签到摘要（读签到状态文件）。状态文件按天存全池汇总（不分号），按此汇报，
+    不虚构分号明细；过期日期不展示。"""
     st = _read_checkin_state()
-    today = time.strftime("%Y-%m-%d", time.localtime())
-    if not st or st.get("date") != today:
+    today = time.strftime("%Y-%m-%d")
+    if not isinstance(st, dict) or st.get("date") != today:
         return []
-    secured = int(st.get("secured_accounts") or 0)
-    total = int(st.get("pool_accounts") or 0)
-    done = bool(st.get("done"))
     return [{
-        "account_id": "all",
-        "label": "每日 Credits 汇总",
-        "status": "done" if done else ("partial" if secured else "pending"),
-        "secured": bool(total) and secured >= total,
-        "amount": 100 * secured,
-        "message": "已到位 %d/%d，attempts=%s" % (secured, total, st.get("attempts", 0)),
-        "updated_at": st.get("last_at") or "",
+        "account_id": "*",
+        "label": "全池汇总",
+        "secured": bool(st.get("done")),
+        "status": "ok" if st.get("last_all_ok") else "failed",
+        "amount": 100 * int(st.get("secured_accounts") or 0),
+        "add_on_total": None,
+        "message": "已到位 %s/%s（尝试 %s 次，done=%s）" % (
+            st.get("secured_accounts"), st.get("pool_accounts"),
+            st.get("attempts"), st.get("done")),
+        "updated_at": st.get("last_at"),
     }]
 
 
-def _adm_patch_account(aid, fields):
-    a = _find_account_by_admin_id(aid)
-    if a is None:
-        return None
-    # 白名单；token 类敏感字段允许设置（管理端自用）。label 语义映射到池的 account 字段。
-    patch = {}
-    for k, v in (fields or {}).items():
-        if k == "label":
-            if v:
-                patch["account"] = str(v)[:120]
-        elif k in ("displayName", "uid", "organizationId", "note",
-                   "token", "refreshToken", "expiresAt", "session_seed",
-                   "machineId", "machineToken", "machineType", "machineCode"):
-            patch[k] = v
-    if "expiresAt" in patch:
-        patch["exp"] = _parse_exp(patch["expiresAt"]) or 0
-    old_label = _label_of(a)
-    if patch:
-        _update_account(old_label, patch)
-    fresh = _pooled_account(patch.get("account") or old_label, a)
-    return _adm_account_row(fresh, aid)
-
-
-def _adm_delete_account(aid):
-    a = _find_account_by_admin_id(aid)
-    removed = False
-    if a is not None:
-        with _pool_lock:
-            accs = _load_pool_locked()
-            keep = [x for x in accs if _label_of(x) != _label_of(a)]
-            removed = len(keep) < len(accs)
-            if removed:
-                _pool["accounts"] = keep
-                _save_pool_locked()
-    return {"ok": True, "deleted": removed}
-
-
-def _adm_import_accounts(items):
-    """逐个入池（token 必填；缺失时记 skipped 不中断整批）。"""
-    added, skipped = [], 0
-    for it in items or []:
-        if not isinstance(it, dict):
+def _admin_import_accounts(items):
+    """导入账号（token 必填）；同标签覆盖旧记录（_add_session_to_pool 语义）。"""
+    imported = updated = skipped = 0
+    out = []
+    for it in items if isinstance(items, list) else []:
+        if not isinstance(it, dict) or not str(it.get("token") or "").strip():
             skipped += 1
-            continue
-        token = it.get("token") or it.get("accessToken") or it.get("device_token")
-        if not token:
-            skipped += 1
+            out.append({"error": "missing token"})
             continue
         acct = dict(it)
-        acct["token"] = token
-        acct.pop("accessToken", None)
-        acct.pop("device_token", None)
-        if not acct.get("exp"):
-            acct["exp"] = _parse_exp(acct.get("expiresAt")) or 0
-        label = _add_session_to_pool(acct)
-        added.append({"label": label, "action": "imported"})
-    return {"ok": True, "imported": len(added), "updated": 0, "skipped": skipped,
-            "items": added}
+        label = _label_of(acct)
+        with _pool_lock:
+            existed = any(_label_of(a) == label for a in _load_pool_locked())
+        final = _add_session_to_pool(acct)
+        if existed:
+            updated += 1
+            action = "updated"
+        else:
+            imported += 1
+            action = "imported"
+        out.append({"id": final, "label": final, "action": action})
+    return {"imported": imported, "updated": updated, "skipped": skipped,
+            "items": out}
 
 
-def _adm_checkin_account(aid):
-    a = _find_account_by_admin_id(aid)
-    if a is None:
+_ADMIN_ACCOUNT_READONLY = ("account", "session_seed")
+
+
+def _admin_patch_account(aid, fields):
+    """按标签改账号字段；account/session_seed 由入池逻辑管理，不接受外部改。"""
+    if not isinstance(fields, dict):
         return None
-    try:
-        ok, rep = _checkin_account(a)
-    except Exception as e:
-        return {"ok": False, "account": _label_of(a),
-                "rep": {"secured": False, "message": str(e)}}
-    return {"ok": bool(ok), "account": _label_of(a), "rep": rep}
-
-
-def _adm_refresh_account(aid):
-    a = _find_account_by_admin_id(aid)
-    if a is None:
-        return None
-    try:
-        fresh = _refresh_account(a, force=True)
-    except Exception as e:
-        raise ProxyError(502, "续期失败: %s" % e)
-    return {"ok": not fresh.get("refresh_dead"),
-            "expires_at": fresh.get("expiresAt") or "",
-            "refresh_dead": bool(fresh.get("refresh_dead")),
-            "error": fresh.get("refresh_error") or ""}
-
-
-def _adm_test_account(aid):
-    a = _find_account_by_admin_id(aid)
-    if a is None:
-        return None
-    params = {"endpoint": GATEWAY, "path": MODEL_LIST_PATH, "method": "GET"}
-    try:
-        status, resp = _signed_send(a, params)
-    except SignerError as e:
-        raise ProxyError(502, "签名失败: %s" % e)
-    except Exception as e:
-        raise ProxyError(502, "上游请求失败: %s" % e)
-    try:
-        raw = resp.read().decode("utf-8", "replace")
-    finally:
-        try:
-            resp.close()
-        except Exception:
-            pass
-    if status != 200:
-        raise ProxyError(502, "上游 HTTP %s: %s" % (status, raw[:200]))
-    try:
-        lst = _normalize_models(json.loads(raw))
-    except Exception:
-        raise ProxyError(502, "上游模型清单解析失败")
-    return {"ok": True, "models": len(lst), "account": _label_of(a)}
-
-
-# 近似用量计数：内存累计（重启清零），够管理面板看今日/趋势，不做落盘机制
-_usage_stats = {}                # {date: {"requests": int, "total_tokens": int}}
-_usage_stats_lock = threading.Lock()
-
-
-def _bump_usage(total_tokens=0):
-    day = time.strftime("%Y-%m-%d", time.localtime())
-    with _usage_stats_lock:
-        row = _usage_stats.setdefault(day, {"requests": 0, "total_tokens": 0})
-        row["requests"] += 1
-        row["total_tokens"] += int(total_tokens or 0)
-
-
-def _adm_stats():
-    day = time.strftime("%Y-%m-%d", time.localtime())
-    with _usage_stats_lock:
-        today = dict(_usage_stats.get(day) or {"requests": 0, "total_tokens": 0})
-        trend = []
-        for i in range(6, -1, -1):
-            d = time.strftime("%Y-%m-%d", time.localtime(time.time() - i * 86400))
-            r = _usage_stats.get(d) or {"requests": 0, "total_tokens": 0}
-            trend.append({"date": d, "requests": r["requests"],
-                          "total_tokens": r["total_tokens"]})
+    patch = {k: v for k, v in fields.items()
+             if k not in _ADMIN_ACCOUNT_READONLY}
     with _pool_lock:
-        n_acc = len(_load_pool_locked())
-    st = _read_checkin_state()
-    checkins = int(st.get("secured_accounts") or 0) if st.get("date") == day else 0
-    return {"today": today, "trend": trend, "accounts": n_acc,
-            "keys": len(_get_key_store().list()),
-            "models": len(_models["list"]), "checkins": checkins}
+        accs = _load_pool_locked()
+        hit = next((a for a in accs if _label_of(a) == aid), None)
+    if hit is None:
+        return None
+    if patch:
+        _update_account(aid, patch)
+    merged = _pooled_account(aid)
+    if not merged:
+        return None
+    return _admin_account_row(merged)
 
 
-def _adm_list_models():
+def _admin_delete_account(aid):
+    """幂等删除（对齐 _cmd_remove 的池写回，但不打印）。"""
+    with _pool_lock:
+        accs = _load_pool_locked()
+        keep = [a for a in accs if _label_of(a) != aid]
+        if len(keep) != len(accs):
+            _pool["accounts"] = keep
+            _save_pool_locked()
+
+
+def _admin_test_account(aid):
+    """轻量上游探测：用该号签名拉一次模型清单。失败抛 KeyStoreError(status=502)，
+    AdminApi.handle 会带 status 回给客户端。"""
+    acct = _pooled_account(aid)
+    if not acct.get("token"):
+        return None
+    params = {"endpoint": _gw(_realm_of(acct)), "path": MODEL_LIST_PATH, "method": "GET"}
+    try:
+        status, resp = _signed_send(acct, params)
+        try:
+            raw = resp.read().decode("utf-8", "replace")
+        finally:
+            try:
+                resp.close()
+            except Exception:
+                pass
+    except Exception as e:
+        raise QA.KeyStoreError("账号测试失败: %s" % e, 502)
+    if status != 200:
+        raise QA.KeyStoreError("账号测试失败: 上游 HTTP %s" % status, 502)
+    try:
+        models = _normalize_models(json.loads(raw))
+    except Exception as e:
+        raise QA.KeyStoreError("账号测试失败: 模型清单解析失败 %s" % e, 502)
+    return {"ok": True, "models": len(models)}
+
+
+def _admin_refresh_account(aid):
+    """手动续期（force=True：按"续期"按钮语义直接刷，不看临期阈值）。"""
+    acct = _pooled_account(aid)
+    if not acct.get("token"):
+        return None
+    if not acct.get("refreshToken"):
+        return {"ok": False, "expires_at": acct.get("expiresAt") or "",
+                "refresh_dead": bool(acct.get("refresh_dead")),
+                "error": "该账号没有 refreshToken，无法续期"}
+    merged = _refresh_account(acct, force=True)
+    out = {
+        "ok": not merged.get("refresh_dead"),
+        "expires_at": merged.get("expiresAt") or "",
+        "refresh_dead": bool(merged.get("refresh_dead")),
+    }
+    if merged.get("refresh_error"):
+        out["error"] = merged["refresh_error"]
+    return out
+
+
+def _admin_checkin_account(aid):
+    """单号签到：回执 rep 含 secured/message（页面 toast 直接展示）。"""
+    acct = _pooled_account(aid)
+    if not acct.get("token"):
+        return None
+    ok, rep = _checkin_account(acct)
+    return {"ok": bool(ok), "rep": rep}
+
+
+def _admin_stats():
+    with _pool_lock:
+        n_accounts = len(_load_pool_locked())
+    return {
+        "today": _req_stats_snapshot(),
+        "trend": [],                       # 本地代理没有历史聚合，不虚构
+        "accounts": n_accounts,
+        "models": len(_models["list"]),
+        "checkins": _admin_latest_checkins(),
+        "gateway": GATEWAY,
+        "port": PORT,
+    }
+
+
+def _admin_list_models():
     try:
         cached = _fetch_models()
     except Exception as e:
-        return {"models": [], "updated_at": None, "error": str(e)}
-    rows = [{"id": m["key"], "name": m["name"], "ctx": m["ctx"],
-             "reasoning": m["reasoning"], "vision": m["vision"],
-             "enabled": m["enabled"], "default": m["default"],
-             "price_factor": m["price_factor"]} for m in cached["list"]]
-    return {"models": rows, "updated_at": int(cached["at"])}
+        raise QA.KeyStoreError("模型清单不可用: %s" % e, 502)
+    rows = [{"id": m["key"], "name": m["name"], "context_length": m["ctx"],
+             "max_output_tokens": m["max_output_tokens"],
+             "reasoning": m["reasoning"], "vision": m["vision"]}
+            for m in cached["list"]]
+    # updated_at 用毫秒（对齐页面 fmtTime(Math.floor(v/1000)) 的口径）
+    return {"models": rows, "updated_at": int(_models["at"] * 1000)}
 
 
-# ── 模型映射（mappings/aliases，管理端 /api/model-routes 读写）───────────────
-_model_routes_lock = threading.Lock()
-_model_routes = {"routes": {"mappings": {}, "aliases": {}}, "mtime": 0.0}
-
-
-def _get_model_routes():
-    """读模型路由（mtime 缓存热加载，形态对齐 _load_pool_locked）。"""
+def _admin_model_routes():
     with _model_routes_lock:
-        try:
-            mtime = os.path.getmtime(MODEL_ROUTES_FILE)
-        except OSError:
-            _model_routes["routes"] = {"mappings": {}, "aliases": {}}
-            _model_routes["mtime"] = 0.0
-            return _model_routes["routes"]
-        if mtime != _model_routes["mtime"]:
-            data = _read_json_file(MODEL_ROUTES_FILE)
-            mappings = data.get("mappings") if isinstance(data, dict) else None
-            aliases = data.get("aliases") if isinstance(data, dict) else None
-            _model_routes["routes"] = {
-                "mappings": {str(k): str(v) for k, v in mappings.items()}
-                            if isinstance(mappings, dict) else {},
-                "aliases": {str(k): str(v) for k, v in aliases.items()}
-                           if isinstance(aliases, dict) else {},
-            }
-            _model_routes["mtime"] = mtime
-        return _model_routes["routes"]
+        routes = _load_model_routes_locked()
+        return {"mappings": dict(routes["mappings"]),
+                "aliases": dict(routes["aliases"])}
 
 
-def _write_model_routes(routes):
-    """原子写路由文件并刷新内存缓存（管理端 PUT/PATCH 用）。"""
-    folder = os.path.dirname(os.path.abspath(MODEL_ROUTES_FILE))
-    os.makedirs(folder, exist_ok=True)
-    tmp = MODEL_ROUTES_FILE + ".tmp"
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        json.dump({"version": 1, "mappings": routes["mappings"],
-                   "aliases": routes["aliases"]}, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, MODEL_ROUTES_FILE)
+def _admin_patch_model_routes(body):
+    if not isinstance(body, dict):
+        return None
+    mappings = _norm_route_map(body.get("mappings"))
+    aliases = _norm_route_map(body.get("aliases"))
     with _model_routes_lock:
-        _model_routes["routes"] = {"mappings": dict(routes["mappings"]),
-                                   "aliases": dict(routes["aliases"])}
-        try:
-            _model_routes["mtime"] = os.path.getmtime(MODEL_ROUTES_FILE)
-        except OSError:
-            pass
+        _model_routes["mappings"] = mappings
+        _model_routes["aliases"] = aliases
+        _save_model_routes_locked()
+    return {"mappings": mappings, "aliases": aliases}
 
 
-def _apply_model_routes(name):
-    """请求侧模型名 resolve：先 aliases（假名→请求名）再 mappings（请求名→上游名），
-    支持链式（alias 命中结果继续过 mapping）；都不命中原样返回。"""
-    raw = str(name or "").strip()
-    if not raw:
-        return raw
-    routes = _get_model_routes()
-    hit = routes["aliases"].get(raw)
-    if hit:
-        raw = hit
-    hit = routes["mappings"].get(raw)
-    if hit:
-        raw = hit
-    return raw
-
-
-def _adm_model_routes():
-    r = _get_model_routes()
-    return {"mappings": dict(r["mappings"]), "aliases": dict(r["aliases"])}
-
-
-def _adm_patch_model_routes(body):
-    """全量替换（对齐 CF 页面 JS 的提交语义：整个 mappings/aliases 一起交）。"""
-    mappings_in = body.get("mappings") if isinstance(body, dict) else None
-    aliases_in = body.get("aliases") if isinstance(body, dict) else None
-    routes = {
-        "mappings": {str(k): str(v) for k, v in mappings_in.items()}
-                    if isinstance(mappings_in, dict) else {},
-        "aliases": {str(k): str(v) for k, v in aliases_in.items()}
-                   if isinstance(aliases_in, dict) else {},
-    }
-    _write_model_routes(routes)
-    return dict(routes)
-
-
-def _build_admin_adapters():
-    """把 qoder_admin 的 adapters 协议接到本模块现有函数上。"""
+def _admin_adapters():
     return {
-        "list_accounts": _adm_account_rows,
-        "latest_checkins": _adm_latest_checkins,
-        "import_accounts": _adm_import_accounts,
-        "patch_account": _adm_patch_account,
-        "delete_account": _adm_delete_account,
-        "test_account": _adm_test_account,
-        "refresh_account": _adm_refresh_account,
-        "checkin_account": _adm_checkin_account,
-        "stats": _adm_stats,
-        "list_models": _adm_list_models,
-        "model_routes": _adm_model_routes,
-        "patch_model_routes": _adm_patch_model_routes,
+        "list_accounts": _admin_list_accounts,
+        "latest_checkins": _admin_latest_checkins,
+        "import_accounts": _admin_import_accounts,
+        "patch_account": _admin_patch_account,
+        "delete_account": _admin_delete_account,
+        "test_account": _admin_test_account,
+        "refresh_account": _admin_refresh_account,
+        "checkin_account": _admin_checkin_account,
+        "stats": _admin_stats,
+        "list_models": _admin_list_models,
+        "model_routes": _admin_model_routes,
+        "patch_model_routes": _admin_patch_model_routes,
     }
 
 
-def _is_admin_path(raw_path):
-    """/admin、/admin/、/api、/api/* 归管理面；其余归 LLM 数据面。"""
-    path = raw_path.split("?", 1)[0]
-    if path.rstrip("/") == "/admin":
-        return True
-    return path == "/api" or path.startswith("/api/")
+def _admin_api():
+    """AdminApi 工厂（无状态：KeyStore 单例 + 当前 ADMIN_PASSWORD + adapters；
+    每次请求现取，测试里改全局即可生效）。"""
+    return QA.AdminApi(_get_key_store(), ADMIN_PASSWORD, _admin_adapters())
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -2583,38 +2934,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
         return self._json(code, {"error": {"message": str(message)[:600], "type": err_type}})
 
     def _check_api_key(self):
-        """LLM 数据面鉴权（失败时已回复，返回 False）：
-          1. KeyStore 有 key（qoder_admin 多 Key）→ lookup：不存在/禁用/过期 401、
-             当日超 max_calls 429（X-API-Key 与 Bearer 等价，CF 兼容）；
-          2. KeyStore 空 且设了 QODER_PROXY_API_KEY → 旧单 Key 逻辑（向后兼容）；
-          3. 两者都没配 → 不鉴权。"""
-        ks = _get_key_store()
-        try:
-            has_keys = bool(ks.list())
-        except Exception:
-            has_keys = False
+        """鉴权：多 Key（qoder_admin.KeyStore）优先；KeyStore 空且配了
+        QODER_PROXY_API_KEY 时走单 Key 兼容；都没配不鉴权。
+        失败时已回复，返回 False。"""
         authz = self.headers.get("Authorization") or ""
-        xkey = self.headers.get("X-Api-Key") or ""
-        if not has_keys:
-            if not API_KEY:
-                return True
-            ok = (authz.startswith("Bearer ") and secrets.compare_digest(authz[7:], API_KEY)) \
-                or (xkey and secrets.compare_digest(xkey, API_KEY))
-            if ok:
-                return True
-            self._err(401, "missing or invalid API key", "invalid_api_key")
-            return False
-        raw = authz[7:] if authz.startswith("Bearer ") else (xkey or "")
-        record, allowed = ks.lookup(raw)
-        if record is None:
-            self._err(401, "missing or invalid API key", "invalid_api_key")
-            return False
-        if not allowed:
-            self._err(429, "API key %r 当日调用次数已用尽（max_calls=%s），"
-                           "可在管理面板重置或调大" % (record.get("name"), record.get("max_calls")),
-                      "rate_limit_exceeded")
-            return False
-        return True
+        bearer = authz[7:].strip() if authz.startswith("Bearer ") else ""
+        xkey = (self.headers.get("X-Api-Key") or "").strip()
+        ok, status, message, err_type = _check_key_auth([bearer, xkey])
+        if ok:
+            return True
+        self._err(status, message, err_type)
+        return False
 
     def _read_json_body(self):
         length = int(self.headers.get("Content-Length") or 0)
@@ -2637,47 +2967,54 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self._err(400, message, "invalid_request_error")
         return None
 
-    # 管理面转接（qoder_admin.AdminApi.handle）：鉴权全由其内部处理
-    # （/admin 页面与 /api/auth/login 免 Bearer，其余 /api/* 校验管理密码）。
-    def _handle_admin(self, method):
-        if not _is_admin_path(self.path):
-            return False
-        try:
-            length = int(self.headers.get("Content-Length") or 0)
-        except ValueError:
-            length = 0
+    # 路由
+    def _maybe_admin(self):
+        """admin 路由（/admin 页面 + /api/* 管理 API）接管请求；其余返回 False。
+        admin 有自己的 Bearer 管理密码鉴权，不走数据面 _check_api_key。"""
+        path = self.path.split("?", 1)[0]
+        if path.startswith("/api") or path.rstrip("/") == "/admin":
+            self._handle_admin()
+            return True
+        return False
+
+    def _handle_admin(self):
+        """qoder_admin.AdminApi 薄转接：headers 直接传 email.message.Message
+        （qoder_admin 大小写不敏感取 Authorization）；path 过一道 unquote ——
+        账号标签带空格/中文时浏览器会 percent-encode，不解码就命中不了标签。"""
+        length = int(self.headers.get("Content-Length") or 0)
         if length > MAX_BODY_BYTES:
             _drain_body(self, length)
             self.close_connection = True
-            self._err(413, "请求体过大（%d > %d 字节）" % (length, MAX_BODY_BYTES))
-            return True
+            return self._err(413, "请求体过大（%d > %d 字节）" % (length, MAX_BODY_BYTES))
         body = self.rfile.read(length) if length else b""
-        status, headers, payload = _get_admin_api().handle(
-            method, self.path, self.headers, body)
+        try:
+            status, headers, payload = _admin_api().handle(
+                self.command, urllib.parse.unquote(self.path), self.headers, body)
+        except Exception as e:
+            _log("管理接口异常 %s %s: %r" % (self.command, self.path, e))
+            return self._err(500, "管理接口内部错误: %s" % e)
         self.send_response(status)
-        for k, v in (headers or {}).items():
+        for k, v in headers.items():
             self.send_header(k, v)
-        self.send_header("Content-Length", str(len(payload)))
         self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
         try:
             self.wfile.write(payload)
         except (BrokenPipeError, ConnectionResetError):
             pass
-        return True
 
-    # 路由
     def do_OPTIONS(self):
         self.send_response(204)
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods",
-                         "GET, POST, PUT, PATCH, DELETE, OPTIONS")
+                         "GET, POST, PATCH, PUT, DELETE, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "*")
         self.send_header("Content-Length", "0")
         self.end_headers()
 
     def do_GET(self):
-        if self._handle_admin("GET"):
+        if self._maybe_admin():
             return
         path = self.path.split("?")[0]
         if not self._check_api_key():
@@ -2693,7 +3030,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._err(500, "内部错误: %s" % e)
 
     def do_POST(self):
-        if self._handle_admin("POST"):
+        if self._maybe_admin():
             return
         path = self.path.split("?")[0]
         if not self._check_api_key():
@@ -2709,20 +3046,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
         return self._err(404, "支持: POST /v1/chat/completions, /v1/responses, "
                               "/v1/messages, /v1/messages/count_tokens")
 
-    def do_PUT(self):
-        if self._handle_admin("PUT"):
-            return
-        self._err(404, "PUT 仅用于管理接口 /api/model-routes")
-
     def do_PATCH(self):
-        if self._handle_admin("PATCH"):
+        if self._maybe_admin():
             return
-        self._err(404, "PATCH 仅用于管理接口 /api/*")
+        return self._err(404, "PATCH 仅用于 /api/* 管理接口")
+
+    def do_PUT(self):
+        if self._maybe_admin():
+            return
+        return self._err(404, "PUT 仅用于 /api/* 管理接口")
 
     def do_DELETE(self):
-        if self._handle_admin("DELETE"):
+        if self._maybe_admin():
             return
-        self._err(404, "DELETE 仅用于管理接口 /api/*")
+        return self._err(404, "DELETE 仅用于 /api/* 管理接口")
 
     # /health 只读本地状态：不启动 node、不打上游，保证秒回
     def _handle_health(self):
@@ -2759,7 +3096,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except Exception as e:
             return self._err(502, "模型清单获取失败: %s" % e)
         now = int(_models["at"])
-        data = [{"id": m["key"], "object": "model", "created": now, "owned_by": "qoder-cn",
+        data = [{"id": m["key"], "object": "model", "created": now, "owned_by": "qoder-intl",
                  "name": m["name"], "context_window": m["ctx"], "reasoning": m["reasoning"],
                  "vision": m["vision"],
                  "metadata": {"display_name": m["name"], "source": m["source"],
@@ -2767,34 +3104,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                               "enabled": m["enabled"], "scene": m["scene"],
                               "thinking_config": m["thinking_config"]}}
                 for m in cached["list"]]
-        # 模型映射：mapping 键（请求名）与 alias（假名）不在上游清单时补一行，
-        # 让客户端能从 /v1/models 发现这些可用的名字；标注 maps_to / alias_of。
-        routes = _get_model_routes()
-        seen = {m["id"] for m in data}
-        by_id = {m["id"]: m for m in data}
-        for req_name, upstream in sorted(routes["mappings"].items()):
-            if req_name in seen:
-                continue
-            base = by_id.get(upstream) or {}
-            data.append({"id": req_name, "object": "model", "created": now,
-                         "owned_by": "qoder-cn", "name": req_name,
-                         "context_window": base.get("context_window"),
-                         "reasoning": base.get("reasoning"), "vision": base.get("vision"),
-                         "metadata": dict(base.get("metadata") or {},
-                                          maps_to=upstream, kind="mapping")})
-            seen.add(req_name)
-        for alias, req_name in sorted(routes["aliases"].items()):
-            if alias in seen:
-                continue
-            target = routes["mappings"].get(req_name, req_name)  # 解析到最终上游名
-            base = by_id.get(target) or {}
-            data.append({"id": alias, "object": "model", "created": now,
-                         "owned_by": "qoder-cn", "name": alias,
-                         "context_window": base.get("context_window"),
-                         "reasoning": base.get("reasoning"), "vision": base.get("vision"),
-                         "metadata": dict(base.get("metadata") or {},
-                                          alias_of=req_name, maps_to=target, kind="alias")})
-            seen.add(alias)
+        data.extend(_model_route_entries(cached["list"], now))
         return self._json(200, {"object": "list", "data": data})
 
     def _handle_count_tokens(self):
@@ -2810,6 +3120,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         body = self._read_json_body()
         if body is None:
             return
+        _bump_req_stats()
         if protocol == "responses":
             oa = convert_responses_to_openai(body)
             if not body.get("input") and not body.get("messages"):
@@ -2819,7 +3130,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not oa.get("messages"):
                 return self._bad("缺少 messages")
         req_model = body.get("model") or DEFAULT_MODEL
-        req_model = _apply_model_routes(req_model)  # 假名/请求名 → 上游名（都不命中原样）
+        routed_model = _route_model_name(req_model)
         if not _models["list"]:
             try:
                 _fetch_models()
@@ -2828,7 +3139,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             except Exception as e:
                 _log("模型清单不可用，模型名原样透传: %s" % e)
         try:
-            model = _resolve_model(req_model)
+            model = _resolve_model(routed_model)
         except Exception as e:
             return self._err(502, "模型清单不可用: %s" % e)
         if model is None:
@@ -2839,7 +3150,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         oa["model"] = model["key"]
         is_stream = bool(oa.get("stream"))
         try:
-            _, resp = _open_upstream(oa, model)
+            # 请求级 realm 路由：X-Realm 头显式指定 cn/intl；缺省取全部（按账号自身 realm 走端点）
+            realm = (self.headers.get("X-Realm") or "").strip().lower()
+            if realm not in REALM_CONFIGS:
+                realm = None
+            _, resp = _open_upstream(oa, model, realm=realm)
         except ProxyError as e:
             return self._err(e.status, e.message)
         if is_stream:
@@ -2866,7 +3181,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                  err.get("message") or "上游返回错误")
             objs.append(o)
         merged = aggregate_sse(objs, req_model)
-        _bump_usage((merged.get("usage") or {}).get("total_tokens"))
         _log("回合完成 model=%s stream=False frames=%d 耗时=%.2fs"
              % (model["key"], len(frames), time.time() - t0))
         if protocol == "responses":
@@ -2909,7 +3223,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                          ensure_ascii=False))
 
         n = 0
-        tokens = 0
         try:
             for inner in _iter_upstream(resp):
                 try:
@@ -2917,9 +3230,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 except Exception:
                     continue
                 n += 1
-                u = obj.get("usage") if isinstance(obj, dict) else None
-                if isinstance(u, dict) and u.get("total_tokens"):
-                    tokens = int(u["total_tokens"])
                 err = _error_of(obj)
                 if err:
                     write_error(err.get("message") or "上游返回错误")
@@ -2955,7 +3265,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.wfile.write(b"0\r\n\r\n")
             except Exception:
                 pass
-        _bump_usage(tokens)
         _log("回合完成 model=%s stream=True frames=%d 耗时=%.2fs"
              % (model["key"], n, time.time() - t0))
 
@@ -3040,7 +3349,7 @@ def _cmd_capture(_args=None):
 def _cmd_list(_args=None):
     rows = _account_table()
     if not rows:
-        print("账号池为空: python qoder_proxy.py --capture")
+        print("账号池为空: python qoder_intl_proxy.py --capture")
         return 1
     for r in rows:
         print("%-16s token=%-28s 到期=%s(剩 %s 天) 续期=%s 设备=%s(%s)%s"
@@ -3096,8 +3405,8 @@ def _cmd_import(path):
         _print_err("凭证包格式不对：每个账号至少要有 token")
         return 1
     print("已导入 %d 个账号: %s" % (len(added), ", ".join(added)))
-    print("目标机不需要 Qoder CN 客户端，但签名器仍需要 Node；"
-          "客户端的 worker runtime 文件可用 QODER_WORKER_BUNDLE 指定")
+    print("目标机不需要 Qoder 国际版客户端，但签名器仍需要 Node；"
+          "客户端的 worker runtime 文件可用 QODER_INTL_WORKER_BUNDLE 指定")
     return 0
 
 
@@ -3176,10 +3485,11 @@ def _cmd_checkin(_args=None):
               % (rep["status"], rep["campaigns"], rep["claimable"],
                  "已到位" if rep.get("secured") else "没到位"))
         for x in rep["claimed"]:
-            print("领取     %s %s %s → HTTP %s%s grant=%s 发放=%s%s"
+            print("领取     %s %s %s → HTTP %s%s%s grant=%s 发放=%s%s"
                   % (x.get("key") or x["id"], x.get("kind") or "",
                      ("%s" % x["amount"]) if x.get("amount") is not None else "",
                      x.get("status"),
+                     (" " + str(x["claimStatus"])) if x.get("claimStatus") else "",
                      (" " + str(x["message"])) if x.get("message") else "",
                      str(x.get("grantId") or "-")[:8], x.get("grantedAt") or x.get("claimedAt") or "-",
                      "（重复请求，服务端 replayed，不再二次发放）" if x.get("replayed") else ""))
@@ -3199,16 +3509,20 @@ def _cmd_checkin(_args=None):
             print("-" * 40)
     print("合计     今天的 Credits 已到位 %d/%d 个号" % (secured, len(accs)))
     if len(accs) > 1 and secured < len(accs):
-        _print_err("提示：部分号被上游以 SAME_PERSON_ALREADY_CLAIMED 拒发（判定按号+活动缓存，"
-                   "当天重试只重放）；桌面端换号可领而代理连发被拒，触发条件待查")
+        _print_err("提示：部分号被上游以 SAME_PERSON_ALREADY_CLAIMED 拒发（每天每设备一份，"
+                    "当天重试只重放）；签到已用账号池独立身份，若仍撞车检查该号"
+                    " machineId 是否与他人共用")
     return 0 if (all_ok and secured == len(accs)) else 1
 
 
 def _checkin_round(reason):
-    """给池里每个号各跑一次当日 Credits 签到。
+    """给池里每个号各跑一次当日 Credits 签到（对齐国内版：账号池身份，只领
+    各号列表里 CLAIM_BENEFIT+CLAIMABLE 的条目，不探测、不盲领）。
     返回 (今天的份已到位的号数, 池内号数, 是否全部调用成功)。
     "已到位"= 这个号今天的 CREDITS 活动是 CLAIMED（这一轮领的、或客户端/上一轮领的都算），
-    只有全部到位才算今天不用再来；单号异常只记日志并继续下一个。"""
+    只有全部到位才算今天不用再来；单号异常只记日志并继续下一个。
+    SAME_PERSON_ALREADY_CLAIMED 的号 ok=True 但不"已到位"（上游拒发的判定每天
+    每设备一份，当天重试只是幂等重放，不多领也不误报失败）。"""
     with _pool_lock:
         accs = list(_load_pool_locked())
     total = len(accs)
@@ -3225,7 +3539,10 @@ def _checkin_round(reason):
             all_ok = False
             continue
         claimed = [c for c in (rep.get("claimed") or []) if c.get("status") in (200, 201, 204)]
-        fresh = [c for c in claimed if not c.get("replayed")]
+        # BLOCKED（含 SAME_PERSON）也回 HTTP 200 且带 benefit 字段，
+        # 必须按业务状态过滤，否则"无份"会被算成"本轮新领"。
+        fresh = [c for c in claimed if not c.get("replayed")
+                 and c.get("claimStatus") == "CLAIMED"]
         credits = sum(int(c.get("amount") or 0)
                       for c in fresh if (c.get("kind") or "").upper() == "CREDITS")
         if fresh:
@@ -3273,14 +3590,18 @@ def _write_checkin_state(st):
 
 
 def _today_at(hhmm, base=None):
-    """今天 hhmm（本地时区）的 epoch；hhmm 非法则退回 10:30。"""
+    """今天 hhmm（本地时区）的 epoch；hhmm 非法则退回 CHECKIN_AT 默认时间。"""
     try:
         hh, mm = hhmm.split(":")
         hh, mm = int(hh), int(mm)
         if not (0 <= hh < 24 and 0 <= mm < 60):
             raise ValueError
     except Exception:
-        hh, mm = 10, 30
+        try:    # 非法 → 退回 CHECKIN_AT（默认 10:30）
+            dh, dm = CHECKIN_AT.split(":")
+            hh, mm = int(dh), int(dm)
+        except Exception:
+            hh, mm = 10, 30
     lt = time.localtime(base if base is not None else time.time())
     return time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, hh, mm, 0, 0, 0, -1))
 
@@ -3380,7 +3701,7 @@ def _interactive_menu():
             accs = list(_load_pool_locked())
         now = time.time()
         print("\n" + "=" * 56)
-        print("  Qoder CN 官方模型本地代理")
+        print("  Qoder 国际版官方模型本地代理")
         print("=" * 56)
         print("  账号池: %d 个账号" % len(accs))
         counts = _device_counts(accs)
@@ -3402,7 +3723,7 @@ def _interactive_menu():
             print("  0 启动代理")
             print("  1 浏览器设备码登录（加入账号池，可连续登多个）")
             print("  2 浏览器设备码登录（token 直接签发给一套全新设备）")
-            print("  3 抓取本机 Qoder CN 客户端登录态")
+            print("  3 抓取本机 Qoder 国际版客户端登录态")
             print("  4 领取今天的每日 Credits（多账号）")
             print("  5 查看账号池详情")
             print("  6 移除账号")
@@ -3489,25 +3810,35 @@ def _serve():
     except OSError as e:
         _print_err("端口 %d 起不来: %s（可用 --port 换端口）" % (PORT, e))
         return 1
-    print("Qoder CN 代理: http://127.0.0.1:%d  (%s)" % (PORT, ACCOUNTS_FILE))
+    print("Qoder 国际版代理: http://127.0.0.1:%d  (%s)" % (PORT, ACCOUNTS_FILE))
     print("  OpenAI      POST /v1/chat/completions   GET /v1/models")
     print("  Responses   POST /v1/responses")
     print("  Anthropic   POST /v1/messages、/v1/messages/count_tokens")
     print("  健康        GET /health")
-    print("  管理        GET /admin（%s）"
-          % ("QODER_PROXY_ADMIN_PASSWORD 已设置" if ADMIN_PASSWORD
-             else "未设 QODER_PROXY_ADMIN_PASSWORD，管理接口已禁用，仅登录页可看"))
     print("  上游        %s%s" % (GATEWAY, INFER_PATH))
     print("  签名        %s" % _signer.describe())
-    if API_KEY:
-        print("  API Key     已启用（QODER_PROXY_API_KEY，KeyStore 有 key 时以多 Key 为准）")
+    if ADMIN_PASSWORD:
+        print("  管理后台    http://127.0.0.1:%d/admin（QODER_PROXY_ADMIN_PASSWORD 已配置）"
+              % PORT)
+    else:
+        print("  管理后台    /admin 页面可看，但管理 API 已禁用"
+              "（未配置 QODER_PROXY_ADMIN_PASSWORD）")
+    try:
+        n_keys = len(_get_key_store().list())
+    except Exception:
+        n_keys = 0
+    if n_keys:
+        print("  API Key     多 Key 已启用（%d 个，管理: /admin；%s）"
+              % (n_keys, ADMIN_KEYS_FILE))
+    elif API_KEY:
+        print("  API Key     已启用（QODER_PROXY_API_KEY；/admin 可切多 Key）")
     else:
         print("  API Key     未设置 —— 任何本机进程都能用这个代理，建议设 QODER_PROXY_API_KEY"
-              " 或在管理面板建多 Key")
+              " 或在 /admin 建多 Key")
     with _pool_lock:
         n = len(_load_pool_locked())
     if not n:
-        print("  警告        账号池为空，先运行: python qoder_proxy.py --login 或 --capture")
+        print("  警告        账号池为空，先运行: python qoder_intl_proxy.py --login 或 --capture")
     else:
         print("  设备        %s" % _device_summary(_account_table()))
     _log("启动 port=%d accounts=%d" % (PORT, n))
@@ -3530,14 +3861,15 @@ def _serve():
 def main():
     global PORT, LOG_FILE, API_KEY
     p = argparse.ArgumentParser(
-        description="Qoder CN 官方模型本地代理（OpenAI / Responses / Anthropic 三协议）")
-    p.add_argument("--capture", action="store_true", help="从本机 Qoder CN 客户端提取登录态入池")
+        description="Qoder 双区官方模型本地代理（OpenAI / Responses / Anthropic 三协议，单进程单端口同时服务 cn/intl）")
+    p.add_argument("--capture", action="store_true", help="从本机 Qoder 客户端提取登录态入池（按 --realm 选区）")
     p.add_argument("--login", action="store_true",
-                   help="浏览器设备码登录换 token 入池（不需要装 Qoder CN 客户端）")
+                   help="浏览器设备码登录换 token 入池（按 --realm 选区，本机可无客户端）")
     p.add_argument("--new-device", action="store_true",
-                   help="配合 --login：授权时不用本机设备 ID，token 直接签发给一套新设备"
-                        "（入池后每号本来也各发一套）")
-    p.add_argument("--site", help="设备码授权页 base（默认 https://qoder.cn，等价 QODER_PROXY_SITE）")
+                   help="--login 时不用本机设备 ID（token 签发给一套新设备）")
+    p.add_argument("--realm", choices=("cn", "intl"), default=None,
+                   help="指定区域：cn=国内版 / intl=国际版（默认 QODER_PROXY_DEFAULT_REALM 或 cn）")
+    p.add_argument("--site", help="设备码授权页 base（默认按 realm：cn=https://qoder.cn / intl=https://qoder.com）")
     p.add_argument("--client-id", help="覆盖设备码登录的 client_id（默认取自客户端 bundle）")
     p.add_argument("--list", action="store_true", help="列出池内账号（脱敏）")
     p.add_argument("--remove", metavar="ACCOUNT", help="移除池内账号")

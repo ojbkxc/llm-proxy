@@ -303,7 +303,7 @@ class _Env:
         Q.MODEL_ROUTES_FILE = os.path.join(self.tmpdir, "model_routes.json")
         Q.ADMIN_PASSWORD = ""
         Q._key_store = QA.KeyStore(Q.ADMIN_KEYS_FILE)
-        Q._admin_api = None
+        # intl 版 _admin_api 是工厂函数（每次现取），无需重置；cn 版曾是缓存对象
         Q._pool.update({"accounts": [], "mtime": 0.0})
         Q._rr = 0
         Q._models.update({"at": 0.0, "list": [], "by_id": {}, "alias": {}})
@@ -1060,7 +1060,7 @@ def test_auto_refresh():
     env = _Env(accounts=accts)
     calls = []
 
-    def fake_openapi(method, path, body=None, token="", timeout=20):
+    def fake_openapi(method, path, body=None, token="", timeout=20, headers=None, ua=None, realm=None, **kw):
         calls.append((method, path, body))
         return 200, {"device_token": "dt-refreshed", "refresh_token": "drt-rotated",
                      "expires_at": "2099-01-02T00:00:00Z",
@@ -1080,7 +1080,7 @@ def test_auto_refresh():
         # 续期链死亡：401 → 标 refresh_dead，不再反复尝试
         calls2 = []
 
-        def dead_openapi(method, path, body=None, token="", timeout=20):
+        def dead_openapi(method, path, body=None, token="", timeout=20, headers=None, ua=None, realm=None, **kw):
             calls2.append(path)
             return 401, {"message": "invalid refresh token"}
 
@@ -1109,7 +1109,7 @@ def test_refresh_single_flight_per_account():
     peak = [0]
     done = []
 
-    def fake_openapi(method, path, body=None, token="", timeout=20):
+    def fake_openapi(method, path, body=None, token="", timeout=20, headers=None, ua=None, realm=None, **kw):
         with lock:
             live.append(1)
             peak[0] = max(peak[0], len(live))
@@ -1152,7 +1152,7 @@ def test_sweep_guard_is_atomic():
         seen.append(a.get("account"))
         return orig_cool(a, now)
 
-    def fake_openapi(method, path, body=None, token="", timeout=20):
+    def fake_openapi(method, path, body=None, token="", timeout=20, headers=None, ua=None, realm=None, **kw):
         refreshes.append(path)
         return 200, {"device_token": "dt-swept", "refresh_token": "drt-swept",
                      "expires_at": "2099-01-02T00:00:00Z"}
@@ -1335,7 +1335,7 @@ def test_admin_accounts_adapters():
         # 签到：打桩 campaigns（先 CLAIMABLE，claim 之后 CLAIMED）
         claimed = {"done": False}
 
-        def fake_openapi(method, path, body=None, token="", timeout=20, headers=None):
+        def fake_openapi(method, path, body=None, token="", timeout=20, headers=None, ua=None, realm=None, **kw):
             if path.startswith(Q.CAMPAIGNS_PATH):
                 if method == "POST":
                     claimed["done"] = True
@@ -2162,7 +2162,7 @@ def test_checkin_claim_flow():
     acct = _fake_account()
     calls = []
 
-    def fake(method, path, body=None, token="", timeout=20, headers=None):
+    def fake(method, path, body=None, token="", timeout=20, headers=None, ua=None, realm=None, **kw):
         calls.append((method, path, body, dict(headers or {}), token))
         if path == Q.USAGE_PATH:
             return 200, {"displayMode": "qoder",
@@ -2214,7 +2214,7 @@ def test_checkin_skips_non_claimable_items():
     acct = _fake_account()
     calls = []
 
-    def fake(method, path, body=None, token="", timeout=20, headers=None):
+    def fake(method, path, body=None, token="", timeout=20, headers=None, ua=None, realm=None, **kw):
         calls.append((method, path))
         return 200, {"campaigns": [
             _camp("c1", "act-20261013-582", "CLAIM_BENEFIT", "CLAIMED", "CREDITS", 100),
@@ -2238,7 +2238,7 @@ def test_checkin_claims_every_benefit_item():
     acct = _fake_account()
     posts = []
 
-    def fake(method, path, body=None, token="", timeout=20, headers=None):
+    def fake(method, path, body=None, token="", timeout=20, headers=None, ua=None, realm=None, **kw):
         if method == "POST":
             posts.append(path)
             return 200, {"success": True}
@@ -2263,7 +2263,7 @@ def test_checkin_not_claimable():
     acct = _fake_account()
     calls = []
 
-    def fake(method, path, body=None, token="", timeout=20, headers=None):
+    def fake(method, path, body=None, token="", timeout=20, headers=None, ua=None, realm=None, **kw):
         calls.append((method, path))
         return 200, {"campaigns": [], "claimable": False, "showCampaign": False}
 
@@ -2282,7 +2282,7 @@ def test_checkin_http_error():
     acct = _fake_account()
     calls = []
 
-    def fake(method, path, body=None, token="", timeout=20, headers=None):
+    def fake(method, path, body=None, token="", timeout=20, headers=None, ua=None, realm=None, **kw):
         calls.append(method)
         return 500, {"message": "boom"}
 
@@ -2304,7 +2304,7 @@ def test_checkin_cli_all_accounts():
                                       "CLAIMED", "CREDITS", 100)]}
         calls = []
 
-        def fake(method, path, body=None, token="", timeout=20, headers=None):
+        def fake(method, path, body=None, token="", timeout=20, headers=None, ua=None, realm=None, **kw):
             calls.append((method, path, token))
             return 200, {"campaigns": list(holder["campaigns"]), "claimable": False}
 

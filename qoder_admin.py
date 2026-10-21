@@ -1160,7 +1160,8 @@ var ICONS = {
 function el(id){return document.getElementById(id)}
 function esc(v){return String(v==null?"":v).replace(/[&<>"']/g,function(c){return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]})}
 function toast(msg,isErr){var t=el("toast");t.textContent=msg;t.classList.toggle("error",!!isErr);t.classList.add("show");clearTimeout(toast._t);toast._t=setTimeout(function(){t.classList.remove("show")},3000)}
-function copyText(text,okMsg,failMsg){navigator.clipboard.writeText(text).then(function(){toast(okMsg||"已复制")}).catch(function(){toast(failMsg||"复制失败",true)})}
+function copyText(text,okMsg,failMsg){if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(text).then(function(){toast(okMsg||"已复制")}).catch(function(){_copyFallback(text,okMsg,failMsg)})}else{_copyFallback(text,okMsg,failMsg)}}
+function _copyFallback(text,okMsg,failMsg){try{var ta=document.createElement("textarea");ta.value=text;ta.style.position="fixed";ta.style.left="-9999px";document.body.appendChild(ta);ta.focus();ta.select();var ok=document.execCommand("copy");document.body.removeChild(ta);if(ok)toast(okMsg||"已复制");else toast(failMsg||"复制失败",true)}catch(e){toast(failMsg||"复制失败",true)}}
 function copyKeyText(val){copyText(val,"API Key 复制成功！","复制失败，请手动复制")}
 function keyMask(v){var s=String(v||"");if(!s)return "";return s.length<=6?s.slice(0,3)+"...":s.slice(0,5)+"..."+s.slice(-1)}
 function fmtTime(v){if(!v)return "-";if(typeof v==="number"){return new Date(v*1000).toLocaleString()}var d=new Date(v);return isNaN(d.getTime())?String(v):d.toLocaleString()}
