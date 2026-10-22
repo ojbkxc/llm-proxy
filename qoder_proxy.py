@@ -1947,6 +1947,8 @@ def _signed_send(acct, params, timeout=None):
 
 # ── 模型清单 ──────────────────────────────────────────────────────────────────
 _models = {"at": 0.0, "list": [], "by_id": {}, "alias": {}}
+# 上游模型缺 context_config 且 max_input_tokens=0 时的上下文兜底（对齐 catalog 默认 200K）
+DEFAULT_CTX_FALLBACK = 200000
 
 
 def _slug(name):
@@ -1974,6 +1976,8 @@ def _normalize_models(raw):
             if any(x["key"] == m["key"] for x in out):
                 continue
             ctx = max(int(m.get("max_input_tokens") or 0), _max_ctx(m.get("context_config")))
+            if ctx == 0:
+                ctx = DEFAULT_CTX_FALLBACK
             out.append({
                 "key": m["key"],
                 "source": m.get("source") or "system",
@@ -1994,35 +1998,62 @@ def _normalize_models(raw):
 
 
 def _fetch_models(force=False):
-    """签名拉 /algo/api/v2/model/list，缓存 MODELS_TTL 秒。"""
+    """签名拉 /algo/api/v2/model/list，缓存 MODELS_TTL 秒。
+    双区合并：分别从 cn/intl 各拉一次，按 key 去重，每个模型带 realm 字段。
+    单个 realm 失败（无账号 / HTTP 非 200 / 解析异常）不中断，只有全部失败才抛。"""
     now = time.time()
     if not force and _models["list"] and now - _models["at"] < MODELS_TTL:
         return _models
-    acct = _read_session()
-    if acct is None:
-        raise RuntimeError("账号池为空：先运行 python qoder_proxy.py --capture")
-    params = {"endpoint": _gw(_realm_of(acct)), "path": MODEL_LIST_PATH, "method": "GET"}
-    _log("拉取模型清单")
-    status, resp = _signed_send(acct, params)
-    try:
-        raw = resp.read().decode("utf-8", "replace")
-    finally:
+    all_models = []
+    seen_keys = set()
+    key_realms = {}
+    for realm in ("cn", "intl"):
+        acct = _read_session(realm)
+        if acct is None:
+            _log("模型清单 %s 跳过：无可用账号" % realm)
+            continue
+        params = {"endpoint": _gw(realm), "path": MODEL_LIST_PATH, "method": "GET"}
         try:
-            resp.close()
-        except Exception:
-            pass
-    if status != 200:
-        raise RuntimeError("模型清单 HTTP %s: %s" % (status, raw[:200]))
-    lst = _normalize_models(json.loads(raw))
+            status, resp = _signed_send(acct, params)
+            try:
+                raw = resp.read().decode("utf-8", "replace")
+            finally:
+                try:
+                    resp.close()
+                except Exception:
+                    pass
+        except Exception as e:
+            _log("模型清单 %s 拉取失败: %s" % (realm, e))
+            continue
+        if status != 200:
+            _log("模型清单 %s HTTP %s: %s" % (realm, status, raw[:200]))
+            continue
+        try:
+            lst = _normalize_models(json.loads(raw))
+        except Exception as e:
+            _log("模型清单 %s 解析失败: %s" % (realm, e))
+            continue
+        for m in lst:
+            m["realm"] = realm
+            key_realms.setdefault(m["key"], set()).add(realm)
+            if m["key"] not in seen_keys:
+                seen_keys.add(m["key"])
+                all_models.append(m)
+        _log("模型清单 %s: %d 个" % (realm, len(lst)))
+    if not all_models:
+        raise RuntimeError(
+            "模型清单为空：cn/intl 均无可用账号或上游不可达，先运行 python qoder_proxy.py --capture")
+    for m in all_models:
+        m["realms"] = sorted(key_realms.get(m["key"], {m["realm"]}))
     _models["at"] = now
-    _models["list"] = lst
-    _models["by_id"] = {m["key"]: m for m in lst}
+    _models["list"] = all_models
+    _models["by_id"] = {m["key"]: m for m in all_models}
     alias = {}
-    for m in lst:
+    for m in all_models:
         alias[m["key"].lower()] = m
         alias[_slug(m["name"])] = m
     _models["alias"] = alias
-    _log("模型清单 %d 个" % len(lst))
+    _log("模型清单合并 %d 个（cn+intl）" % len(all_models))
     return _models
 
 
@@ -2665,11 +2696,11 @@ def _model_route_entries(upstream_list, created):
             continue          # 悬空映射：最终目标不在上游清单，不虚构条目
         entries.append({
             "id": name, "object": "model", "created": created,
-            "owned_by": "qoder-intl", "name": base["name"],
+            "owned_by": "qoder-" + base.get("realm", "cn"), "name": base["name"],
             "context_window": base["ctx"], "reasoning": base["reasoning"],
-            "vision": base["vision"],
+            "vision": base["vision"], "realm": base.get("realm", "cn"),
             "metadata": {"display_name": base["name"], "source": kind,
-                         "target": base["key"]}})
+                         "target": base["key"], "realm": base.get("realm", "cn")}})
         seen.add(low)
     return entries
 
@@ -2685,6 +2716,7 @@ def _admin_account_row(a, counts=None, now=None):
         "id": label,
         "label": label,
         "uid": a.get("uid") or "",
+        "realm": a.get("realm") or _realm_of(a),
         "expires_at": a.get("expiresAt") or "",
         "exp": exp,
         "left_days": round((exp - now) / 86400, 1) if exp else None,
@@ -2860,7 +2892,9 @@ def _admin_list_models():
         raise QA.KeyStoreError("模型清单不可用: %s" % e, 502)
     rows = [{"id": m["key"], "name": m["name"], "context_length": m["ctx"],
              "max_output_tokens": m["max_output_tokens"],
-             "reasoning": m["reasoning"], "vision": m["vision"]}
+             "reasoning": m["reasoning"], "vision": m["vision"],
+             "realm": m.get("realm", "cn"),
+             "realms": m.get("realms", [m.get("realm", "cn")])}
             for m in cached["list"]]
     # updated_at 用毫秒（对齐页面 fmtTime(Math.floor(v/1000)) 的口径）
     return {"models": rows, "updated_at": int(_models["at"] * 1000)}
@@ -3096,12 +3130,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except Exception as e:
             return self._err(502, "模型清单获取失败: %s" % e)
         now = int(_models["at"])
-        data = [{"id": m["key"], "object": "model", "created": now, "owned_by": "qoder-intl",
+        data = [{"id": m["key"], "object": "model", "created": now,
+                 "owned_by": "qoder-" + m.get("realm", "cn"),
                  "name": m["name"], "context_window": m["ctx"], "reasoning": m["reasoning"],
-                 "vision": m["vision"],
+                 "vision": m["vision"], "realm": m.get("realm", "cn"),
                  "metadata": {"display_name": m["name"], "source": m["source"],
                               "format": m["format"], "price_factor": m["price_factor"],
                               "enabled": m["enabled"], "scene": m["scene"],
+                              "realm": m.get("realm", "cn"),
                               "thinking_config": m["thinking_config"]}}
                 for m in cached["list"]]
         data.extend(_model_route_entries(cached["list"], now))

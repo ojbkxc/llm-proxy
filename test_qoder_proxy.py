@@ -596,7 +596,9 @@ def test_http_health_and_models():
               and ids == ["fkmodel", "fktwo", "fkoff"]
               and ml["data"][0]["context_window"] == 1000000
               and ml["data"][0]["name"] == "Fake One"
-              and ml["data"][2]["metadata"]["enabled"] is False)
+              and ml["data"][2]["metadata"]["enabled"] is False
+              and ml["data"][0]["owned_by"] == "qoder-cn"
+              and ml["data"][0]["metadata"]["realm"] == "cn")
         _record("http_health_and_models", ok, str(ids))
     finally:
         env.close()
@@ -1014,13 +1016,15 @@ def test_upstream_error_frame_502():
 def test_signer_failure_502():
     env = _Env()
     try:
-        env.signer.fail_times = 1
+        # 双区合并后 _fetch_models 会消耗 1~2 次签名（cn/intl 各一次），
+        # chat 请求再消耗一次；这里让签名器持续不可用，确保 chat 走到 502。
+        env.signer.fail_times = 5
         code, raw = _post(env.url + "/v1/chat/completions",
                           {"model": "fkmodel", "messages": [{"role": "user", "content": "hi"}],
                            "stream": True})
         ok = code == 502
         # request 抛异常 → _signed_send 里 sidecar 的重试由 _Signer 负责；这里 fake 直接抛，
-        # _open_upstream 的 except Exception 兜住 → 502
+        # _open_upstream 的 except SignerError 兜住 → 502
         _record("signer_failure_502", ok, "%s %s" % (code, raw[:100]))
     finally:
         env.close()
@@ -1402,7 +1406,8 @@ def test_admin_accounts_adapters():
         c10, raw10 = _adm_req(env, "GET", "/api/models", headers=H)
         obj10 = json.loads(raw10)
         ok10 = c10 == 200 and len(obj10.get("models") or []) == 3 \
-            and obj10["models"][0]["id"] == "fkmodel"
+            and obj10["models"][0]["id"] == "fkmodel" \
+            and all(x.get("realm") in ("cn", "intl") for x in obj10["models"])
         c9, raw9 = _adm_req(env, "GET", "/api/stats", headers=H)
         obj9 = json.loads(raw9)
         ok9 = (c9 == 200 and obj9.get("accounts") == 1 and obj9.get("models") == 3
@@ -1795,9 +1800,76 @@ def test_model_alias_and_cache():
         cached_at = Q._models["at"]
         Q._fetch_models()
         ok = ok and Q._models["at"] == cached_at
+        # 每个模型都带 realm 字段（cn/intl）
+        ok = ok and all(x.get("realm") in ("cn", "intl") for x in m["list"])
         _record("model_alias_and_cache", ok, "list=%d" % len(m["list"]))
     finally:
         env.close()
+
+
+def test_fetch_models_dual_realm():
+    """_fetch_models 分别从 cn/intl 拉模型合并去重，每个模型带 realm 字段。
+    cn 先拉 → shared 归 cn；intl 再拉 → shared 已存在跳过，intl-only 归 intl。"""
+    cn_acct = _fake_account(label="cn-1")
+    intl_acct = _fake_account(label="intl-1")
+    intl_acct["realm"] = "intl"
+    env = _Env(accounts=[cn_acct, intl_acct])
+    fixture_cn = {"chat": [
+        {"key": "cn-only", "display_name": "CN Only", "enable": True, "max_input_tokens": 100000},
+        {"key": "shared", "display_name": "Shared", "enable": True, "max_input_tokens": 200000},
+    ]}
+    fixture_intl = {"chat": [
+        {"key": "shared", "display_name": "Shared Intl", "enable": True, "max_input_tokens": 300000},
+        {"key": "intl-only", "display_name": "Intl Only", "enable": True, "max_input_tokens": 400000},
+    ]}
+
+    class _Resp:
+        status = 200
+
+        def __init__(self, fx):
+            self._b = json.dumps(fx).encode("utf-8")
+
+        def read(self):
+            return self._b
+
+        def close(self):
+            pass
+
+    orig = Q._signed_send
+
+    def fake_signed_send(acct, params, timeout=None):
+        realm = Q._realm_of(acct)
+        return 200, _Resp(fixture_cn if realm == "cn" else fixture_intl)
+
+    try:
+        Q._signed_send = fake_signed_send
+        Q._models.update({"at": 0.0, "list": [], "by_id": {}, "alias": {}})
+        m = Q._fetch_models(force=True)
+        keys = [x["key"] for x in m["list"]]
+        realms = {x["key"]: x.get("realm") for x in m["list"]}
+        ok = (len(m["list"]) == 3
+              and set(keys) == {"cn-only", "shared", "intl-only"}
+              and realms.get("cn-only") == "cn"
+              and realms.get("shared") == "cn"      # 去重保留先拉的 cn
+              and realms.get("intl-only") == "intl")
+        _record("fetch_models_dual_realm", ok, "keys=%s realms=%s" % (keys, realms))
+    finally:
+        Q._signed_send = orig
+        env.close()
+
+
+def test_models_ctx_fallback():
+    """模型缺 context_config 且 max_input_tokens=0 时 ctx 兜底 200000。"""
+    raw = {"chat": [{"key": "nobc", "display_name": "No BC", "enable": True}]}
+    out = Q._normalize_models(raw)
+    ok = len(out) == 1 and out[0]["ctx"] == 200000
+    # 有 max_input_tokens 时以它为准，不兜底
+    raw2 = {"chat": [{"key": "hastok", "display_name": "Has Tok", "enable": True,
+                      "max_input_tokens": 5000}]}
+    out2 = Q._normalize_models(raw2)
+    ok = ok and len(out2) == 1 and out2[0]["ctx"] == 5000
+    _record("models_ctx_fallback", ok, "ctx=%s ctx2=%s"
+            % (out[0]["ctx"] if out else "?", out2[0]["ctx"] if out2 else "?"))
 
 
 # ── 3. 纯函数边界 ──────────────────────────────────────────────────────────
@@ -2515,6 +2587,9 @@ def main():
         test_admin_stats_usage,
         test_model_routes_apply,
         test_admin_model_routes_api,
+        # 模型清单双区合并 + ctx 兜底
+        test_fetch_models_dual_realm,
+        test_models_ctx_fallback,
     ]
     for fn in tests:
         try:

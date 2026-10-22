@@ -1259,7 +1259,8 @@ function renderAccounts(){
       :'<span class="badge">未设置</span>';
     var status=a.refresh_dead?'<span class="badge bad">续期链失效</span>':(a.failed_at&&(Date.now()/1000-a.failed_at)<300?'<span class="badge bad">冷却中 '+esc(a.failed_status||"")+'</span>':'<span class="badge ok">可用</span>');
     var checkin=ck?(ck.secured?'<span class="badge ok">已领 '+esc(ck.amount||100)+'</span>':'<span class="badge bad">'+esc(ck.message||ck.status||"未到账")+'</span>'):'<span class="badge">未执行</span>';
-    return '<tr><td><b>'+esc(a.label)+'</b><div class="muted mono">'+esc(a.uid||"-")+'</div></td>'+
+    var realmTag=a.realm==='intl'?'<span class="badge" style="background:#6366f1;color:#fff">国际</span>':'<span class="badge" style="background:#10b981;color:#fff">国内</span>';
+    return '<tr><td><b>'+esc(a.label)+'</b> '+realmTag+'<div class="muted mono">'+esc(a.uid||"-")+'</div></td>'+
       '<td>'+status+'<div class="muted">'+esc(a.has_refresh?"可续期":"无 refresh")+'</div></td>'+
       '<td>'+fmtExp(a)+'<div class="muted">'+esc(a.expires_at||"-")+'</div></td>'+
       '<td>'+device+'</td>'+
@@ -1397,7 +1398,8 @@ function loadModels(force){
     MODELS=r.models||[];
     if(el("modelsUpdated"))el("modelsUpdated").textContent=r.updated_at?("最后更新："+fmtTime(Math.floor(r.updated_at/1000))):"";
     el("models").innerHTML='<table><thead><tr><th>模型</th><th>上下文</th><th>最大输出</th><th>能力</th></tr></thead><tbody>'+MODELS.map(function(m){
-      return '<tr><td class="mono">'+esc(m.id)+'<div class="muted">'+esc(m.name||"")+'</div></td><td>'+esc(m.context_length||"-")+'</td><td>'+esc(m.max_output_tokens||"-")+'</td><td>'+esc((m.reasoning?"reasoning ":"")+(m.vision?"vision":"")||"-")+'</td></tr>'
+      var rt=(m.realms&&m.realms.length>1)?'':(m.realm==='intl'?'<span class="badge" style="background:#6366f1;color:#fff">国际</span>':'<span class="badge" style="background:#10b981;color:#fff">国内</span>');
+      return '<tr><td class="mono">'+esc(m.id)+' '+rt+'<div class="muted">'+esc(m.name||"")+'</div></td><td>'+esc(m.context_length||"-")+'</td><td>'+esc(m.max_output_tokens||"-")+'</td><td>'+esc((m.reasoning?"reasoning ":"")+(m.vision?"vision":"")||"-")+'</td></tr>'
     }).join("")+'</tbody></table>';
     renderRouteTargets();refreshRouteSelects();
   }).catch(function(e){el("models").innerHTML='<p class="badge bad">'+esc(e.message)+'</p>'})
