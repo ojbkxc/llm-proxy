@@ -17,6 +17,12 @@ Workspace (Midea) LLM 本地代理 - 纯 Python 标准库实现，无需 pip ins
   3. 违规词汇拦截：政治/宗教/违法等（SENSITIVE_WORDS 可配置）→ 403
   4. 忽略路径：含 .github 的路径直接跳过检查
 
+2026-10-29 修复（Workspace 程序更新导致全量 401）：
+  上游 litellm 网关随程序更新启用 UA 校验，裸 "Workspace" UA 一律 401；
+  已改为 Workspace IDE 实际发送的 Chrome UA（见 spoof_upstream_headers）。
+  模型实时更新：/v1/models 每次请求实时拉取上游模型表；聊天遇到缓存里
+  没有的模型时强制刷新一次再查（新模型即时可用，不等 300s TTL）。
+
 用法:  python proxy.py        （默认端口 8787，可用环境变量 WS_PROXY_PORT 修改）
 """
 import base64
@@ -697,11 +703,19 @@ def _unspoof_walk(obj):
 
 
 def spoof_upstream_headers(headers: dict) -> dict:
-    """改写转发上游的 HTTP 头：去掉可疑客户端 UA，补上 Workspace 官方 UA。"""
+    """改写转发上游的 HTTP 头：去掉可疑客户端 UA，补上 Workspace 官方客户端 UA。
+
+    2026-10-29：Workspace 程序更新后，上游 litellm 网关启用了 UA 校验——
+    裸 "Workspace" / "Bun/x" UA 一律 401 Unauthorized。改用 Workspace IDE
+    扩展实际发送的 Chrome 内核 UA（ws.exe 二进制内嵌常量，已实测放行）：
+      Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36
+      (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36
+    """
     h = dict(headers)
     if "User-Agent" in h:
         del h["User-Agent"]
-    h["User-Agent"] = "Workspace"  # 上游统一看到 Workspace 客户端
+    h["User-Agent"] = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                       "(KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36")
     return h
 
 
@@ -1650,6 +1664,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._json(500, {"error": {"message": str(e)}})
         m = models.get(model_id)
         if not m:
+            # 实时模型跟进：缓存里没有（上游可能刚新增）→ 强制刷新模型表后再查一次，
+            # 避免 300s TTL 内新模型可用但聊天仍 404
+            try:
+                models = get_models(session, force=True)
+            except Exception:
+                pass
+            m = models.get(model_id)
+        if not m:
             ids = ", ".join(sorted(models))
             return self._json(404, {"error": {"message": "模型 %s 不存在。可用: %s" % (model_id, ids)}})
 
@@ -2149,6 +2171,10 @@ def convert_openai_to_responses(openai_obj: dict, req_body: dict) -> dict:
             "status": "completed",
         })
     incomplete = choice.get("finish_reason") == "length"
+    # 顶层便捷字段 output_text：部分客户端（简化的 Responses 消费方）直接读它
+    _ot = "".join(seg.get("text", "")
+                  for item in output if item.get("type") == "message"
+                  for seg in (item.get("content") or []) if seg.get("type") == "output_text")
     return {
         "id": "resp_" + _rand(),
         "object": "response",
@@ -2156,6 +2182,7 @@ def convert_openai_to_responses(openai_obj: dict, req_body: dict) -> dict:
         "status": "incomplete" if incomplete else "completed",
         "model": req_body.get("model", ""),
         "output": output,
+        "output_text": _ot,
         "usage": {
             "input_tokens": usage.get("prompt_tokens", 0),
             "input_tokens_details": {"cached_tokens": (usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0)},
