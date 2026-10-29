@@ -8,17 +8,11 @@ TRAE SOLO CN 官方模型本地代理 - 纯 Python 标准库 + cryptography
   Anthropic 兼容 POST /v1/messages、POST /v1/messages/count_tokens
   健康检查       GET /health
 
-上游（与 codearts_proxy 的直连 chat 不同：TRAE 无纯聊天端点可复用）：
-  TRAE 的主 LLM 通道是服务端编排的 Cloud Agent（alaudalog 日志实测时序）：
-    POST /api/agent/v3/create_agent_task   建回合，响应为 SSE（ModelConfig 等）
-    POST /api/agent/v3/workflow/start      LLM token 流（SSE）
-    [tool_call 出现 → 本代理发 interrupt 终止回合]
-  本代理把一次 chat 请求映射为一个伪 agent 回合，SSE 事件翻译为 chat chunk：
-    thought 事件(thought 字段)   → delta.content
-    thought 事件(reasoning 字段) → delta.reasoning_content
-    tool_call 事件               → delta.tool_calls + interrupt 终止
-    token_usage 事件             → usage
-    turn_completion / done       → finish
+上游（SOLO 免费聊天通道，不走 create_agent_task 编排）：
+  POST /api/agent/v3/llm_utils_chat   请求体近 OpenAI 格式，SSE 事件为
+      metadata / output{response, reasoning_content, tool_calls}
+      / token_usage / done / error
+  本代理把 SSE 事件翻译为 OpenAI chat chunk / Responses / Anthropic 三协议。
 
 认证完全复用 TRAE SOLO CN 客户端登录态（算法移植自 trae-mate trae_auth.rs）：
   %APPDATA%/TRAE SOLO CN/User/globalStorage/storage.json
@@ -27,16 +21,32 @@ TRAE SOLO CN 官方模型本地代理 - 纯 Python 标准库 + cryptography
     → secret = LEFT_SECRET ⊕ RIGHT_SECRET（64B 常量）
     → key/iv = SHA512( SHA512(randomKey) ++ secret )[0:16]/[16:32]
     → 明文 = SHA512(payload) + payload(JSON: token/userId/host/refreshToken...)
-  token 过期时打开 TRAE 客户端让它自动刷新即可（当前 token 至 2026-09-13）。
+  token 临期自动续期（ExchangeToken），续期后写回 storage.json，无需手动刷新。
 
-已知限制（详见 trae_proxy_进展.md 与 trae_probe.py 注释）：
-  1. create_agent_task 请求体已迭代至第二代（user_input 对象化 + __dev 模型名），
-     上游绑定/模型配置检查均通过；剩余卡点是服务端 "failed to get summary
-     config"——摘要配置未注册，需用 mitm 抓一次真实报文对比请求序列后修正。
-  2. tool_call 即终止：云端工具（RunCommand/Read/Edit...）无法在本机执行，
-     工具调用翻译为 OpenAI tool_calls 返回给客户端后立即 interrupt 回合。
-  3. 服务端排队（request_wait_in_queue）时首 token 延迟可达分钟级（Free 账号）。
-  4. 每条消息是独立"回合"，对话历史被拼接进单条 query（无服务端多轮状态）。
+模型表自动同步（上游新增/下线模型，本代理自动跟进）：
+  数据源 POST /api/ide/v1/get_detail_param（config_info_list 含 display/ctx/
+  multimodal/capability/is_invisible_to_user 元数据），三条同步触发路径：
+    1. 启动时后台线程立即拉一次；
+    2. 之后每 models_ttl 秒定期拉（config.json "models_ttl"，默认 3600）；
+    3. /v1/models 请求发现缓存过期时现场拉（失败按 models_fail_cooldown 负缓存冷却）。
+  每次成功拉取：覆盖内存模型表（上游下线的模型即从 /v1/models 移除）
+  → 原子写入 trae_models.json（tmp + os.replace，写坏不伤旧文件，重启免拉取）。
+  /v1/models 只暴露"可见 + 有实质能力 + 白名单放行"的模型；隐形 subagent /
+  custom_model 占位 / summary 内部模型仍在内部表，改白名单即可放开。
+  白名单（目前只开放六个新一代模型，与 Trae CN 客户端模型目录一致）：
+    glm-5.3 / glm-5.3-flashx / mimo-v2.6-pro / mimo-v2.6-flash /
+    deepseek-v4.1-flash / minimax-m3.1-flash
+  其余模型暂不开放（不进列表、聊天 404）；config.json "model_whitelist" 数组
+  或环境变量 TRAE_PROXY_MODEL_WHITELIST（逗号分隔）即时调整，设为空 = 全部开放。
+  公共名映射（通用规则，未写死任何模型名）：上游 config_name 带 -solo 后缀时
+  对外自动去后缀（glm-5.3-solo ⇄ glm-5.3 双向映射），以此类推任何 -solo 模型；
+  上游同时存在 glm-5.3 与 glm-5.3-solo 时原名持有者优先，-solo 版保留全名直连。
+
+已知限制：
+  1. 工具调用仅透传：tool_calls 翻译返回给客户端执行（云端工具不在本机跑）。
+  2. 服务端排队（request_wait_in_queue）时首 token 延迟可达分钟级（Free 账号）。
+  3. 每条消息是独立"回合"，对话历史被拼接进单条 query（无服务端多轮状态）。
+  4. 图片输入不支持（转成"[图片输入暂不支持]"占位文本）。
 
 用法:  python trae_proxy.py    （默认端口 8790，环境变量 TRAE_PROXY_PORT 修改）
 """
@@ -45,13 +55,11 @@ import hashlib
 import http.server
 import json
 import os
-import platform
 import secrets
 import threading
 import time
 import urllib.error
 import urllib.request
-import uuid
 
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
@@ -61,28 +69,35 @@ APPDATA = os.environ.get("APPDATA", os.path.join(HOME, "AppData", "Roaming"))
 
 # TRAE SOLO CN 客户端用户数据
 STORAGE_JSON = os.path.join(APPDATA, "TRAE SOLO CN", "User", "globalStorage", "storage.json")
-# 客户端默认工作区（solo-lite-default-workspace/workspace.json 换算）：
-WORKSPACE = "C:\\GitHub"
 
 # 上游网关（alaudalog 实测）
 GATEWAY = "https://trae-api-cn.mchost.guru"
 
-# —— SOLO 免费聊天通道（来自 traework2api 实测，2026-09-04 本机验证通过）——
-# 不走 create_agent_task 编排（会被 summary config 卡点拦截），
-# 直接用 llm_utils_chat：请求体近 OpenAI 格式，SSE 事件为
-# metadata / output{response, reasoning_content, tool_calls} / token_usage / done / error。
+# —— SOLO 免费聊天通道（solo_work_remote，2026-10-28 本机实测打通）——————
+# 旧通道 solo_work_lite 只有旧一代模型（glm-5.2/kimi-k2.6 等，无 glm-5.3）；
+# remote 通道与 Trae CN 客户端模型目录一致，含新一代模型
+# （glm-5.3/glm-5.3-flashx/mimo-v2.6/deepseek-v4.1/minimax-m3.1 等）。
+# 不走 create_agent_task 编排，直接用 llm_utils_chat：请求体近 OpenAI 格式，
+# SSE 事件为 metadata / output{response, reasoning_content, tool_calls}
+# / token_usage / done / error。
 EP_LLM_UTILS = GATEWAY + "/api/agent/v3/llm_utils_chat"
 EP_GET_DETAIL_PARAM = GATEWAY + "/api/ide/v1/get_detail_param"
-SOLO_FUNCTION = "solo_work_lite"
+SOLO_FUNCTION = "solo_work_remote"
 SOLO_IDE_VERSION = "0.1.43"
 SOLO_IDE_VERSION_CODE = "20260716"
 SOLO_DEVICE_BRAND = "83DG"
 
-# solo_work_lite 模型表缓存（get_detail_param 拉取，失败回落静态 MODELS）
-# TTL：正缓存 1h，负缓存 5min（对齐 traework2api handler.go）
-_solo_models_cache = {"names": [], "ts": 0, "fail_ts": 0}
-SOLO_MODELS_TTL = 3600
-SOLO_MODELS_FAIL_COOLDOWN = 300
+# 模型表自动同步（get_detail_param 拉取，详见文件头说明）：
+#   成功 → 覆盖内存表 + 原子写 trae_models.json；失败 → 负缓存冷却后重试
+# TRAE_PROXY_MODELS_FILE / config.json "models_file" 可改缓存文件路径
+TRAE_MODELS_FILE = os.environ.get("TRAE_PROXY_MODELS_FILE") or \
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "trae_models.json")
+SOLO_MODELS_TTL = 3600            # 定期同步间隔 / 正缓存 TTL（秒）
+SOLO_MODELS_FAIL_COOLDOWN = 300   # 拉取失败后的重试冷却（秒）
+_models_lock = threading.Lock()   # 保护 MODELS / MODEL_ALIAS / 公共名映射 / _models_state
+_models_state = {"ts": 0, "fail_ts": 0}  # 最近一次成功 / 失败同步的 epoch
+_public_to_upstream = {}   # 公共名(小写) → 上游 config_name（-solo 后缀自动去除）
+_upstream_to_public = {}   # 上游 config_name → 公共展示名
 
 # token 自动续期（traework2api client.go refreshLocked 移植）
 OAUTH_HOST = "https://api.trae.com.cn"
@@ -111,33 +126,38 @@ RIGHT_SECRET = bytes([
     12, 125,
 ])
 
-# ── 模型清单（batch_get_detail_param 实测 + alaudalog 日志确认）──────────────
-# config_name → 服务端 model_name（__dev 后缀由服务端 ModelConfig 事件确认）
+# ── 模型清单（2026-10-28 solo_work_remote 实拉快照；仅作离线兜底种子，───────────
+# 运行时以自动同步的 trae_models.json / 上游拉取结果为准，上游下线即随之移除；
+# 对外开放范围由 MODEL_WHITELIST 白名单控制，默认只开放六个）
 MODELS = {
-    "DeepSeek-V4-Flash-Official": {"model_name": "DeepSeek-V4-Flash-Official__dev", "display": "DeepSeek-V4-Flash", "ctx": 168000},
-    "DeepSeek-V4-Flash":          {"model_name": "DeepSeek-V4-Flash__dev",          "display": "DeepSeek-V4-Flash", "ctx": 168000},
-    "DeepSeek-V4-Pro-Official":   {"model_name": "DeepSeek-V4-Pro-Official__dev",   "display": "DeepSeek-V4-Pro",   "ctx": 168000},
-    "DeepSeek-V4-Pro":            {"model_name": "DeepSeek-V4-Pro__dev",            "display": "DeepSeek-V4-Pro",   "ctx": 168000},
-    "glm-5.2":                    {"model_name": "glm-5.2__dev",                    "display": "GLM-5.2",           "ctx": 200000},
-    "glm-5.3":                    {"model_name": "glm-5.3__dev",                    "display": "GLM-5.3",           "ctx": 200000},
-    "kimi-k2.6":                  {"model_name": "kimi-k2.6__dev",                  "display": "Kimi-K2.6",         "ctx": 200000},
-    "Doubao-Seed-2.1-Pro":        {"model_name": "Doubao-Seed-2.1-Pro__dev",        "display": "Seed-2.1-Pro",      "ctx": 200000},
-    "Doubao-Seed-2.1-Turbo":      {"model_name": "Doubao-Seed-2.1-Turbo__dev",      "display": "Seed-2.1-Turbo",    "ctx": 200000},
+    "glm-5.3":             {"model_name": "glm-5.3__dev",             "display": "GLM-5.3",           "ctx": 200000, "multimodal": False, "capability": "reasoning_model"},
+    "glm-5.3-flashx":      {"model_name": "glm-5.3-flashx__dev",      "display": "GLM-5.3-FlashX",    "ctx": 200000, "multimodal": False, "capability": "reasoning_model"},
+    "mimo-v2.6-pro":       {"model_name": "mimo-v2.6-pro__dev",       "display": "MiMo-V2.6-Pro",     "ctx": 200000, "multimodal": True,  "capability": "reasoning_model"},
+    "mimo-v2.6-flash":     {"model_name": "mimo-v2.6-flash__dev",     "display": "MiMo-V2.6-Flash",   "ctx": 200000, "multimodal": True,  "capability": "reasoning_model"},
+    "deepseek-v4.1-flash": {"model_name": "deepseek-v4.1-flash__dev", "display": "DeepSeek-V4.1-Flash", "ctx": 200000, "multimodal": True, "capability": "reasoning_model"},
+    "minimax-m3.1-flash":  {"model_name": "minimax-m3.1-flash__dev",  "display": "MiniMax-M3.1-Flash", "ctx": 200000, "multimodal": False, "capability": "reasoning_model"},
 }
+# 手写短别名 → 官方 config_name（自动同步后重建别名表时保留这部分）
+_EXTRA_MODEL_ALIAS = {}
 # 小写别名 → 官方 config_name
 MODEL_ALIAS = {m.lower(): m for m in MODELS}
-MODEL_ALIAS.update({
-    "deepseek-v4-flash": "DeepSeek-V4-Flash",
-    "deepseek-v4-pro": "DeepSeek-V4-Pro",
-    "seed-2.1-pro": "Doubao-Seed-2.1-Pro",
-    "seed-2.1-turbo": "Doubao-Seed-2.1-Turbo",
-})
-DEFAULT_MODEL = "glm-5.2"  # solo_work_lite 通道实测可用（traework2api 同款默认）
+MODEL_ALIAS.update(_EXTRA_MODEL_ALIAS)
+DEFAULT_MODEL = "glm-5.3"  # solo_work_remote 通道实测可用（与 Trae CN 客户端当前主力一致）
+
+# ── 模型白名单：目前只开放这六个模型（2026-10-28）─────────────────────────────
+# 其余模型不进 /v1/models，聊天直接 404（暂不开放、非永久屏蔽，改白名单即时生效）。
+# 调整方式：config.json "model_whitelist": ["glm-5.3", ...]（设为 [] = 全部开放）
+#   或环境变量 TRAE_PROXY_MODEL_WHITELIST="glm-5.3,mimo-v2.6-pro"（逗号分隔，空 = 全部开放）
+DEFAULT_MODEL_WHITELIST = [
+    "glm-5.3", "glm-5.3-flashx", "mimo-v2.6-pro",
+    "mimo-v2.6-flash", "deepseek-v4.1-flash", "minimax-m3.1-flash",
+]
+MODEL_WHITELIST = [s.strip().lower() for s in DEFAULT_MODEL_WHITELIST]
 
 # ── 配置文件（config.json 覆盖常量；环境变量优先）────────────────────────────
 def _apply_config():
     """读 config.json 覆盖常量。优先级：环境变量 > config.json > 代码默认值。"""
-    global PORT, API_KEY, MAX_BODY_BYTES, SOLO_MODELS_TTL, SOLO_MODELS_FAIL_COOLDOWN, REFRESH_AHEAD_SEC, DEFAULT_MODEL
+    global PORT, API_KEY, MAX_BODY_BYTES, SOLO_MODELS_TTL, SOLO_MODELS_FAIL_COOLDOWN, REFRESH_AHEAD_SEC, DEFAULT_MODEL, TRAE_MODELS_FILE, MODEL_WHITELIST
     path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -154,10 +174,19 @@ def _apply_config():
         SOLO_MODELS_TTL = int(cfg["models_ttl"])
     if "models_fail_cooldown" in cfg and not os.environ.get("TRAE_PROXY_MODELS_FAIL_COOLDOWN"):
         SOLO_MODELS_FAIL_COOLDOWN = int(cfg["models_fail_cooldown"])
+    if "models_file" in cfg and not os.environ.get("TRAE_PROXY_MODELS_FILE"):
+        TRAE_MODELS_FILE = os.path.abspath(str(cfg["models_file"]))
     if "refresh_ahead_sec" in cfg and not os.environ.get("TRAE_PROXY_REFRESH_AHEAD_SEC"):
         REFRESH_AHEAD_SEC = int(cfg["refresh_ahead_sec"])
     if "default_model" in cfg and not os.environ.get("TRAE_PROXY_DEFAULT_MODEL"):
         DEFAULT_MODEL = str(cfg["default_model"])
+    wl_env = os.environ.get("TRAE_PROXY_MODEL_WHITELIST")
+    if wl_env is not None:
+        # 环境变量：逗号分隔；空字符串 = 不限制（全部开放）
+        MODEL_WHITELIST = [s.strip().lower() for s in wl_env.split(",") if s.strip()]
+    elif isinstance(cfg.get("model_whitelist"), list):
+        # config.json：数组；空数组 = 不限制（全部开放）
+        MODEL_WHITELIST = [str(s).strip().lower() for s in cfg["model_whitelist"] if str(s).strip()]
 
 _apply_config()
 
@@ -363,39 +392,6 @@ def _read_session() -> dict:
     return sess
 
 
-# ── 上游请求头（mitm dump 实测 27 头模板的子集）──────────────────────────────
-def build_headers(sess: dict, body_len: int) -> dict:
-    trace = secrets.token_hex(16)
-    h = {
-        "content-type": "application/json",
-        "authorization": "Cloud-IDE-JWT " + sess["token"],
-        "x-ide-token": sess["token"],
-        "x-app-id": "6eefa01c-1036-4c7e-9ca5-d891f63bfcd8",
-        "x-app-version": "default",
-        "x-app-version-code": "20260820",
-        "x-ide-version": "0.1.60",
-        "x-ide-version-code": "20260820",
-        "x-ide-version-type": "stable",
-        "x-custom-trace-id": trace,
-        "x-flow-traceparent": "04-%s-%s-01" % (trace, secrets.token_hex(8)),
-        "x-device-id": sess["device_id"],
-        "x-machine-id": sess["machine_id"],
-        "x-device-type": "windows",
-        "x-os-version": platform.platform()[:64],
-        "x-device-cpu": "Intel",
-        "x-user-region": "CN",
-        "request-traffic-type": "prod",
-        "user-agent": "TraeClient/TTNet",
-        "x-lgw-req-sdk-type": "3",
-        "package-type": "stable_cn",
-        "x-lscbd-aid": "787976",
-        "x-ckg-user-id": sess["user_id"],
-        "x-request-id": "req_" + str(uuid.uuid4()),
-        "content-length": str(body_len),
-    }
-    return h
-
-
 class UpstreamError(Exception):
     def __init__(self, message, status=502):
         super().__init__(message)
@@ -589,7 +585,7 @@ def solo_turn_chunks(sess: dict, cfg: dict, oa: dict):
 
     def chunk(delta, fr=None):
         return {"id": chat_id, "object": "chat.completion.chunk", "created": created,
-                "model": cfg["name"],
+                "model": cfg.get("public") or cfg["name"],
                 "choices": [{"index": 0, "delta": delta, "finish_reason": fr}]}
 
     yield chunk({"role": "assistant", "content": ""})
@@ -670,6 +666,11 @@ def solo_turn_chunks(sess: dict, cfg: dict, oa: dict):
         if event == "error":
             code = data.get("code")
             msg = data.get("message") or data_text[:200]
+            extra = str(data.get("extra") or "")
+            # 1005 + plan：模型需要付费计划（权益不足），提示换免费模型而非误导性的认证失败
+            if str(code) == "1005" and "plan" in extra:
+                raise UpstreamError("模型 %s 需要付费计划（error 1005, extra=%s）；请换用免费模型，如 glm-5.2" % (
+                    cfg["name"], extra), status=403)
             raise UpstreamError("上游事件错误 error(code=%s): %s" % (code, msg), status=_map_upstream_error(code, msg))
 
     if finish_reason is None:
@@ -680,8 +681,147 @@ def solo_turn_chunks(sess: dict, cfg: dict, oa: dict):
     yield final
 
 
-def fetch_solo_models(sess: dict) -> list:
-    """get_detail_param 拉取 solo_work_lite 模型表（config_name 列表）。"""
+# ── 模型表自动同步（get_detail_param → 内存表 + trae_models.json）────────────
+def _parse_solo_models(obj: dict) -> dict:
+    """get_detail_param 响应 → {config_name: {model_name, display, ctx, multimodal,
+    capability, invisible}}。config_name 去重（首次出现优先：主通道条目在前，
+    带 __dev/ctx 元数据）；config_switch=false 的直接丢弃。"""
+    out = {}
+    for ci in obj.get("config_info_list") or []:
+        if not isinstance(ci, dict):
+            continue
+        name = ci.get("config_name")
+        if not isinstance(name, str) or not name or name in out:
+            continue
+        if not ci.get("config_switch", True):
+            continue
+        dc = ci.get("display_config") or {}
+        mdl = ci.get("model_detail_list") or []
+        model_name = name
+        if isinstance(mdl, list) and mdl and isinstance(mdl[0], dict):
+            model_name = str(mdl[0].get("model_name") or "") or name
+        try:
+            ctx = int((ci.get("context_window_tokens") or {}).get("dev") or 0)
+        except Exception:
+            ctx = 0
+        out[name] = {
+            "model_name": model_name,
+            "display": str(dc.get("display_name") or ""),
+            "ctx": ctx,
+            "multimodal": bool(dc.get("multimodal")),
+            "capability": str(dc.get("model_capability") or ""),
+            "invisible": bool(ci.get("is_invisible_to_user")),
+        }
+    return out
+
+
+def _is_model_open(pub_name: str) -> bool:
+    """白名单开关：未配置（空列表）= 全部开放；配置后只开放白名单内的公共名
+    （比较不区分大小写；白名单外模型暂不开放，改配置即时生效，无需重启）。"""
+    if not MODEL_WHITELIST:
+        return True
+    return str(pub_name).lower() in MODEL_WHITELIST
+
+
+def _is_model_exposed(name: str, table: dict, u2p: dict = None) -> bool:
+    """是否进 /v1/models 列表：可见 + 有实质能力 + 白名单放行。
+    隐形 subagent、custom_model 占位、summary 内部模型仍在内部表，改白名单即可放开。"""
+    m = table.get(name) or {}
+    if m.get("invisible"):
+        return False
+    if not (m.get("display") or m.get("capability")):
+        return False
+    pub = (u2p or {}).get(name, name)
+    return _is_model_open(pub)
+
+
+def _build_public_maps(table: dict):
+    """生成 (公共名→上游名, 上游名→公共名)。公共名 = 上游 config_name 自动去掉
+    -solo 后缀（通用规则，未写死任何模型名），如 glm-5.3-solo → glm-5.3。
+    冲突策略：上游同时有 glm-5.3 与 glm-5.3-solo 时，glm-5.3 归原名持有者，
+    -solo 版保留全名展示（仍可点名直连）。"""
+    p2u, u2p = {}, {}
+    for name in table:
+        if not name.endswith("-solo"):
+            p2u[name.lower()] = name
+            u2p[name] = name
+    for name in table:
+        if name.endswith("-solo"):
+            short = name[:-5]
+            if short and short.lower() not in p2u:
+                p2u[short.lower()] = name
+                u2p[name] = short
+            else:
+                u2p[name] = name
+    return p2u, u2p
+
+
+def _merge_models(fetched: dict):
+    """上游模型表整体覆盖内存表（上游下线的模型随之移除），重建别名表与公共名映射。"""
+    global MODEL_ALIAS, _public_to_upstream, _upstream_to_public
+    with _models_lock:
+        MODELS.clear()
+        MODELS.update(fetched)
+        MODEL_ALIAS = {m.lower(): m for m in MODELS}
+        MODEL_ALIAS.update(_EXTRA_MODEL_ALIAS)
+        _public_to_upstream, _upstream_to_public = _build_public_maps(MODELS)
+
+
+def _resolve_model(model: str) -> str:
+    """请求模型名 → 上游 config_name（大小写不敏感）：
+    1) 别名表（含手写短别名）→ 2) 公共名映射（-solo 自动去后缀）→ 3) 原名直通。
+    例：上游只有 glm-5.3-solo 时，请求 glm-5.3 / GLM-5.3 均自动映射到它。"""
+    low = str(model).lower()
+    cand = MODEL_ALIAS.get(low)
+    if cand and cand in MODELS:
+        return cand
+    up = _public_to_upstream.get(low)
+    if up:
+        return up
+    return cand or model
+
+
+def _save_models_cache(fetched: dict):
+    """原子写 trae_models.json（tmp + os.replace，写坏不伤旧文件、不半写）。"""
+    obj = {"fetched_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+           "models": fetched}
+    tmp = "%s.tmp.%d" % (TRAE_MODELS_FILE, os.getpid())
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, TRAE_MODELS_FILE)
+
+
+def _load_models_cache():
+    """启动时读 trae_models.json 覆盖静态种子表（结构异常则忽略、保留种子，幂等）。"""
+    if not os.path.exists(TRAE_MODELS_FILE):
+        return
+    try:
+        with open(TRAE_MODELS_FILE, "r", encoding="utf-8") as f:
+            obj = json.load(f)
+        fetched = obj.get("models") or {}
+        if not isinstance(fetched, dict) or not fetched:
+            return
+        clean = {}
+        for k, v in fetched.items():
+            if isinstance(k, str) and k and isinstance(v, dict):
+                try:
+                    clean[k] = {"model_name": str(v.get("model_name") or k),
+                                "display": str(v.get("display") or ""),
+                                "ctx": int(v.get("ctx") or 0),
+                                "multimodal": bool(v.get("multimodal")),
+                                "capability": str(v.get("capability") or ""),
+                                "invisible": bool(v.get("invisible"))}
+                except Exception:
+                    continue
+        if clean:
+            _merge_models(clean)
+            _log("模型表缓存已加载: %d 个（拉取于 %s）" % (len(clean), obj.get("fetched_at") or "?"))
+    except Exception as e:
+        _log("模型表缓存读取失败（用静态种子）: %r" % e)
+
+
+def fetch_solo_models(sess: dict) -> dict:
+    """get_detail_param 拉取 solo_work_lite 模型表（完整元数据，未解析过滤）。"""
     body = {"function": SOLO_FUNCTION, "config_names": None, "need_prompt": False,
             "current_config_info": None, "poly_prompt": True, "mode_type": None,
             "agent_type": None}
@@ -690,12 +830,44 @@ def fetch_solo_models(sess: dict) -> list:
                                  headers=solo_headers(sess, stream=False), method="POST")
     resp = _opener.open(req, timeout=30)
     obj = json.loads(resp.read().decode("utf-8", "replace"))
-    names = []
-    for ci in obj.get("config_info_list") or []:
-        n = ci.get("config_name")
-        if n:
-            names.append(n)
-    return names
+    return _parse_solo_models(obj)
+
+
+def _sync_models_once(trigger: str) -> int:
+    """拉上游模型表 → 覆盖内存表 → 原子写缓存。返回模型数；失败抛异常且不动表。"""
+    fetched = fetch_solo_models(_read_session())
+    if not fetched:
+        raise RuntimeError("上游 config_info_list 为空")
+    _merge_models(fetched)
+    now = int(time.time())
+    try:
+        _save_models_cache(fetched)
+    except Exception as e:
+        _log("模型表缓存写入失败（内存已更新）: %r" % e)
+    with _models_lock:
+        _models_state["ts"] = now
+        _models_state["fail_ts"] = 0
+    with _models_lock:
+        snap = dict(MODELS)
+        u2p = dict(_upstream_to_public)
+    exposed = sum(1 for n in snap if _is_model_exposed(n, snap, u2p))
+    _log("模型表已同步(%s): 共 %d 个，开放 %d 个" % (trigger, len(fetched), exposed))
+    return len(fetched)
+
+
+def _models_refresh_loop():
+    """后台守护线程：启动立即同步一次，此后每 SOLO_MODELS_TTL 秒同步；
+    失败按 SOLO_MODELS_FAIL_COOLDOWN 冷却重试（凭证缺失等场景不轰炸上游）。"""
+    while True:
+        interval = SOLO_MODELS_TTL
+        try:
+            _sync_models_once("后台定期")
+        except Exception as e:
+            with _models_lock:
+                _models_state["fail_ts"] = int(time.time())
+            _log("模型表同步失败: %r" % e)
+            interval = SOLO_MODELS_FAIL_COOLDOWN
+        time.sleep(max(30, interval))
 
 
 # ── chunk 流聚合（非流式响应）───────────────────────────────────────────────
@@ -1276,42 +1448,49 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     exp = s.get("exp")
                     exp_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(exp)) if exp else "unknown"
                     now = int(time.time())
-                    cache = _solo_models_cache
-                    cache_age = now - cache.get("ts", 0) if cache.get("ts") else None
+                    with _models_lock:
+                        snap = dict(MODELS)
+                        u2p = dict(_upstream_to_public)
+                        ts = _models_state["ts"]
+                    exposed = sorted(u2p.get(n, n) for n in snap if _is_model_exposed(n, snap, u2p))
+                    cache_age = now - ts if ts else None
                     return self._json(200, {"ok": True, "user": s["user_id"],
                                             "tokenExp": exp_str,
                                             "port": PORT, "upstream": EP_LLM_UTILS,
-                                            "models": sorted(MODELS),
-                                            "cache": {"count": len(cache.get("names", [])),
+                                            "models": exposed,
+                                            "cache": {"count": len(snap), "exposed": len(exposed),
                                                       "age": cache_age, "ttl": SOLO_MODELS_TTL}})
                 except Exception as e:
                     return self._json(200, {"ok": False, "error": str(e)})
             if path in ("/v1/models", "/models"):
                 now = int(time.time())
-                cached_names = _solo_models_cache.get("names") or []
-                if cached_names and now - _solo_models_cache.get("ts", 0) < SOLO_MODELS_TTL:
-                    solo_names = cached_names
-                elif _solo_models_cache.get("fail_ts") and now - _solo_models_cache["fail_ts"] < SOLO_MODELS_FAIL_COOLDOWN:
-                    solo_names = cached_names or sorted(MODELS)
-                else:
+                # 缓存过期则现场同步一次（失败记负缓存冷却，避免每个请求都轰炸上游）
+                if now - _models_state["ts"] >= SOLO_MODELS_TTL \
+                        and now - _models_state["fail_ts"] >= SOLO_MODELS_FAIL_COOLDOWN:
                     try:
-                        sess = _read_session()
-                        solo_names = fetch_solo_models(sess)
-                        _solo_models_cache["names"] = solo_names
-                        _solo_models_cache["ts"] = now
-                        _solo_models_cache["fail_ts"] = 0
-                    except Exception:
-                        _solo_models_cache["fail_ts"] = now
-                        solo_names = cached_names or sorted(MODELS)
+                        _sync_models_once("请求触发")
+                    except Exception as e:
+                        with _models_lock:
+                            _models_state["fail_ts"] = now
+                        _log("模型表同步失败(请求触发): %r" % e)
+                with _models_lock:
+                    snap = dict(MODELS)
+                    u2p = dict(_upstream_to_public)
                 data = []
-                for n in solo_names:
-                    m = MODELS.get(n, {})
+                for n in sorted(snap):
+                    if not _is_model_exposed(n, snap, u2p):
+                        continue
+                    m = snap[n]
+                    pub = u2p.get(n, n)   # 公共名 = 自动去 -solo 后缀
                     data.append({
-                        "id": n, "object": "model", "created": now,
+                        "id": pub, "object": "model", "created": now,
                         "owned_by": "trae-solo-cn",
-                        "metadata": {"display_name": m.get("display", n),
+                        "metadata": {"display_name": m.get("display") or pub,
                                      "model_name": m.get("model_name", n),
-                                     "context_window": m.get("ctx", 0)},
+                                     "config_name": n,
+                                     "context_window": m.get("ctx", 0),
+                                     "capability": m.get("capability", ""),
+                                     "multimodal": bool(m.get("multimodal"))},
                     })
                 return self._json(200, {"object": "list", "data": data})
             return self._json(404, {"error": {"message": "支持: GET /v1/models, GET /health, POST /v1/chat/completions, /v1/responses, /v1/messages"}})
@@ -1363,13 +1542,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
         else:
             oa = dict(req_body)
 
-        # 3) 模型解析（别名 → config_name；未知模型放行，由上游校验）
+        # 3) 模型解析（别名/公共名映射/大小写不敏感 → 上游 config_name）+ 白名单闸门
         model = oa.get("model") or DEFAULT_MODEL
-        real = MODEL_ALIAS.get(model, model)
+        if not oa.get("model") and MODEL_WHITELIST and not _is_model_open(model):
+            model = MODEL_WHITELIST[0]   # 未指定模型且默认模型不在白名单 → 取白名单首项
+        real = _resolve_model(model)
+        pub_name = _upstream_to_public.get(real, real)
+        if not _is_model_open(pub_name):
+            return self._json(404, {"error": {"message": "模型 %s 暂未开放，当前开放: %s（config.json 的 model_whitelist 可调整）" % (
+                model, ", ".join(MODEL_WHITELIST))}})
         if real in MODELS:
-            cfg = {"name": real, **MODELS[real]}
+            cfg = {"name": real, "public": pub_name, **MODELS[real]}
         else:
-            cfg = {"name": real, "model_name": real, "display": real, "ctx": 0}
+            cfg = {"name": real, "model_name": real, "display": real, "ctx": 0, "public": real}
         is_stream = bool(oa.get("stream"))
 
         # 4) 凭证
@@ -1467,8 +1652,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     pass
             return
 
-        # 6b) 非流式：聚合 → 协议转换
-        merged = collect_chunks(chunks, real)
+        # 6b) 非流式：聚合 → 协议转换（model 字段回显公共名）
+        merged = collect_chunks(chunks, cfg.get("public") or real)
         if protocol == "responses":
             return self._json(200, convert_openai_to_responses(merged, req_model_name))
         if protocol == "anthropic":
@@ -1477,6 +1662,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
 
 def main():
+    _load_models_cache()  # 先用上次同步结果（离线也有完整表），后台再刷新
+    threading.Thread(target=_models_refresh_loop, name="models-sync", daemon=True).start()
     server = http.server.ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     try:
         sess = _read_session()
@@ -1487,10 +1674,15 @@ def main():
     except Exception as e:
         print("TRAE 官方模型代理已启动: http://127.0.0.1:%d" % PORT)
         print("警告: 凭证暂不可用（%s）；启动 TRAE SOLO CN 登录后自动恢复" % e)
-    print("模型: %s" % ", ".join(sorted(MODELS)))
-    print("上游: llm_utils_chat 通道（solo_work_lite）%s" % GATEWAY)
-    print("认证: 自动复用 TRAE SOLO CN 登录态（token 过期时打开客户端刷新）")
-    _log("启动 port=%d models=%d" % (PORT, len(MODELS)))
+    with _models_lock:
+        snap = dict(MODELS)
+        u2p = dict(_upstream_to_public)
+    print("模型: 内部 %d 个，开放 %d 个: %s" % (
+        len(snap), sum(1 for n in snap if _is_model_exposed(n, snap, u2p)),
+        ", ".join(sorted(u2p.get(n, n) for n in snap if _is_model_exposed(n, snap, u2p)))))
+    print("上游: llm_utils_chat 通道（solo_work_remote，每 %ds 自动同步）%s" % (SOLO_MODELS_TTL, GATEWAY))
+    print("认证: 自动复用 TRAE SOLO CN 登录态（token 临期自动续期）")
+    _log("启动 port=%d models=%d" % (PORT, len(snap)))
     try:
         server.serve_forever()
     except KeyboardInterrupt:
